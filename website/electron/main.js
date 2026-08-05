@@ -59,6 +59,7 @@ function readInternalSecret() {
   return "";
 }
 const { buildMenuTemplate } = require("./app-menu");
+const { attachAltMenuGuard } = require("./alt-menu-guard");
 
 // ── Persistent settings for remote tunnel mode ──
 
@@ -128,6 +129,7 @@ const POLL_INTERVAL_MS = 500;
 const MAX_WAIT_MS = 30_000; // 30s max wait for backend
 const IS_MAC = process.platform === "darwin";
 const IS_WIN = process.platform === "win32";
+const IS_LINUX = process.platform === "linux";
 const DEFAULT_THEME_ACCENT = "#8E48FF";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
@@ -919,6 +921,11 @@ function setupWindowContents(win, backendUrl) {
   });
   view.setBackgroundColor("#00000000");
   win.contentView.addChildView(view);
+
+  // Linux: a bare Alt press moves focus into the native menu bar (GTK
+  // convention). Suppress it — the VS Code `customMenuBarAltFocus: false`
+  // behavior. Alt+<key> chords are unaffected; see alt-menu-guard.js.
+  if (IS_LINUX) attachAltMenuGuard(view.webContents);
 
   // Clean up views when window is closed
   win.on("closed", () => {

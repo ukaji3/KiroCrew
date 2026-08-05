@@ -58,6 +58,7 @@
     "files": [
       "main.js",
       "app-menu.js",
+      "alt-menu-guard.js",
       "badge.js",
       "native-theme.js",
       "zoom.js",
