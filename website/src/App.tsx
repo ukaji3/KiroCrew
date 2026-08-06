@@ -54,6 +54,7 @@ import NotificationDetailPanel from './components/notifications/NotificationDeta
 import NotificationFeed from './components/notifications/NotificationFeed'
 import LogsPage from './pages/LogsPage'
 import HooksPage from './pages/HooksPage'
+import WebhooksPage from './pages/WebhooksPage'
 import CapabilitiesPage from './pages/CapabilitiesPage'
 import KnowledgePage from './pages/KnowledgePage'
 import ArtifactsPage from './pages/ArtifactsPage'
@@ -86,7 +87,7 @@ import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
 import { getTopBarWidgets } from './apps/topBarWidgets'
 import { getCapsuleSegments } from './apps/capsuleSegments'
-import { FEATURE_REQUEST_PROMPT } from './prompts/featureRequest'
+import { FEATURE_REQUEST_PROMPT_WITH_SKILL, FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from './hooks/useInstanceShortcuts'
 import { useCommandPalette } from './hooks/useCommandPalette'
@@ -1488,10 +1489,18 @@ export default function App() {
   }, [])
 
   const requestFeature = useCallback(async () => {
+    // Resolve skill availability in the dashboard so the agent never needs
+    // to probe the filesystem (which would trigger a tool-approval prompt).
+    let msg = FEATURE_REQUEST_PROMPT_FALLBACK
+    try {
+      const skills: { name: string }[] = await api.skills()
+      if (skills.some(s => s.name === 'feature-request')) {
+        msg = FEATURE_REQUEST_PROMPT_WITH_SKILL
+      }
+    } catch { /* skill list unavailable — use the self-contained fallback */ }
     const result = await dispatch(createSlot(undefined)).unwrap()
     const slot = result.key
     navigate('/chat')
-    const msg = FEATURE_REQUEST_PROMPT
     dispatch(appendMessage({ role: 'user', content: i18nT('app.i_d_like_to_request_a_feature'), cls: '', ts: new Date().toISOString() }))
     dispatch(setSlotRunning(true))
     try {
@@ -1545,7 +1554,9 @@ export default function App() {
   const closeMobileNav = isMobile ? () => setMobileNavOpen(false) : undefined
   const activePath = location.pathname
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
-  const needsFixedHeight = isChat || activePath === '/settings' || activePath === '/developer' || activePath === '/capabilities'
+  // /webhooks is a full-height rail-and-detail shell (like /capabilities), so it
+  // owns its own scrolling and must not sit inside <main>'s scroll container.
+  const needsFixedHeight = isChat || activePath === '/settings' || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
 
   // Render one standard nav row (used by the top-fixed mains, the Apps list,
   // and the bottom-fixed section). Active-state, mobile close, chat pin
@@ -2391,6 +2402,7 @@ export default function App() {
             <Route path="/tasks" element={<TasksRedirect />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/hooks" element={<HooksPage />} />
+            <Route path="/webhooks" element={<ErrorBoundary><WebhooksPage /></ErrorBoundary>} />
             <Route path="/capabilities" element={<CapabilitiesPage />} />
             {/* Instances setup moved into Settings; switching happens via the header tab strip. */}
             <Route path="/instances" element={<Navigate to="/settings?tab=instances" replace />} />

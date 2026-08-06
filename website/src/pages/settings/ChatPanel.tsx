@@ -29,7 +29,7 @@ const RESTORE_OPTIONS = ['15', '30', '60', '120', '360', '720', '1440', '0']
  *  territory); only the `'0'` sentinel's label is prose. It reuses the in-chat
  *  settings popover's key — same setting, same option, one string to translate. */
 function restoreLabels(): string[] {
-  return ['15m', '30m', '1h', '2h', '6h', '12h', '24h', i18nT('pages.chat.chatSettings.no_limit')]
+  return ['15m', '30m', '1h', '2h', '6h', '12h', '24h', i18nT('pages.settings.chatPanel.no_limit')]
 }
 const COMPACT_OPTIONS = ['20', '40', '60', '80', '90']
 const COMPACT_LABELS = ['20% (aggressive)', '40%', '60%', '80%', '90% (default)']
@@ -146,7 +146,7 @@ export function ChatPanel() {
       completion_keep?: CompletionKeepMode
       completion_keep_chars?: number
     }
-    dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string }
+    dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
     knowledge?: {
       auto_add_documents?: boolean
       auto_register_project_docs?: boolean
@@ -171,6 +171,14 @@ export function ChatPanel() {
       api.patchConfig(path, value),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_profile')),
+  })
+
+  // ── Prevent sleep while running (server-side; gateway-host behavior) ──
+  const preventSleep = mcCfg?.dashboard?.prevent_sleep ?? false
+  const preventSleepMut = useMutation({
+    mutationFn: (v: boolean) => api.patchConfig('dashboard.prevent_sleep', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_dashboard_config')),
   })
 
   // "Other" reveals a free-text role. Typed locally and committed on blur /
@@ -487,6 +495,18 @@ export function ChatPanel() {
             options={TECH_OPTIONS}
             optionLabels={techLabels()}
             onChange={v => profileMut.mutate({ path: 'dashboard.user_technical_level', value: v })}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title={i18nT('pages.settings.chatPanel.power')}>
+        <SettingsCard>
+          <SettingsToggle
+            label={i18nT('pages.settings.chatPanel.prevent_sleep_while_running')}
+            description={i18nT('pages.settings.chatPanel.keep_your_computer_awake_while_a_task_is_running')}
+            checked={preventSleep}
+            onChange={v => preventSleepMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
           />
         </SettingsCard>
       </SettingsSection>

@@ -93,6 +93,7 @@ if TYPE_CHECKING:
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.agent_discovery import spec_model
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     POOL_SIZE_MAX,
@@ -653,6 +654,17 @@ class SessionManager:
         without reaching into the private session map.
         """
         return [sess.provider for sess in self._sessions.values()]
+
+    def any_active_turn(self) -> bool:
+        """True if ANY live session currently has a turn in flight.
+
+        The gateway's prevent-sleep poll reads this to decide whether to keep the
+        host awake. It filters on the same real-turn signal the shutdown drain
+        uses (:func:`_provider_has_active_turn`), so a session whose provider
+        does not implement the probe (warm-pool doubles, stubs) contributes
+        nothing rather than a false positive.
+        """
+        return any(_provider_has_active_turn(sess.provider) for sess in self._sessions.values())
 
     def get_pid(self, key: str) -> int | None:
         """Return the kiro-cli PID for a session, or None."""
@@ -2015,7 +2027,12 @@ class SessionManager:
                 except (ValueError, OSError):
                     continue
                 if ad.get("name") == agent or af.stem == agent:
-                    model = ad.get("model", "auto")
+                    # Coerced, not raw: this method is annotated ``-> str`` and
+                    # its result is CACHED, fed to ``/api/sessions/context``
+                    # (where the dashboard calls ``.replace()`` on it) and
+                    # compared/translated as a model id in ``claim_pooled``. A
+                    # foreign spec's ``{"id": ...}`` would poison all three.
+                    model = spec_model(ad)
                     break
         except Exception:
             pass
