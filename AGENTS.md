@@ -116,6 +116,37 @@ destructive-command deny rules, `~/.aws` / `~/.ssh` path blocking, the SEL audit
   resolve onto `"global"`: that is the only thing between an ordinary click and the
   operator's real cursor.
 
+## Model selection
+
+Never hardcode a model id (`claude-*`, `opus*`, `sonnet*`, `haiku*`, `gpt-*`,
+`fable*`) as a default or fallback. Accounts differ in entitlement and even
+`"auto"` is not served in every partition, so a hardcoded id fails at runtime
+(silent until the first prompt) for anyone not entitled to it.
+
+- **Default is `"auto"`** (`agent.model` / `config/defaults.json`) — don't replace
+  it with a concrete model. `"auto"` is validated like any other id; it is not
+  assumed usable.
+- **Resolve, don't guess.** For a model chosen on the caller's behalf (background
+  one-liners, tips, inherited/cold-start applies) route through
+  `acp.client.resolve_usable_model(preferred, advertised)`: send a served id; send
+  `"auto"` only when advertised; otherwise return `""` = **inherit the session's
+  served backend default**. `run_bg_oneliner` adds a one-shot reactive retry on a
+  wire rejection as a backstop. An **explicit user pick** is the opposite — it
+  `raise`s `AcpModelUnavailable`; never silently swap a model the user chose.
+- **Pickers** MUST list options from `GET /api/models` (the advertised set), never
+  a static in-code list.
+- **Pin a cheaper model** only via `agent.role_models.<role>` (`background`,
+  `subagent`) → `AgentConfig.resolve_model(role)`; roles default to `"auto"` and
+  never inherit `agent.model`.
+- **Entitlement check:** always the shared predicate
+  `acp.client.model_is_unusable(id, advertised)` (with `advertised_model_ids(...)`);
+  an empty/unknown advertised set means "allow". Never hand-roll a membership test.
+- The `claude_code` seam's `cc_model` (`_BACKGROUND_CC_MODEL`) is the one allowed
+  concrete fallback (that backend can't resolve `"auto"`); keep it off the default path.
+
+`code-review.yml` fails on a newly added hardcoded model literal outside
+`model_registry*`, the config schema, and tests.
+
 ## Specification management
 
 - MUST read the relevant spec under `docs/system-specs/modules/` before changing

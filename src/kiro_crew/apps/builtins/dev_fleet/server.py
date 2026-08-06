@@ -1672,6 +1672,99 @@ async def _fleet_cached() -> dict:
     return data
 
 
+#: Memoized ``(key, reason)``. The comparison needs real path resolution —
+#: a symlinked checkout otherwise reads as a mismatch — and that is filesystem
+#: IO, which on a network-backed checkout can stall. So it runs on the executor,
+#: once per distinct key, rather than on the event loop for every ``/fleet`` poll.
+_SERVING_REASON: "tuple[tuple[str, tuple[str, ...]], str | None] | None" = None
+
+
+def _is_checkout(path: str) -> bool:
+    """Whether *path* is a real git checkout. Blocking — executor only.
+
+    ``.git`` is tested rather than mere existence, and as a path rather than a
+    directory, because a linked worktree's ``.git`` is a FILE. An empty or absent
+    directory is not something Dev Fleet can be said to manage.
+    """
+    if not path:
+        return False
+    try:
+        return (Path(path) / ".git").exists()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _serving_install_reason_sync(
+    main_repo: str, managed: "tuple[str, ...]"
+) -> str | None:
+    """Why the install serving this dashboard is not one Dev Fleet manages.
+
+    Blocking — resolves paths. Call it through an executor, never on the loop.
+
+    Dev Fleet drives a set of checkouts, but the backend answering these routes
+    can be a different install altogether — a published desktop bundle, say,
+    whose own Pull+Build predates the dist-staging step. Every control then keeps
+    reporting success while doing an incomplete job: the checkout fast-forwards,
+    the bundle it serves does not, and a Restart button whose eligibility that
+    older backend computes never appears at all. Saying nothing is what turns a
+    one-line diagnosis into a long session chasing the downstream symptoms.
+
+    Every discovered worktree counts as managed, not just the primary checkout:
+    Make live deliberately points the gateway at a linked worktree that lives
+    outside it, and warning about a state this app just created would train the
+    user to dismiss the one signal built for the takeover case.
+    """
+    # __file__ is the strongest available evidence of which install is RUNNING:
+    # it is this very module, so it cannot disagree with the process the way a
+    # PATH-resolved binary can.
+    pkg = Path(__file__).resolve().parents[3]
+    for candidate in (main_repo, *managed):
+        if not candidate:
+            continue
+        try:
+            root = Path(candidate).resolve()
+        except (OSError, RuntimeError, ValueError):
+            # An unusable entry is skipped, not raised: /fleet is a read and every
+            # other field still describes the fleet correctly. RuntimeError is in
+            # the tuple because a symlink cycle surfaces as one rather than as an
+            # OSError — the same reason beacon.is_default_home() catches it.
+            continue
+        if pkg == root or root in pkg.parents:
+            return None
+    if not _is_checkout(main_repo):
+        # Nothing is actually being managed. MAIN_REPO defaults to ~/kirocrew
+        # whether or not it exists, so a desktop-bundle or pip install with no
+        # source checkout — the out-of-the-box case — would otherwise get a
+        # permanent warning whose remedy ("start the gateway from <path>") names
+        # a directory that is not there. A dead-end instruction on every visit is
+        # how a signal gets trained away.
+        return None
+    return (
+        "This dashboard is served by a different install than the checkout you are "
+        "managing, so Pull+Build here does not change the code that runs. "
+        f"Start the gateway from {_redact(main_repo)}, or Make live onto it. "
+        f"Serving now: {_redact(str(pkg))} — an install older than the pulled "
+        "revision may not refresh the dashboard bundle."
+    )
+
+
+async def _serving_install_reason(worktrees: "list[dict]") -> str | None:
+    global _SERVING_REASON
+    managed = tuple(sorted(
+        str(wt["path"]) for wt in worktrees if wt.get("path")
+    ))
+    key = (MAIN_REPO, managed)
+    if _SERVING_REASON is not None and _SERVING_REASON[0] == key:
+        return _SERVING_REASON[1]
+    loop = asyncio.get_running_loop()
+    reason = await loop.run_in_executor(
+        subprocess_executor(),
+        functools.partial(_serving_install_reason_sync, MAIN_REPO, managed),
+    )
+    _SERVING_REASON = (key, reason)
+    return reason
+
+
 async def _build_fleet() -> dict:
     live_path = await _live_worktree_path()
     staged_path = _staged_target()
@@ -1783,6 +1876,11 @@ async def _build_fleet() -> dict:
         # macOS user saw a Pull+Build succeed with no way to apply it and
         # nothing on screen saying why. ``None`` when the service is drivable.
         "gateway_service_reason": await _gateway_service_reason(),
+        # Non-null when the backend answering this request is NOT the checkout
+        # below. Reported for the same reason as gateway_service_reason: the
+        # controls stay clickable and keep succeeding, so nothing else on screen
+        # would ever reveal that the managed code is not the running code.
+        "serving_install_reason": await _serving_install_reason(worktrees),
         # Whether pods can run on THIS host, and if not, why. Previously
         # _POD_ERROR was computed and then never read by anything, so a
         # non-Linux user saw pod controls that silently failed with no
@@ -3706,8 +3804,9 @@ async def _live_user_unit_status() -> str:
                            the process serving this request: restarting it would
                            bounce an idle unit while the real gateway (foreground,
                            or a system unit) keeps serving the old code;
-      ``"no_launchd"`` / ``"no_agent"`` / ``"agent_not_indirected"`` — the launchd
-                           counterparts (see ``gateway_service``);
+      ``"no_launchd"`` / ``"no_agent"`` / ``"agent_not_indirected"`` /
+      ``"agent_restart_contract_outdated"`` — the launchd counterparts (see
+                           ``gateway_service``);
       ``"ok"``           — the live service is known to the manager AND running,
                            so a restart actually replaces the gateway we are in.
     """
@@ -3780,11 +3879,19 @@ def _make_live_status_error(code: str) -> str:
             "can safely bounce. Re-run `kirocrew service install` to refresh "
             "the agent definition"
         ),
+        "agent_restart_contract_outdated": (
+            f"the launchd agent {_LIVE_GATEWAY_LABEL} lacks the bounded graceful "
+            "restart contract required by Dev Fleet. Re-run "
+            "`kirocrew service install` to refresh the agent definition"
+        ),
         "live_program_missing": (
             f"the launchd agent {_LIVE_GATEWAY_LABEL} is loaded but its "
             "live-gateway launcher is missing (deleted application-support "
-            "directory?), so it has nothing to execute. Re-run "
-            "`kirocrew service install` to restore it"
+            "directory?), so it has nothing to execute. Make live onto a "
+            "worktree to rewrite it, or start a gateway from your source "
+            "checkout — either restores the launcher without touching the "
+            "agent definition, whereas kirocrew service install would rewrite "
+            "the whole plist and discard any environment you added to it"
         ),
     }.get(code, f"the live gateway cannot be repointed ({code})")
 
@@ -3888,9 +3995,138 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
     can_restart = svc is not None and unit_status == "ok"
 
     live = await _live_worktree_path()
-    if live is not None and _same_path(str(real), live):
+    same_as_running = live is not None and _same_path(str(real), live)
+    if same_as_running and _staged_target() is None:
+        # Nothing staged: pointing at the checkout already running is a no-op on
+        # EVERY host. This guard sits before the cancel below so that a drivable
+        # host cannot turn a harmless repeat click into a real gateway restart by
+        # falling through to the cutover path.
         return {"ok": False, "code": "already_live",
                 "error": f"{real.name} is already the live gateway"}
+    if same_as_running and not can_restart:
+        # Pointing at the checkout already running is normally a no-op — EXCEPT
+        # while a cutover is staged, where it is the operator cancelling it. The
+        # pointer names a different checkout than the running image, so re-pinning
+        # the running one is exactly "stay on what is running", and it is the only
+        # cancel a non-drivable host can offer: without this the operator's only
+        # routes are to complete the cutover into the wrong code and reverse it
+        # (two manual restarts) or to hand-delete a keystone-fenced file the
+        # product never names.
+        #
+        # Deliberately limited to hosts this app cannot drive. A drivable host
+        # also stages a service DEFINITION naming the staged checkout, and this
+        # shortcut only touches the pointer — so the definition would keep naming
+        # a checkout nobody intends to run. Once that checkout is pruned the unit
+        # fails to start before it ever reads the pointer, turning a recoverable
+        # mis-stage into a gateway that will not boot. A drivable host therefore
+        # falls through to the full cutover below, which restages the definition
+        # and the pointer together and restarts.
+        pending_target = _staged_target()
+        if pending_target is None:
+            # Defensive re-read: the check above and this one straddle no await,
+            # but keeping it means the cancel never builds a plan around a stage
+            # that has since disappeared.
+            return {"ok": False, "code": "already_live",
+                    "error": f"{real.name} is already the live gateway"}
+        cancel_plan = {
+            "action": "cancel_staged_cutover",
+            "staged_target": pending_target,
+            "keeps_live_target": str(real),
+            "pointer_path": str(live_target.pointer_path()),
+            "restart": "not needed",
+        }
+        # Deleting the pointer IS a mutation, so it owes the same two duties as
+        # the cutover below: never act under ``dry_run``, and never touch the
+        # pointer outside the single-flight lock.
+        if dry_run:
+            return {"ok": True, "dry_run": True, "plan": cancel_plan}
+        if _MAKE_LIVE_LOCK.locked():
+            return {"ok": False, "code": "busy", "error": (
+                "another make-live cutover is in progress"
+            )}
+        async with _MAKE_LIVE_LOCK:
+            if _MAKE_LIVE_COMMITTED:
+                return {"ok": False, "code": "restart_pending", "error": (
+                    "a cutover has been scheduled; the gateway is restarting — "
+                    "retry after it comes back"
+                )}
+            # Re-read under the lock: the awaits above mean the stage may have
+            # been completed or re-pointed since the entry check, and cancelling
+            # a stage that no longer exists would delete a pointer someone else
+            # just wrote.
+            if _staged_target() is None:
+                return {"ok": False, "code": "already_live",
+                        "error": f"{real.name} is already the live gateway"}
+            # Re-pin the RUNNING checkout rather than deleting the pointer.
+            # Deleting only means "stay here" when the running image is the
+            # installed build; if this checkout was itself selected by an earlier
+            # cutover, the pointer is the only record of that choice, so removing
+            # it would silently demote the operator back to the installed build
+            # on the next restart — the opposite of the cancel they asked for.
+            # Writing is idempotent when the pointer already named it.
+            loop = asyncio.get_running_loop()
+            try:
+                prior_pointer = await loop.run_in_executor(
+                    subprocess_executor(), live_target.snapshot
+                )
+            except (OSError, ValueError) as exc:
+                return {"ok": False, "code": "write_failed", "error": (
+                    "refusing to cancel the staged cutover: the staged pointer "
+                    "exists but could not be read, so a failed cancel could not "
+                    f"be rolled back: {_redact(str(exc))}"
+                )}
+            try:
+                await loop.run_in_executor(
+                    subprocess_executor(), live_target.write_target, real
+                )
+            except (live_target.InvalidTarget, OSError) as exc:
+                # InvalidTarget refuses before anything is written. OSError can
+                # arrive AFTER the pointer has been replaced, because
+                # write_target re-applies the owner-only mode as its last step —
+                # so a failure there would otherwise leave a code-execution input
+                # in place with inherited permissions while this call reported
+                # failure. Roll the pointer back so the cancel is all-or-nothing,
+                # and only when there was one: restore(None) DELETES, which is
+                # the demotion this branch exists to avoid.
+                rolled_back = True
+                if prior_pointer is not None:
+                    rolled_back = await loop.run_in_executor(
+                        subprocess_executor(), live_target.restore, prior_pointer
+                    )
+                detail = "" if rolled_back else (
+                    " The rollback also failed, so the pointer may name the "
+                    "running checkout without owner-only permissions — check it "
+                    "before the next restart."
+                )
+                return {"ok": False, "code": "write_failed", "error": (
+                    "refusing to cancel the staged cutover: the running "
+                    "checkout could not be re-pinned as the live target: "
+                    f"{_redact(str(exc))}.{detail}"
+                )}
+            _LIVE_WORKTREE = None
+            _LIVE_CHECK_AT = 0.0
+            return {"ok": True, "cancelled": True, "target": str(real),
+                    "plan": cancel_plan,
+                    "notice": (
+                        f"Staged cutover cancelled. {real.name} stays the live "
+                        f"target and no restart is needed."
+                    )}
+    if same_as_running:
+        # Drivable host with a stage pending. The pointer-only cancel above is
+        # unsafe here (it would leave the service definition naming the staged
+        # checkout), but falling through to the full cutover would bounce a live
+        # gateway carrying real sessions in response to a request that reads as
+        # "keep running what is already running". Refuse and name both real
+        # exits instead: surprising an operator in the destructive direction is
+        # worse than doing nothing.
+        pending = _staged_target()
+        pending_name = Path(pending).name if pending else "another checkout"
+        return {"ok": False, "code": "staged_cutover_pending", "error": (
+            f"a cutover to {pending_name} is already staged. Dev Fleet can "
+            f"restart this host, so cancelling by re-pointing here would leave "
+            f"the service definition naming {pending_name}. Make {pending_name} "
+            f"live to complete the cutover, or restart the gateway to apply it."
+        )}
 
     kcbin = real / ".venv" / "bin" / "kirocrew"
     if not kcbin.is_file():
@@ -3997,12 +4233,22 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
                     f"rolled back: {_redact(str(exc))}"
                 )}
 
-        def _unwind() -> bool:
+        def _unwind_sync() -> bool:
             """Restore both staged surfaces. False when either did not land."""
             ok = live_target.restore(prior_content)
             if can_restart and svc is not None:
                 ok = svc.rollback(prior_definition) and ok
             return ok
+
+        async def _unwind() -> bool:
+            # Both halves block: restore() ends in restrict_to_owner, which shells
+            # out to icacls on Windows, and svc.rollback() rewrites the service
+            # definition. Offload them for the same reason the write below is
+            # offloaded — an unwind must not stall every other gateway request for
+            # the duration of a subprocess.
+            return await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _unwind_sync
+            )
 
         try:
             # write_target ends in restrict_to_owner, which shells out to icacls
@@ -4015,7 +4261,8 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
         except live_target.InvalidTarget as exc:
             return {"ok": False, "code": "unsafe_path", "error": _redact(str(exc))}
         except OSError as exc:
-            return {"ok": False, "code": "write_failed", "rolled_back": _unwind(),
+            return {"ok": False, "code": "write_failed",
+                    "rolled_back": await _unwind(),
                     "error": _redact(str(exc))}
 
         # Nothing bounces the gateway on this host, so the cutover is STAGED and
@@ -4035,7 +4282,7 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
 
         staged, code, err = await svc.stage(real, kcbin)
         if not staged:
-            rolled_back = _unwind()
+            rolled_back = await _unwind()
             # Re-read definitions so the loaded config matches the restored disk
             # state rather than the rejected override.
             await svc.reload()
@@ -4043,8 +4290,8 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
                     "error": _redact(err)}
 
         # The restart tears down THIS backend with the gateway, so it is handed
-        # to the service manager to perform (systemd-run on Linux, launchd's own
-        # kickstart on macOS) so it survives our own death. Capture the
+        # to the service manager to perform (systemd-run on Linux, launchd's
+        # stop/relaunch transaction on macOS) so it survives our own death. Capture the
         # pre-restart identity FIRST so the dashboard reuses the same handshake
         # it uses for restart-gateway (wait for a DIFFERENT start id, not "a 200
         # came back") -- a cutover is just a restart into different code, so it
@@ -4052,7 +4299,7 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
         start_id = await _gateway_start_id()
         restarted, err = await svc.restart_detached()
         if not restarted:
-            rolled_back = _unwind()
+            rolled_back = await _unwind()
             await svc.reload()
             return {"ok": False, "code": "restart_failed", "rolled_back": rolled_back,
                     "error": _redact(err)}
