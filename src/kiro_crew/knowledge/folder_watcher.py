@@ -19,6 +19,8 @@ from kiro_crew.sel import sel
 from .chunker import CHUNK_TOKEN_SIZE, MAX_CHUNKS_PER_FILE
 from .dedup import dedup_document
 from .ingestion import DUPLICATE_JOB_STATUS
+from .kiroignore import KIROIGNORE_FILENAME
+from .kiroignore import load as load_kiroignore
 from .readers import FileReader
 
 logger = logging.getLogger(__name__)
@@ -28,8 +30,13 @@ logger = logging.getLogger(__name__)
 # per-file graph reload runs on the event loop and can stall it past the loop
 # watchdog (dist/assets/*.js was the motivating case). Dot-dirs (.cache, .next,
 # .venv) are already pruned separately by the startswith(".") rule in _walk.
+# ``cdk.out`` is the same churn with a cost attached rather than a stall: AWS CDK
+# rewrites hashed asset bundles and template JSON on every synth, so each build
+# presents megabytes of generated JSON as changed content and the scan pays a
+# fresh extraction call per chunk. Its name only CONTAINS a dot, so the
+# dot-prefix rule never prunes it, and the bare ``out`` entry does not match it.
 HARD_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                  "dist", "build", "out", "target"}
+                  "dist", "build", "out", "target", "cdk.out"}
 DEFAULT_MAX_FILES = 5000
 
 # How many times a file left in 'scanning' is retried before its row is retired to
@@ -55,12 +62,23 @@ SOURCE_TYPE_SKIP_DIRS: dict[str, set[str]] = {
     "obsidian_vault": {".obsidian", ".trash"},
 }
 
-# OS-generated temp / lock / junk files that are never real documents. Matched
-# case-insensitively against the file basename for every folder source type, in
-# addition to any per-source ignore_patterns. Without this, files that carry an
-# otherwise-supported extension are discovered, fail ingestion, and (since failed
-# files are never auto-retried) leave a source permanently stalled below 100%.
-# The motivating case: macOS AppleDouble sidecars (``._<name>.docx``).
+# Files that are never real documents, matched case-insensitively against the
+# file basename for every folder source type in addition to any per-source
+# ignore_patterns. Entries must therefore be lowercase.
+#
+# Two classes, for two different reasons:
+#
+# OS-generated temp / lock / junk files carry an otherwise-supported extension,
+# so they are discovered, fail ingestion, and -- since failed files are never
+# auto-retried -- leave a source permanently stalled below 100%. macOS
+# AppleDouble sidecars (``._<name>.docx``) are the common case.
+#
+# Dependency lock files ingest successfully, which is worse: they are large,
+# fully machine-generated, and answer no question a human would ask, yet every
+# chunk costs one extraction call and a regenerated lock file is billed again on
+# the next sweep. Several of them carry an extension no reader supports today,
+# so the glob is what keeps them out regardless of what ``FileReader.SUPPORTED``
+# accepts.
 DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
     "._*",            # macOS AppleDouble resource forks
     ".ds_store",      # macOS Finder metadata
@@ -77,6 +95,22 @@ DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
     "*.crdownload",   # incomplete browser downloads
     "*.part",
     "*.partial",
+    # Dependency lock files: generated resolution output, not documentation.
+    "package-lock.json",     # npm
+    "npm-shrinkwrap.json",
+    "yarn.lock",             # Yarn
+    "pnpm-lock.yaml",        # pnpm
+    "bun.lockb",             # Bun (binary and text forms)
+    "bun.lock",
+    "poetry.lock",           # Python
+    "uv.lock",
+    "pipfile.lock",
+    "cargo.lock",            # Rust
+    "gemfile.lock",          # Ruby
+    "composer.lock",         # PHP
+    "packages.lock.json",    # NuGet
+    "gradle.lockfile",       # Gradle
+    "flake.lock",            # Nix
 )
 
 
@@ -141,6 +175,18 @@ def _prop_int(value: object) -> int:
     if isinstance(value, float) and not math.isfinite(value):
         return 0
     return int(value) if value > 0 else 0
+
+
+def _rel_posix(rel_dir: str, name: str) -> str:
+    """Join a walk-relative directory and an entry name into a ``/``-separated path.
+
+    ``.kiroignore`` patterns are written with ``/``, so a Windows ``\\``-separated
+    relative path has to be normalised or every pattern carrying a separator
+    silently never matches.
+    """
+    if rel_dir in ("", "."):
+        return name
+    return f"{rel_dir.replace(os.sep, '/')}/{name}"
 
 
 #: Per-source property that overrides the configured folder budget. Separate from
@@ -521,6 +567,9 @@ class FolderWatcher:
         supported = FileReader.SUPPORTED
         results = []
         skip_dirs = HARD_SKIP_DIRS | extra_skip_dirs
+        # Root-level rules only, re-read each sweep so editing the file takes effect
+        # without touching the source's properties.
+        kiroignore = load_kiroignore(root)
         root_real = ""
         if confine_to_root:
             try:
@@ -529,15 +578,25 @@ class FolderWatcher:
                 return []
 
         for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = os.path.relpath(dirpath, root)
             # Prune skip dirs in-place.
             # Windows: the `.`-prefix hidden check is POSIX-centric — Windows marks
             # hidden via the NTFS hidden attribute, not a dotfile name, so some
             # dirs that are hidden on Windows aren't pruned (benign over-ingestion).
             # Tracked as follow-on work.
             dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+            if kiroignore is not None:
+                # Excluded directories are PRUNED, not filtered per file, so a huge
+                # generated tree (cdk.out, coverage output) is never descended.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not kiroignore.is_ignored(_rel_posix(rel_dir, d), is_dir=True)]
 
-            rel_dir = os.path.relpath(dirpath, root)
             for fname in filenames:
+                # The rule file is configuration, not a document. Its extensionless
+                # name is in FileReader.SUPPORTED, so it would otherwise be indexed.
+                if rel_dir == "." and fname == KIROIGNORE_FILENAME:
+                    continue
                 # Skip OS-generated temp/lock/junk files (basename, case-insensitive)
                 if any(fnmatch(fname.lower(), pat) for pat in DEFAULT_IGNORE_GLOBS):
                     continue
@@ -546,6 +605,9 @@ class FolderWatcher:
                 # normalized before matching or every pattern containing a
                 # separator silently never matches on Windows.
                 if any(fnmatch(rel_path.replace(os.sep, "/"), pat) for pat in ignore_patterns):
+                    continue
+                if kiroignore is not None and kiroignore.is_ignored(
+                        _rel_posix(rel_dir, fname), is_dir=False):
                     continue
                 # Extension filter
                 ext = Path(fname).suffix.lower()

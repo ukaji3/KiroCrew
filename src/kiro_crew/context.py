@@ -684,6 +684,59 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
     return _RUNTIME_DISPLAY.get(source, source)
 
 
+# ── Switchable context groups ──
+#
+# A spawning parent decides which of these groups its sub-agent inherits (the
+# ``include_memory`` / ``include_lessons`` / ``include_project`` flags on
+# spawn_run). ``None`` means every group and is what every other caller passes,
+# so the dashboard / Slack / cron / eval paths are unaffected.
+#
+# The unlisted fourth group is conduct — critical rules, date, agent identity,
+# runtime, UI language, workspace identity, skills index. It is not switchable:
+# every member is an output contract or a capability pointer, so a sub-agent
+# without it cannot discover what it can do or format what it reports back.
+CONTEXT_GROUP_MEMORY = "memory"
+CONTEXT_GROUP_LESSONS = "lessons"
+CONTEXT_GROUP_PROJECT = "project"
+SWITCHABLE_CONTEXT_GROUPS = (
+    CONTEXT_GROUP_MEMORY,
+    CONTEXT_GROUP_LESSONS,
+    CONTEXT_GROUP_PROJECT,
+)
+
+_GROUP_DESCRIPTIONS = {
+    CONTEXT_GROUP_MEMORY: "memory (user preferences, projects, prior sessions)",
+    CONTEXT_GROUP_LESSONS: "lessons (learned corrections, user profile)",
+    CONTEXT_GROUP_PROJECT: "project (docs pointer, steering files, project directory)",
+}
+
+
+def _group_included(groups: frozenset[str] | None, group: str) -> bool:
+    """True when *group* is in scope; ``None`` ⇒ every group."""
+    return groups is None or group in groups
+
+
+def _build_context_scope_section(groups: frozenset[str] | None) -> str:
+    """Name the groups a parent withheld, or ``""`` when nothing was withheld.
+
+    A sub-agent that silently lacks a group guesses at what it cannot see —
+    inventing user preferences is the specific failure. Naming the gap converts
+    that into an honest "not provided", which is what makes an aggressive
+    opt-out cheap to recover from.
+    """
+    if groups is None:
+        return ""
+    missing = [g for g in SWITCHABLE_CONTEXT_GROUPS if g not in groups]
+    if not missing:
+        return ""
+    return (
+        "[CONTEXT SCOPE] Your parent withheld: "
+        + "; ".join(_GROUP_DESCRIPTIONS[g] for g in missing)
+        + ".\nIf the task needs any of it, say it was not provided and ask the "
+        "parent — do not guess.\n[End of context scope]\n\n"
+    )
+
+
 def _build_docs_section() -> str:
     """Build a lightweight docs pointer for session context.
 
@@ -1399,59 +1452,42 @@ class ContextBuilder:
         verbosity = getattr(cfg.dashboard, "verbosity", "default")
         if verbosity == "ultra":
             verbosity_block = (
-                "## Response Verbosity: Punchline First (ADHD reader)\n\n"
-                "Write for a reader with ADHD. They skim, they lose the thread "
-                "in long prose, and they stop reading at the first wall of "
-                "text. Detail is allowed — burying the point is not.\n"
-                "- **Open with the punchline: at most 3 sentences** giving the "
-                "problem, the answer or fix, and what to do next. A reader who "
-                "stops after those 3 sentences must still be fully served.\n"
-                "- **After the punchline, supporting detail is welcome — but "
-                "make it scannable, not prose.** Short bullets, one idea per "
-                "line, no paragraph longer than 2 sentences. Lead each bullet "
-                "with its own punchline: the point first, the elaboration "
-                "after.\n"
-                "- Never bury the answer: no preamble, no restating the "
-                "question, no narration of what you are about to do "
-                '("let me…", "now I\'ll…", "looking at…"), no closing summary '
-                "of what you just said.\n"
-                "- Lead with the conclusion, not the reasoning chain. **Do "
-                "include the chain when the user needs it to follow a genuinely "
-                "hard problem** — a surprising root cause, a non-obvious "
-                "tradeoff, a diagnosis they will have to trust or check. Then "
-                "give it after the conclusion, as scannable steps, not as a "
-                "narrated walkthrough of how you got there.\n"
-                "- Take a position: name your recommendation, do not hand over "
-                "an unranked menu. **When the recommendation is not a clear "
-                "winner, the alternatives are part of the answer** — say so, "
-                "list the real contenders, and give the one line that "
-                "distinguishes them so the user can decide. Hedging is the "
-                "thing to avoid, not the existence of options.\n"
-                "- Use structure as signposts: tables for comparisons, code "
-                "blocks for anything literal. Structure is how an ADHD reader "
-                "navigates — it is not padding. Do not decorate with emphasis "
-                "the sentence does not need; a punchy first clause beats a bold "
-                "label.\n"
-                "- Progress notes during long work: one line, and only when "
-                "something actually changed or blocked.\n"
-                "- Code, commands, paths, identifiers, diffs, and error strings "
-                "stay verbatim and complete. Brevity applies to prose only, "
-                "never to correctness.\n"
-                "- **Required output formats are not filler and are never cut.** "
-                "Anything the surface needs in order to render — a trailing "
-                "options/choice line, a diff block for a file change, a full "
-                "PR/MR URL, a required closing tag — still goes in, in exactly "
-                "the position and syntax that surface expects, even though it "
-                "comes after the punchline.\n"
-                "- Preserve the user's language.\n\n"
-                "The 3-sentence punchline cap governs the OPENING, not the "
-                "whole response. Length after it is fine when the content earns "
-                "it — and is expected for security warnings, "
-                "irreversible-action confirmations, ordered multi-step "
-                "instructions where omissions cause mistakes, and anything the "
-                "user asked to be detailed (a design doc, a report, a deep "
-                "explanation). Keep those complete, still lead with the "
-                "punchline, and still cut filler."
+                "## Response Verbosity: Ultra-Brief (ADHD reader)\n\n"
+                "Before responding, simulate the reader: they will read the "
+                "first 2 sentences, scan for bold text and code blocks, then "
+                "close the tab. Anything they won't reach is wasted tokens. "
+                "Structure for THAT reader, not an attentive one.\n\n"
+                "You have a strong bias toward completeness. Override it. The "
+                "reader's time costs more than your thoroughness. An answer "
+                "that's 80% complete in 2 lines beats 100% complete in 20 "
+                "lines. Missing a caveat is acceptable. Missing an edge case "
+                "is acceptable.\n\n"
+                "Rules:\n"
+                "- Open with THE answer in 1–2 sentences. Bold the single most "
+                "critical point.\n"
+                "- Supporting bullets only if the reader would be STUCK without "
+                "them. Max 3. Each bullet is one short sentence.\n"
+                "- Take a position. Name your pick. Resolve \"it depends\" "
+                "immediately.\n"
+                "- Do NOT add: tables, headers, numbered lists > 3 items, "
+                "\"common pitfalls\", \"also consider\", multi-section layouts, "
+                "or any content that fails the test: \"would the reader be "
+                "stuck without this line?\"\n"
+                "- Code blocks and commands are the answer — never cut them.\n"
+                "- Never compress for brevity: security warnings, "
+                "irreversible-action confirmations, and ordered multi-step "
+                "instructions where a dropped step causes a mistake. Those "
+                "stay complete, and code, commands, paths, identifiers and "
+                "error strings stay verbatim.\n"
+                "- When the user ASKS for something long (design doc, tutorial, "
+                "full implementation), ignore these constraints and deliver "
+                "what was asked.\n"
+                "- Required output formats are sacred and never cut: "
+                "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
+                "URLs, security warnings, and any format the rendering surface "
+                "needs. These go in their required position regardless of "
+                "brevity.\n"
+                "- Preserve the user's language."
             )
         elif verbosity == "concise":
             verbosity_block = (
@@ -1571,6 +1607,7 @@ class ContextBuilder:
         runtime_source: str | None = None,
         exclude_last_n: int = 0,
         model_window: int | None = None,
+        context_groups: frozenset[str] | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -1602,6 +1639,15 @@ class ContextBuilder:
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
         does NOT read agent ``resources`` and still needs the explicit load.
         Everything else stays at CC/ACP parity.
+
+        *context_groups* selects which switchable groups are injected (see
+        ``SWITCHABLE_CONTEXT_GROUPS``). ``None`` — every caller except a
+        sub-agent whose parent opted a group out — injects all of them, so the
+        output is unchanged. Omitting a group skips its sections entirely rather
+        than capping them to zero: a zero cap yields a truncation marker, not an
+        empty string. A sub-agent that had a group withheld is told so by name
+        (``_build_context_scope_section``) so it reports the gap instead of
+        guessing.
 
         For custom agents (non-kirocrew), skills and workspace identity
         are skipped — the agent loads its own via kiro-cli. Memory,
@@ -1695,9 +1741,14 @@ class ContextBuilder:
         # never picked a language explicitly.
         parts.append(_build_ui_language_section(_cfg))
 
-        profile_ctx = _build_user_profile_section(_cfg)
-        if profile_ctx:
-            parts.append(profile_ctx)
+        # Name any group the parent withheld, before the sections themselves, so
+        # the sub-agent reads the scope as framing rather than discovering a gap.
+        parts.append(_build_context_scope_section(context_groups))
+
+        if _group_included(context_groups, CONTEXT_GROUP_LESSONS):
+            profile_ctx = _build_user_profile_section(_cfg)
+            if profile_ctx:
+                parts.append(profile_ctx)
 
         # Workspace identity — kirocrew-only (custom agents don't use workspaces)
         if not is_custom:
@@ -1720,7 +1771,7 @@ class ContextBuilder:
             )
 
         # Documentation pointer — kirocrew-only, lightweight reference
-        if not is_custom:
+        if not is_custom and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             docs_ctx = _build_docs_section()
             if docs_ctx:
                 parts.append(docs_ctx)
@@ -1740,7 +1791,7 @@ class ContextBuilder:
         # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
         # the explicit load. Injecting on the ACP/kiro backend would duplicate
         # what kiro-cli already loaded.
-        if not is_custom and is_cc:
+        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -1830,7 +1881,7 @@ class ContextBuilder:
         # Temporary sessions skip all memory reads.
         mem_key = memory_store or workspace
         memory = self.get_memory_for(mem_key)
-        if not blocks_reads:
+        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
             memory_ctx = memory.get_context(
                 prefs_cap=caps.prefs,
                 projects_cap=caps.projects,
@@ -1876,7 +1927,7 @@ class ContextBuilder:
         # Lessons: merge global + workspace-scoped — inject for ALL agents
         # (skipped for temporary sessions)
         lessons_ctx = ""
-        if not blocks_reads:
+        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_LESSONS):
             # One query, not two: get_lessons_context() already returns "" when the
             # store holds no lessons, so a separate get_lessons() existence probe
             # would be a duplicate SELECT * over the same rows (embedding blobs
@@ -1925,7 +1976,12 @@ class ContextBuilder:
                 parts.append(lessons_ctx)
 
         # Provenance-tagged entries from recent sessions (skipped for temporary)
-        if session_key and self.conversation_log and not blocks_reads:
+        if (
+            session_key
+            and self.conversation_log
+            and not blocks_reads
+            and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
+        ):
             provenance = self.conversation_log.recent_with_provenance(
                 session_key, exclude_last_n=exclude_last_n
             )
@@ -1988,6 +2044,7 @@ class ContextBuilder:
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
+        context_groups: frozenset[str] | None = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -2071,6 +2128,7 @@ class ContextBuilder:
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
+                context_groups=context_groups,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -2267,6 +2325,8 @@ class ContextBuilder:
             logger.info("🔍 Minimal context — episodic memory skipped")
         elif blocks_reads:
             logger.info("🔍 Temporary session — episodic memory skipped")
+        elif not _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+            logger.info("🔍 Memory group withheld by parent — episodic memory skipped")
         elif is_new_session:
             memory = self.get_memory_for(memory_store or workspace)
             if memory.vector_store:
@@ -2291,7 +2351,7 @@ class ContextBuilder:
 
         # Project context — inject on every message so the LLM always knows
         # the active project, even when set/changed after session start.
-        if project:
+        if project and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             parts.append(
                 f"[PROJECT] Active project directory: {project}\n"
                 "This is the codebase you are working in for this session. "

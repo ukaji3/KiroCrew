@@ -37,6 +37,7 @@ import { useLanguage } from '../i18n/LanguageProvider'
 import { useSessionActions } from '../hooks/useSessionActions'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import { useChatPopouts } from '../hooks/useChatPopouts'
+import { platformShortcut } from '../utils/platform'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { usePointerDrag } from '../hooks/usePointerDrag'
@@ -269,6 +270,8 @@ interface Slot {
 }
 
 type SourceLinkState = NonNullable<NonNullable<Slot['source_links']>[number]['state']>
+/** One sidebar chip's payload, as the slot serializer sends it. */
+type SidebarSourceLink = NonNullable<Slot['source_links']>[number]
 
 /** Lifecycle states after which a pull request can never merge, so its CI
  * rollup carries no actionable information and the lifecycle glyph is the only
@@ -491,6 +494,15 @@ interface ChatSidebarProps {
    *  When provided, this fires AFTER the switchSlot dispatch so consumers
    *  can react to user-driven selection (e.g. to navigate the URL). */
   onSelectSlot?: (key: string) => void
+  /** Reveal a session's pull request / issue in the side panel instead of
+   *  leaving for the provider's website.
+   *
+   *  Fires AFTER the row's own switchSlot dispatch, so the consumer can address
+   *  the panel of the session the chip belongs to. Returns whether the panel took
+   *  the link: FALSE (or an omitted callback) falls back to plain link
+   *  navigation, which is the correct behaviour both on a surface with no side
+   *  panel (the `/embed/sessions` list) and for a url the panel cannot resolve. */
+  onOpenSource?: (slotKey: string, link: { url: string; kind: 'change' | 'issue' }) => boolean
   /** When true, ChatPage floats a hide-sidebar button over this header's
    *  top-left (open state), so the header reserves left space for it.
    *  Omitted in embed/sessions mode where the sidebar is the whole view. */
@@ -531,7 +543,7 @@ const SIDEBAR_LS_KEY = 'mc-sidebar-width'
 
 function ChatSidebar({
   slots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, collapsible, splitEnabled, splitActive, onOpenSplit,
+  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSource, collapsible, splitEnabled, splitActive, onOpenSplit,
 }: ChatSidebarProps) {
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
@@ -1823,7 +1835,7 @@ function ChatSidebar({
           onClick={() => toggleCollapse(folder.id)}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(folder.id) } }}
         >
-          <FolderGlyph color={folder.color} size={15} open={!folder.collapsed} />
+          <FolderGlyph color={folder.color} size={11} open={!folder.collapsed} />
           {editingId === folder.id && editScope === columnId ? (
             /* Inline rename input — board-view parity with renderFolderHeader.
              *  Without this branch the ⋯-menu "Rename" set editingId but no
@@ -2232,25 +2244,62 @@ function ChatSidebar({
               const overflowTitle = issueLinks.length
                 ? i18nT('pages.chatSidebar.more_pull_request_or_issue_in_this_session', { count: hidden })
                 : i18nT('pages.chatSidebar.more_pull_request_in_this_session', { count: hidden })
+              /** Chip tooltip. A plain click now reveals in-panel, so a bare
+               *  "Open <url>" would promise the browser and mislead; naming the
+               *  modifier is also the only way that escape hatch is discoverable
+               *  rather than found by accident. */
+              const chipTitle = (link: SidebarSourceLink) => i18nT('pages.chatSidebar.open_source_link_in_side_panel', {
+                url: link.url,
+                modifier: platformShortcut('Cmd+click'),
+              })
+              /** Chip click: switch to the session the chip belongs to and reveal
+               *  its pull request / issue in that session's side panel, rather
+               *  than sending the user out to the provider's website.
+               *
+               *  The chip stays a real anchor with a real href, so four cases
+               *  deliberately fall through to plain link navigation instead:
+               *    - `onOpenSource` unset — the surface has no side panel to
+               *      reveal into (the `/embed/sessions` list).
+               *    - a modifier click — the user asked for a new tab/window
+               *      explicitly, and "Copy link address" still yields the PR url.
+               *    - offline — the panel loads a PR through the LOCAL provider
+               *      CLI, so with the gateway down the provider's own page is the
+               *      only thing that can answer at all.
+               *    - `onOpenSource` returning false — the panel could not resolve
+               *      this url, so the provider's page is better than a dead click.
+               *  Middle-click never reaches a click handler (it fires auxclick),
+               *  so it opens a background tab natively without a case here.
+               *
+               *  `preventDefault` comes LAST on purpose: the default action runs
+               *  only after every handler returns, so suppressing navigation
+               *  after the reveal is still effective — and it means the reveal
+               *  decides, rather than being assumed to succeed. */
+              const revealInPanel = (link: SidebarSourceLink) => (e: React.MouseEvent<HTMLAnchorElement>) => {
+                // The row is a click-to-switch button; never let a chip click
+                // reach it, whichever branch we take below.
+                e.stopPropagation()
+                if (!onOpenSource || !connected || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+                if (!isActive) { dispatch(switchSlot(s.key)); onSelectSlot?.(s.key) }
+                if (!onOpenSource(s.key, { url: link.url, kind: link.kind ?? 'change' })) return
+                e.preventDefault()
+              }
               return (
                 <div className="flex flex-wrap gap-1.5 mt-1">
                   {changeLinks.map(link => (
-                    // The chip is a real link to the PR/MR. `link.url` is always
-                    // an `https://` URL on an allowlisted host (state.py scans for
-                    // the literal "https://" then validates via parse_source_url),
-                    // so no scheme sanitising is needed here.
+                    // `link.url` is always an `https://` URL on an allowlisted
+                    // host (state.py scans for the literal "https://" then
+                    // validates via parse_source_url), so no scheme sanitising is
+                    // needed for the href.
                     //
-                    // The row itself is a click-to-switch button AND a dnd-kit
-                    // draggable, so the anchor has to opt out of both: stop the
-                    // click from bubbling into the row's switchSlot handler, and
-                    // disable the anchor's own native HTML5 drag, which would
+                    // The row is a dnd-kit draggable as well as a button, so the
+                    // anchor also disables its own native HTML5 drag — that would
                     // otherwise put the URL on the dataTransfer instead of the
                     // slot key in the board/flat scopes that use native drag.
                     <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
                       draggable={false}
-                      onClick={e => e.stopPropagation()}
+                      onClick={revealInPanel(link)}
                       className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
-                      title={`Open ${link.url}`}>
+                      title={chipTitle(link)}>
                       {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
                       {link.provider === 'github' ? `#${link.number}` : `!${link.number}`}
                       {link.state === 'merged' && (
@@ -2267,7 +2316,7 @@ function ChatSidebar({
                     </a>
                   ))}
                   {issueLinks.map(link => (
-                    // Issue chip: the same anchor discipline (stop propagation,
+                    // Issue chip: the same anchor discipline (reveal in panel,
                     // no native drag) but deliberately NO ci / state / merge
                     // decoration — the chip-status cache is pull-request-only in
                     // this phase, so an issue chip has nothing truthful to colour
@@ -2276,9 +2325,9 @@ function ChatSidebar({
                     <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
                       data-testid={`session-issue-chip-${link.number}`}
                       draggable={false}
-                      onClick={e => e.stopPropagation()}
+                      onClick={revealInPanel(link)}
                       className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
-                      title={`Open ${link.url}`}>
+                      title={chipTitle(link)}>
                       {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
                       <CircleDot className="lucide-inline shrink-0" aria-hidden="true" />
                       {`#${link.number}`}
@@ -2381,14 +2430,17 @@ function ChatSidebar({
         // and action buttons clickable; drag is off while renaming.
         {...(draggable ? dragHandleProps : {})}
         className={`group relative flex items-center gap-2 pr-2 py-1.5 rounded-md text-sm text-muted hover:text-text hover:bg-bg-hover transition-all ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}`}
-        // 9px left pad + 19px glyph + 7px gap lands the folder NAME on the
-        // 35px text x of the sessions INSIDE it (the 19px indent step guide).
-        // The glyph box outdents 7px left of sibling session text
-        // (Finder-style: bigger icons hang left, text stays on the guide).
-        style={{ paddingLeft: '9px' }}>
+        // 16px left pad puts the folder GLYPH on the same x as the text of the
+        // session rows at the folder's OWN level (both `px-4`), so a folder and
+        // its siblings start the same column. The 5px glyph→name gap is chosen
+        // (not cosmetic) so glyph 14px + 5px == the 19px indent step of the
+        // nested body, which lands the folder NAME on the text x of the sessions
+        // INSIDE it. Both guides hold at once; changing either breaks one.
+        // Measured: glyph == sibling session text, name == child session text.
+        style={{ paddingLeft: '16px' }}>
         {editingId === folder.id && editScope === 'list' ? (
           <>
-            <FolderGlyph color={folder.color} size={17} open={!folder.collapsed} />
+            <FolderGlyph color={folder.color} size={14} open={!folder.collapsed} />
             <Input ref={folderEditInputRef} className="flex-1 py-0.5 text-[13px] min-w-0" value={editName} onChange={e => setEditName(e.target.value)} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} {...ime.bindEnter<HTMLInputElement>({ onEnter: () => renameCommit(folder.id, editName), onEscape: () => setEditingId(null), onBlur: () => renameCommit(folder.id, editName) })} />
             <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
           </>
@@ -2398,11 +2450,11 @@ function ChatSidebar({
              *  <button> (keyboard-operable for free), filling the row so clicking
              *  the folder glyph/name still toggles.  Double-click the name renames. */}
             <button type="button"
-              className="flex items-center gap-[7px] flex-1 min-w-0 bg-transparent border-none cursor-pointer text-left text-inherit p-0"
+              className="flex items-center gap-[5px] flex-1 min-w-0 bg-transparent border-none cursor-pointer text-left text-inherit p-0"
               aria-expanded={!folder.collapsed}
               aria-label={folder.collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
               onClick={() => toggleCollapse(folder.id)}>
-              <FolderGlyph color={folder.color} size={17} open={!folder.collapsed} testId={`folder-collapse-${folder.id}`} />
+              <FolderGlyph color={folder.color} size={14} open={!folder.collapsed} testId={`folder-collapse-${folder.id}`} />
               {/* Double-click rename is a mouse-only power shortcut; the accessible
                *  path is the ⋯-menu Rename item, so scope-disable the interaction rule. */}
               {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
@@ -3014,7 +3066,7 @@ function ChatSidebar({
                       <span className="flex-1">
                         {i18nT('pages.chatSidebar.folders')}
                         {filterHiddenFolders.size > 0 && (
-                          <span className="normal-case tracking-normal"> · {filterHiddenFolders.size} hidden</span>
+                          <span className="normal-case tracking-normal"> · {filterHiddenFolders.size} {i18nT('pages.chatSidebar.hidden')}</span>
                         )}
                       </span>
                     </DropdownMenuItem>

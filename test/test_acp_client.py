@@ -41,6 +41,17 @@ from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpPromptStats
 # Tests that exercise these paths are skipped on Windows.
 _POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree APIs only")
 
+# Separate from _POSIX_ONLY because the reason differs: these tests assert POSIX
+# EXECUTABLE-RESOLUTION semantics, not process-tree APIs. They build fixtures that
+# have no Windows equivalent — extensionless binaries made runnable with
+# chmod(0o755), which `shutil.which` cannot find on Windows because it resolves
+# candidates through PATHEXT, and `/`-rooted paths, which os.path.realpath()
+# anchors to the current drive (`/home/u/x` -> `D:\home\u\x`). The production
+# resolvers are correct on Windows; only these fixtures are POSIX-shaped.
+_POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX executable-resolution semantics only"
+)
+
 
 class TestVendoredClaudeAcp:
     """Resolve the vendored claude-agent-acp adapter (no npm/network)."""
@@ -834,6 +845,7 @@ class TestResolveClaudeAcpBin:
         assert result is not None
         assert str(bin_path) in result
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_path_lookup(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -855,6 +867,7 @@ class TestResolveClaudeAcpBin:
         assert result is not None
         assert str(bin_path) in result
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_mise_which_preferred(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -876,6 +889,7 @@ class TestResolveClaudeAcpBin:
         result = client_mod._resolve_claude_acp_bin()
         assert result == [str(script)]
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_mise_installed_script_resolves_node(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
         from kiro_crew.acp.client import _resolve_claude_acp_bin
@@ -931,6 +945,7 @@ class TestResolveClaudeAcpBin:
         result = client_mod._resolve_claude_acp_bin()
         assert result == [str(node_bin), str(script.resolve())]
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_mise_glob_fallback(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -1002,6 +1017,7 @@ class TestResolveClaudeCodeExecutable:
         monkeypatch.setattr(client_mod.shutil, "which", lambda name, path=None: "/usr/bin/claude")
         assert client_mod._resolve_claude_code_executable() == "/mise/bin/claude"
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_path_lookup(self, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -1359,27 +1375,59 @@ class TestAcpClientReadMessage:
         assert msg is None
 
     @pytest.mark.asyncio
-    async def test_read_buffer_overrun_raises_process_died(self, tmp_path):
-        """A line exceeding the stdout buffer must surface as AcpProcessDied.
+    async def test_read_buffer_overrun_drops_frame_and_keeps_reading(self, tmp_path):
+        """A line exceeding the stdout buffer costs that ONE frame, not the turn.
 
-        asyncio's StreamReader.readline() raises ValueError when a single
-        line exceeds its limit; the stream is corrupted afterward. The read
-        loop must convert that into AcpProcessDied so session recovery
-        respawns the process instead of the session freezing.
+        The stream is NOT corrupted afterwards, contrary to what this call site
+        used to assume: readline() removes the oversize line through its
+        terminating newline (or clears the buffer when the newline has not
+        arrived yet) and resumes the transport before raising ValueError. So the
+        overrun joins the blank-line and non-JSON paths in returning None, and
+        the caller's next read gets the following frame. Raising AcpProcessDied
+        here killed a healthy live turn over one unreadably large frame.
+
+        Driven through a REAL StreamReader so the recovery claim is asserted
+        against asyncio's actual behaviour rather than a mock's side_effect.
         """
         client = AcpClient(work_dir=tmp_path)
 
+        reader = asyncio.StreamReader(limit=256)
         mock_process = MagicMock()
-        mock_stdout = AsyncMock()
-        mock_stdout.readline = AsyncMock(
-            side_effect=ValueError("Separator is not found, and chunk exceed the limit")
-        )
-        mock_process.stdout = mock_stdout
+        mock_process.stdout = reader
         mock_process.returncode = None
         client._process = mock_process
 
-        with pytest.raises(AcpProcessDied):
-            await client._read_message(timeout=1.0)
+        reader.feed_data(b"X" * 1024 + b"\n")  # oversize frame
+        reader.feed_data(b'{"jsonrpc":"2.0","method":"session/update","params":{}}\n')
+
+        assert await client._read_message(timeout=1.0) is None  # frame dropped
+        msg = await client._read_message(timeout=1.0)
+        assert msg is not None and msg.method == "session/update"
+
+    @pytest.mark.asyncio
+    async def test_repeated_buffer_overruns_never_kill_the_process(self, tmp_path):
+        """Oversize frames must not accumulate into a kill here.
+
+        This reader carries no drain budget on purpose (see the asymmetry note in
+        `_read_message`): every call is bounded by the caller's timeout, so a run
+        of oversize frames costs only those frames. A frame-count cap would
+        reintroduce exactly the defect this PR removes — death from a replay of
+        properly-terminated but oversize frames."""
+        client = AcpClient(work_dir=tmp_path)
+
+        reader = asyncio.StreamReader(limit=256)
+        mock_process = MagicMock()
+        mock_process.stdout = reader
+        mock_process.returncode = None
+        client._process = mock_process
+
+        for _ in range(40):
+            reader.feed_data(b"X" * 1024 + b"\n")  # oversize, terminated
+            assert await client._read_message(timeout=1.0) is None
+
+        reader.feed_data(b'{"jsonrpc":"2.0","method":"session/update","params":{}}\n')
+        msg = await client._read_message(timeout=1.0)
+        assert msg is not None and msg.method == "session/update"
 
 
 class TestAcpClientExtractChunk:

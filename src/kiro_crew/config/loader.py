@@ -829,14 +829,17 @@ class AgentConfig:
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
     )
     sandbox: str = field(
-        default="off",
+        default="auto",
         metadata=_meta(
             "Sandbox",
-            "Sandbox mode for ACP provider. Default 'off' defers isolation to "
-            "kiro-cli's internal agent sandbox (kiro-cli >= 2.13). Set to 'auto' "
-            "to re-enable Kiro Crew's OS-level sandbox (namespace on Linux, "
-            "sandbox-exec on macOS). The two layers are mutually exclusive on "
-            "macOS (nested seatbelt causes EPERM).",
+            "Sandbox mode for ACP provider. Default 'auto' engages OS-level "
+            "isolation (namespace on Linux, sandbox-exec on macOS) and "
+            "automatically defers to kiro-cli's internal sandbox on macOS when "
+            "it is enabled (kiro-cli >= 2.13; nested seatbelt causes EPERM). "
+            "Set to 'off' to skip Kiro Crew's own OS-level sandbox — delegation "
+            "to kiro-cli's internal sandbox still fires on macOS if it is "
+            "enabled, and a SECURITY warning is logged when neither layer is "
+            "active.",
             enum=["auto", "off"],
         ),
     )
@@ -876,7 +879,20 @@ class AgentConfig:
             "Defaults to false. Only the JSON boolean true admits in-process Python "
             "hooks, backend processes, lifecycle/install scripts, and openCommand. "
             "App code can access the filesystem, network, and in-memory credentials; "
-            "enable this only for apps you trust (CSE SEC-012).",
+            "enable this only for apps you trust (CSE SEC-012). Prefer "
+            "apps_trusted, which grants the same admission to ONE named app.",
+        ),
+    )
+    apps_trusted: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Trusted Apps",
+            "Per-app grants for third-party execution — the narrow form of "
+            "apps_allow_third_party. An app whose manifest name appears here is "
+            "admitted to run Python hooks, its backend, lifecycle scripts, and "
+            "openCommand; every other third-party app stays blocked. Only a JSON "
+            "array of app-name strings is honoured, and no wildcard entry is "
+            "accepted (use apps_allow_third_party to trust all).",
         ),
     )
     jail: str = field(
@@ -4572,7 +4588,7 @@ class KiroCrewConfig:
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
                 default_agent=agent_data.get("default_agent", ""),
-                sandbox=agent_data.get("sandbox", "off"),
+                sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
                     agent_data.get("sandbox_allow_no_isolation", False)
                 ),
@@ -4581,6 +4597,11 @@ class KiroCrewConfig:
                 ),
                 apps_allow_third_party=_safe_bool(
                     agent_data.get("apps_allow_third_party", False), False
+                ),
+                apps_trusted=(
+                    [a for a in _trusted if isinstance(a, str) and a]
+                    if isinstance(_trusted := agent_data.get("apps_trusted"), list)
+                    else []
                 ),
                 jail=_normalize_jail(agent_data.get("jail", "auto")),
                 dangerously_skip_permissions=_read_skip_permissions(agent_data),

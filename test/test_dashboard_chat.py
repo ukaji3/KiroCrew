@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -198,18 +199,185 @@ class TestChatSlot:
                 "assistant",
                 f"https://github.com/acme/widgets/pull/{number}",
             )
+        # The scan runs newest-first, so the message it must never reach is the
+        # OLDEST one -- placed before everything else in the transcript.
         beyond_cap = CountingMessage(
             role="assistant",
             content="https://github.com/acme/widgets/pull/999",
         )
-        slot.messages.append(beyond_cap)
+        slot.messages.insert(0, beyond_cap)
         slot.invalidate_source_links()
 
         links = slot._pr_source_links()
 
         assert len(links) == _MAX_SOURCE_LINKS_PER_SLOT
-        assert links[0]["number"] == 1
+        # Newest mention leads; the cap keeps the newest links, not the first ever.
+        assert links[0]["number"] == _MAX_SOURCE_LINKS_PER_SLOT
         assert beyond_cap.reads == 0
+
+    def test_pr_source_links_are_ordered_most_recently_mentioned_first(self):
+        """The chip budget serializes only the first few links per kind, so a
+        first-mention order handed those slots to the oldest pull requests and
+        collapsed the one being worked on into the "+N" pill."""
+        slot = _ChatSlot("s1")
+        for number in (1, 2, 3, 4):
+            slot.append("assistant", f"https://github.com/acme/widgets/pull/{number}")
+
+        assert [link["number"] for link in slot._pr_source_links()] == [4, 3, 2, 1]
+
+        # Re-mentioning an OLD pull request moves it back to the head: recency is
+        # last mention, which is what "the one I am working on" actually means.
+        slot.append("assistant", "picking https://github.com/acme/widgets/pull/1 back up")
+        links = slot._pr_source_links()
+        assert [link["number"] for link in links] == [1, 4, 3, 2]
+        # Still deduplicated -- the earlier mention did not survive as a second entry.
+        assert len(links) == 4
+
+    def test_pr_source_links_order_within_one_message_by_position(self):
+        """Several urls in ONE message have no turn ordering to go on, so position
+        in the text is the only available proxy for "mentioned later"."""
+        slot = _ChatSlot("s1")
+        first = "https://github.com/acme/widgets/pull/1"
+        second = "https://github.com/acme/widgets/pull/2"
+        slot.append("assistant", f"opened {first} then {second}")
+
+        assert [link["url"] for link in slot._pr_source_links()] == [second, first]
+
+    def test_pr_source_links_stop_parsing_one_message_at_the_cap(self, monkeypatch):
+        """The per-message walk must stop AT the cap, not collect the whole message
+        first. One message can carry thousands of urls and this runs synchronously
+        on the serialization path."""
+        from kiro_crew.dashboard.handlers import source_providers
+
+        calls = 0
+        real = source_providers.parse_source_url
+
+        def counting(url):
+            nonlocal calls
+            calls += 1
+            return real(url)
+
+        monkeypatch.setattr(source_providers, "parse_source_url", counting)
+
+        slot = _ChatSlot("s1")
+        flood = " ".join(
+            f"https://github.com/acme/widgets/pull/{n}"
+            for n in range(1, _MAX_SOURCE_LINKS_PER_SLOT * 20)
+        )
+        slot.append("assistant", flood)
+
+        links = slot._pr_source_links()
+
+        assert len(links) == _MAX_SOURCE_LINKS_PER_SLOT
+        # Newest-first: the tail of the message wins, not its head.
+        assert links[0]["number"] == _MAX_SOURCE_LINKS_PER_SLOT * 20 - 1
+        # Parsing is the expensive half; DISTINCT valid urls are bounded by the cap
+        # because each admission advances the loop condition.
+        assert calls <= _MAX_SOURCE_LINKS_PER_SLOT
+
+    def test_pr_source_links_stay_linear_on_adjacent_url_prefixes(self):
+        """A candidate's end is bounded by the NEXT occurrence, not by the end of the
+        message.
+
+        Content made of adjacent `https://` prefixes has no stop character until the
+        very end, so an unbounded forward scan per occurrence is quadratic -- and
+        `to_dict` runs this synchronously during `push_slots_update`, so a single
+        crafted message could stall the gateway past its watchdog. Measured on this
+        input: 0.14s bounded vs 128s unbounded, so the absolute budget below
+        separates them by ~70x without comparing ratios (which flakes on loaded
+        runners)."""
+        payload = "https://" * 16000 + "github.com/acme/widgets/pull/1"
+        assert len(payload) > 128_000
+        slot = _ChatSlot("s1")
+        slot.append("assistant", payload)
+
+        started = time.perf_counter()
+        links = slot._pr_source_links()
+        elapsed = time.perf_counter() - started
+
+        assert [link["url"] for link in links] == ["https://github.com/acme/widgets/pull/1"]
+        assert elapsed < 10, f"scan took {elapsed:.1f}s — the per-candidate bound is gone"
+
+    def test_pr_source_links_bound_total_parse_attempts(self, monkeypatch):
+        """Every parse attempt is charged, so no flood shape can run unbounded.
+
+        `len(found)` advances only on a NEW valid url, so a message repeating one
+        REJECTED candidate never advanced it and every occurrence reached the
+        parser -- a 58 MB body froze the event loop for ~13.6s. Charging attempts
+        rather than successes is what bounds rejected, repeated and distinct floods
+        with one mechanism (a dedup set bounded only some of them, and cost
+        unbounded memory to do it)."""
+        from kiro_crew.dashboard.handlers import source_providers
+
+        calls = 0
+        real = source_providers.parse_source_url
+
+        def counting(url):
+            nonlocal calls
+            calls += 1
+            return real(url)
+
+        monkeypatch.setattr(source_providers, "parse_source_url", counting)
+        budget = _MAX_SOURCE_LINKS_PER_SLOT * 64
+
+        # A rejected candidate repeated far past the budget.
+        slot = _ChatSlot("s1")
+        slot.append("assistant", " ".join(["https://nope.example/pull/1"] * (budget * 3)))
+        assert slot._pr_source_links() == []
+        assert calls <= budget
+
+        # The budget spans the WHOLE call, not one message: many messages must not
+        # multiply it.
+        calls = 0
+        many = _ChatSlot("s2")
+        for _ in range(50):
+            many.append("assistant", " ".join(["https://nope.example/pull/1"] * 200))
+        assert many._pr_source_links() == []
+        assert calls <= budget
+
+    def test_pr_source_links_budget_leaves_real_transcripts_untouched(self, monkeypatch):
+        """The budget must be headroom, not a ceiling a real session can hit: a
+        transcript mentioning the full chip allowance still yields every link."""
+        slot = _ChatSlot("s1")
+        for n in range(1, _MAX_SOURCE_LINKS_PER_SLOT + 1):
+            slot.append("assistant", f"opened https://github.com/acme/widgets/pull/{n} for review")
+
+        links = slot._pr_source_links()
+        assert len(links) == _MAX_SOURCE_LINKS_PER_SLOT
+        assert links[0]["number"] == _MAX_SOURCE_LINKS_PER_SLOT
+
+    def test_pr_source_links_see_a_url_nested_in_another_url(self):
+        """Documented consequence of walking urls backwards: a `https://` inside
+        another token is now examined on its own, where the previous forward walk
+        skipped past it. A pull request reached through a redirect/tracking wrapper
+        is a real link, and the backend re-validates every url before any provider
+        call, so surfacing it is acceptable -- pinned here so it is a decision
+        rather than a surprise."""
+        slot = _ChatSlot("s1")
+        nested = "https://redirect.example/?to=https://github.com/acme/widgets/pull/7"
+        slot.append("assistant", nested)
+
+        assert [link["url"] for link in slot._pr_source_links()] == [
+            "https://github.com/acme/widgets/pull/7",
+        ]
+
+    def test_serialized_chips_keep_the_newest_links_of_each_kind(self):
+        slot = _ChatSlot("s1")
+        for number in (1, 2, 3, 4, 5):
+            slot.append("assistant", f"https://github.com/acme/widgets/pull/{number}")
+        for number in (10, 11, 12, 13):
+            slot.append("assistant", f"https://github.com/acme/widgets/issues/{number}")
+
+        payload = slot.to_dict()
+        serialized = payload["source_links"]
+        changes = [x["number"] for x in serialized if x["kind"] == "change"]
+        issues = [x["number"] for x in serialized if x["kind"] == "issue"]
+
+        # Three per kind, newest first, and the total still counts everything so
+        # the "+N" pill stays honest.
+        assert changes == [5, 4, 3]
+        assert issues == [13, 12, 11]
+        assert payload["source_links_total"] == 9
 
     def test_to_dict_scans_pr_source_links_once(self, monkeypatch):
         slot = _ChatSlot("s1")
@@ -238,14 +406,15 @@ class TestChatSlot:
         payload = slot.to_dict()
 
         assert payload["source_links_total"] == 4
-        # Assert on the full list: to_dict serializes only the first
-        # _SERIALIZED_SOURCE_LINKS_PER_SLOT entries.
-        assert [(link["url"], link["kind"]) for link in slot._pr_source_links()] == [
-            (pr, "change"),
-            (issue, "issue"),
-            (mr, "change"),
-            (gitlab_issue, "issue"),
-        ]
+        # Order-insensitive on purpose: this pins the kind MAPPING, and the
+        # recency ordering has its own tests below. Asserting a sequence here
+        # made it a second, accidental ordering oracle.
+        assert {link["url"]: link["kind"] for link in slot._pr_source_links()} == {
+            pr: "change",
+            issue: "issue",
+            mr: "change",
+            gitlab_issue: "issue",
+        }
         assert all("kind" in link for link in payload["source_links"])
 
     def test_issue_links_never_inherit_a_chip_status(self, monkeypatch):
@@ -636,6 +805,53 @@ class TestApiChatMemoryModeForwarding:
         assert kw["operation"] == "chat_send"
         assert kw["source"] == "memory_mode_mismatch"
         assert "slot=locked" in kw["resources"]
+
+
+@pytest.mark.asyncio
+class TestApiChatNoBrowseMarker:
+    """Browse is gated by tool AVAILABILITY, not a per-message marker: the chat
+    handler injects nothing into the user message, and the agent itself decides
+    whether to operate a browser or read with web_fetch. This pins that the
+    persisted message is verbatim (no `[BROWSE]` prefix), regardless of any legacy
+    `browse` field a client might still send."""
+
+    async def _send(self, tmp_path, monkeypatch, *, body_extra: dict):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+
+        async def fake_run_chat(st, sl, msg):
+            sl.append("chunk", "ack", "chunk")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+
+        slot_key = body_extra.get("slot", "browse-slot")
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat",
+                json={"message": "look at example.com", **body_extra},
+                timeout=None,
+            )
+            async for _chunk in resp.content.iter_any():
+                break
+            resp.close()
+            await asyncio.sleep(0.05)
+        return state._slots.get(slot_key)
+
+    async def test_message_is_never_marked(self, tmp_path, monkeypatch):
+        slot = await self._send(tmp_path, monkeypatch, body_extra={"slot": "plain-slot"})
+        assert slot is not None
+        user_msgs = [m for m in slot.messages if m.get("role") == "user"]
+        assert user_msgs and user_msgs[-1]["content"] == "look at example.com"
+
+    async def test_legacy_browse_field_is_ignored(self, tmp_path, monkeypatch):
+        # A client that still sends the old `browse` field must not change the
+        # stored message: the marker mechanism is gone entirely.
+        slot = await self._send(
+            tmp_path, monkeypatch, body_extra={"slot": "legacy-slot", "browse": True}
+        )
+        assert slot is not None
+        user_msgs = [m for m in slot.messages if m.get("role") == "user"]
+        assert user_msgs and not user_msgs[-1]["content"].startswith("[BROWSE]")
 
 
 # ── Slot detail pagination (HTTP) ──

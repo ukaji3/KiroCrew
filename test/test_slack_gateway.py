@@ -868,7 +868,13 @@ class TestCheckForUpdates:
 
         orig = _h._update_info.copy()
         try:
-            _h._update_info.update({"available": False})
+            # A git checkout (self_updatable) below the floor: the git auto-apply
+            # is the correct mandatory action. `_do_update_check` sets this key
+            # per layout in the real flow; it is mocked here, so the fixture
+            # states the layout explicitly. The wheel layout (self_updatable
+            # False) takes the notify path instead — see
+            # TestMandatoryUpdateOnWheelInstall.
+            _h._update_info.update({"available": False, "self_updatable": True})
             with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
                 with patch(
                     "kiro_crew.platform.update_governance.update_required", return_value=True
@@ -4919,24 +4925,22 @@ class TestChannelTransportStartGate:
         import contextlib as _cl  # local import; keeps module import block untouched
 
         assert isinstance(stack, _cl.ExitStack)  # documents the contract
-        # slack.gateway imports the four maybe_start_* at module top (hoisted; no
-        # cycle), so patch the names bound IN the gateway module, not their source
-        # modules — patching the source would not affect the already-bound refs.
-        mocks = {}
-        mocks["wecom"] = stack.enter_context(
-            patch("kiro_crew.slack.gateway.maybe_start_wecom", new=AsyncMock())
-        )
-        mocks["telegram"] = stack.enter_context(
-            patch("kiro_crew.slack.gateway.maybe_start_telegram", new=AsyncMock())
-        )
-        mocks["discord"] = stack.enter_context(
-            patch(
-                "kiro_crew.slack.gateway.maybe_start_discord",
-                new=AsyncMock(return_value=discord_ret),
-            )
-        )
-        mocks["webex"] = stack.enter_context(
-            patch("kiro_crew.slack.gateway.maybe_start_webex", new=AsyncMock())
+        # The registry rewrite (PR ③) removed the module-level maybe_start_*
+        # bindings from slack.gateway — the roster now comes from
+        # kiro_crew.channels. Tests inject a descriptor tuple through
+        # _start_channel_transports(descriptors=...) instead of patching names;
+        # the mocks and every assertion below are unchanged.
+        from kiro_crew.messaging.registry import ChannelDescriptor
+
+        mocks = {
+            "wecom": AsyncMock(),
+            "telegram": AsyncMock(),
+            "discord": AsyncMock(return_value=discord_ret),
+            "webex": AsyncMock(),
+        }
+        self._descriptors = tuple(
+            ChannelDescriptor(channel_type=name, start=mock)
+            for name, mock in mocks.items()
         )
         return mocks
 
@@ -4964,7 +4968,7 @@ class TestChannelTransportStartGate:
         discord_client = MagicMock(name="discord_client")
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack, discord_ret=discord_client)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         # Denied members: maybe_start_* never invoked, clients stay None.
         mocks["wecom"].assert_not_awaited()
@@ -4988,7 +4992,7 @@ class TestChannelTransportStartGate:
         self._enable_all_transports(orch)
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         mocks["wecom"].assert_awaited_once()
         mocks["telegram"].assert_awaited_once()
@@ -5034,7 +5038,7 @@ class TestChannelTransportStartGate:
         discord_client = MagicMock(name="discord_client")
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack, discord_ret=discord_client)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         # Host profile narrows telegram out even though the policy allowed it.
         mocks["telegram"].assert_not_awaited()
@@ -5070,7 +5074,7 @@ class TestChannelTransportStartGate:
         monkeypatch.setattr(gw, "_channel_transport_permitted", _spy)
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         # Only the enabled transport was evaluated + started.
         assert queried == ["telegram"]
@@ -5118,3 +5122,114 @@ class TestChannelTransportStartGate:
         assert connected is True
         socket_client.connect.assert_awaited_once()
         assert orch._socket_client is socket_client
+
+
+class TestMandatoryUpdateOnWheelInstall:
+    """A policy min-version makes an update mandatory. On a wheel/cli.sh install
+    the git-based auto-apply cannot run, so the mandatory branch must NOTIFY
+    (warn + light the dashboard badge) instead of silently returning — which is
+    what it did before, leaving the host below the floor with no signal."""
+
+    @pytest.mark.asyncio
+    async def test_mandatory_update_on_wheel_notifies_not_silent(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        async def _noop_check():
+            return None
+
+        # Wheel install below a policy floor: a feed-checkable layout reports
+        # self_updatable False, and the check can leave available False (a
+        # pre-release remote reads as not-newer) even though the floor mandates
+        # the update. Start from available False to prove the branch lights it.
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {
+                "available": False,
+                "self_updatable": False,
+                "install_kind": "wheel",
+                # A feed-checkable wheel carries an installer command; that is
+                # what distinguishes it from an externally-managed install.
+                "update_command": "curl -fsSL … | sh",
+            }
+        )
+        monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
+        monkeypatch.setattr(gov, "update_required", lambda _v: True)
+        monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
+
+        apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
+
+        await orch._check_for_updates()
+
+        # Must NOT attempt the git apply on a non-git tree, and must surface it.
+        apply_called.assert_not_awaited()
+        ds.push_refresh.assert_called_once_with("update_available")
+        # The dashboard badge reads _update_info["available"]; a mandatory
+        # update must light it even though the check left it False.
+        assert handlers._update_info.get("available") is True
+
+    @pytest.mark.asyncio
+    async def test_mandatory_update_on_externally_managed_does_not_badge(self, monkeypatch):
+        """A dmg/appimage/docker install below the floor is not self_updatable
+        AND has no installer update_command — it updates via its own surface, so
+        the CLI 'run kirocrew update' badge must NOT light."""
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        async def _noop_check():
+            return None
+
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {
+                "available": False,
+                "self_updatable": False,
+                "install_kind": "docker",
+                "update_command": "",  # externally managed: no CLI update path
+            }
+        )
+        monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
+        monkeypatch.setattr(gov, "update_required", lambda _v: True)
+        monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
+        apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
+
+        await orch._check_for_updates()
+
+        apply_called.assert_not_awaited()
+        ds.push_refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mandatory_update_on_git_still_auto_applies(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        async def _noop_check():
+            return None
+
+        # Git checkout: self_updatable True, so the mandatory git apply runs.
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {"available": True, "self_updatable": True, "install_kind": "git"}
+        )
+        monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
+        monkeypatch.setattr(gov, "update_required", lambda _v: True)
+        monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
+
+        apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
+
+        await orch._check_for_updates()
+        apply_called.assert_awaited_once()

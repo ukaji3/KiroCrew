@@ -368,6 +368,15 @@ interface ChatState {
   workflowRuns: Record<string, WorkflowRunProgress>
   activityOpen: boolean
   activityTab: 'changes' | 'issues' | 'subagents' | 'workflows' | 'logs' | 'files' | 'side' | 'artifacts'
+  /** Monotonic counter bumped ONLY by `openActivityToTab` — i.e. only when
+   *  something deliberately asks for a view (a slash command, a sub-agent /
+   *  workflow card, a keyboard shortcut). The side panel's tab strip owns which
+   *  tab is focused and persists that per chat, so a consumer must distinguish a
+   *  genuine request from `activityTab` merely taking a new VALUE: switching
+   *  chats restores the incoming chat's cached tab (defaulting to Files), and
+   *  treating that as a request would force-focus Files or the last requested
+   *  view over the tab the user actually left the chat on. */
+  activityTabRequest: number
   /** Tool call to highlight & auto-expand inline. Set by openActivityToTool;
    *  consumed (cleared) once the matching ToolCallLine has expanded itself. */
   focusToolCallId: string | null
@@ -455,6 +464,7 @@ const initialState: ChatState = {
   workflowRuns: {},
   activityOpen: false,
   activityTab: 'files' as const,
+  activityTabRequest: 0,
   focusToolCallId: null,
   mcpApps: {},
   slotActivity: seedSlotActivity(),
@@ -601,9 +611,13 @@ function applyNonActiveFrame(
     }
   }
   if (role === 'user') {
-    sa.toolLog = []
-    for (const m of msgs) {
-      if (m.role === 'permission' && !m.meta?.resolved) { if (m.meta) m.meta.resolved = 'rejected'; else m.meta = { resolved: 'rejected' } }
+    // A steered message does not start a new turn — skip the "stale permissions"
+    // cleanup so the approval bar remains visible and answerable (#1667).
+    if (!meta?.steer) {
+      sa.toolLog = []
+      for (const m of msgs) {
+        if (m.role === 'permission' && !m.meta?.resolved) { if (m.meta) m.meta.resolved = 'rejected'; else m.meta = { resolved: 'rejected' } }
+      }
     }
     // Reconcile the optimistic user bubble (appendSlotMessage) rather than
     // pushing a 2nd identical one when the server echoes the user frame — same
@@ -645,8 +659,10 @@ export const selectSlotSubagents = (state: RootState, slot: string | null): Reco
  *  so each grid pane's approval bar reflects ITS slot, not the global active one. */
 export const selectSlotPendingApproval = (state: RootState, slot: string | null): ChatMessage | null => {
   const msgs = slot ? selectSlotMessages(state, slot) : state.chat.messages
+  // Find the last NON-steer user message — steered messages don't start a new
+  // turn, so they must not hide a pending approval bar (#1667).
   let lastUserIdx = -1
-  for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user') { lastUserIdx = i; break } }
+  for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user' && !msgs[i].meta?.steer) { lastUserIdx = i; break } }
   for (let i = msgs.length - 1; i > lastUserIdx; i--) {
     const m = msgs[i]
     if (m.role === 'permission' && !m.meta?.resolved && m.meta?.approval_id) return m
@@ -1616,7 +1632,7 @@ const chatSlice = createSlice({
     setVoiceAudio(state, action: PayloadAction<string | null>) { state.voiceAudio = action.payload },
     toggleActivity(state) { state.activityOpen = !state.activityOpen; if (!state.activityOpen) state.focusToolCallId = null; persistActivityOpen(state.activeSlot, state.activityOpen) },
     openActivityPanel(state) { state.activityOpen = true; persistActivityOpen(state.activeSlot, true) },
-    openActivityToTab(state, action: PayloadAction<'changes' | 'issues' | 'subagents' | 'workflows' | 'logs' | 'files' | 'side' | 'artifacts'>) { state.activityOpen = true; state.activityTab = action.payload; state.focusToolCallId = null; persistActivityOpen(state.activeSlot, true) },
+    openActivityToTab(state, action: PayloadAction<'changes' | 'issues' | 'subagents' | 'workflows' | 'logs' | 'files' | 'side' | 'artifacts'>) { state.activityOpen = true; state.activityTab = action.payload; state.activityTabRequest += 1; state.focusToolCallId = null; persistActivityOpen(state.activeSlot, true) },
     /** Tool details expand inline in the chat. This action signals the matching
      *  ToolCallLine pill to auto-expand and scroll into view. */
     openActivityToTool(state, action: PayloadAction<string>) { state.focusToolCallId = action.payload },
@@ -2297,12 +2313,16 @@ const chatSlice = createSlice({
       }
       // New user message = new turn — clear activity log
       if (role === 'user') {
-        state.toolLog = []
-        // Auto-resolve any stale permissions from previous turn so they don't block the new turn
-        for (const m of state.messages) {
-          if (m.role === 'permission' && !m.meta?.resolved) {
-            if (m.meta) m.meta.resolved = 'rejected'
-            else m.meta = { resolved: 'rejected' }
+        // A steered message does not start a new turn — skip the "stale permissions"
+        // cleanup so the approval bar remains visible and answerable (#1667).
+        if (!meta?.steer) {
+          state.toolLog = []
+          // Auto-resolve any stale permissions from previous turn so they don't block the new turn
+          for (const m of state.messages) {
+            if (m.role === 'permission' && !m.meta?.resolved) {
+              if (m.meta) m.meta.resolved = 'rejected'
+              else m.meta = { resolved: 'rejected' }
+            }
           }
         }
       }

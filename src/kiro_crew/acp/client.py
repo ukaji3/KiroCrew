@@ -119,6 +119,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.skill_usage import get_global_skill_read_observer
 
 logger = logging.getLogger(__name__)
 
@@ -541,6 +542,62 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
 
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
+# Ceiling on the bytes discarded while draining ONE oversize line. Per drain call
+# and expressed in BYTES: each call provably ends ON a frame boundary, so a replay
+# of many legitimately-oversize-but-terminated frames each gets its own budget and
+# stays survivable. A count of oversize FRAMES would kill the runtime on exactly
+# that replay. Only a single blob that never terminates can exhaust this.
+_OVERSIZE_DRAIN_MAX_BYTES = 16 * _STDOUT_BUFFER_LIMIT  # 160MB
+
+
+class OversizeLineUnrecoverable(Exception):
+    """An oversize stdout line exceeded the drain budget without terminating."""
+
+
+async def _drain_oversize_line(
+    reader: asyncio.StreamReader, exc: asyncio.LimitOverrunError
+) -> int:
+    """Discard one oversize line ENTIRELY, leaving the stream on a frame boundary.
+
+    Called after ``readuntil(b"\\n")`` raised ``LimitOverrunError``, which consumes
+    nothing. ``exc.consumed`` is the already-buffered prefix that provably holds no
+    separator, so consuming it cannot cross into the next frame; retrying
+    ``readuntil`` then either returns the remainder of the line or raises for
+    another step. Same consume-prefix-and-retry drain as
+    ``mcp_gateway/backend.py::run_stdout_pump``; a plain ``read(n)`` would instead
+    eat into the NEXT frame.
+
+    The recovered remainder is **discarded, never parsed**. It is a byte-slice of
+    the line cut at an arbitrary offset, so it can split a multibyte UTF-8
+    character — and ``json.loads`` on that raises ``UnicodeDecodeError``, which is
+    NOT a ``json.JSONDecodeError`` and would escape the caller's non-JSON guard
+    into its crash handler, killing every multiplexed session over one oversize
+    frame.
+
+    Returns the bytes discarded. Raises ``OversizeLineUnrecoverable`` past
+    ``_OVERSIZE_DRAIN_MAX_BYTES`` (the stream is garbage, not merely verbose) and
+    propagates ``IncompleteReadError`` on EOF mid-drain so the caller can use its
+    normal end-of-stream path.
+    """
+    discarded = 0
+    while True:
+        if exc.consumed <= 0:
+            # Unreachable via CPython, whose consumed always exceeds the reader's
+            # limit; guarded because a zero would make this loop spin without
+            # awaiting and starve the event loop.
+            raise OversizeLineUnrecoverable(
+                f"stream reported a {exc.consumed}-byte oversize prefix"
+            )
+        discarded += len(await reader.readexactly(exc.consumed))
+        if discarded > _OVERSIZE_DRAIN_MAX_BYTES:
+            raise OversizeLineUnrecoverable(
+                f"discarded {discarded} bytes with no frame boundary "
+                f"(limit {_OVERSIZE_DRAIN_MAX_BYTES})"
+            )
+        try:
+            return discarded + len(await reader.readuntil(b"\n"))
+        except asyncio.LimitOverrunError as again:
+            exc = again
 
 # Max consecutive empty reads before checking if process is alive
 _MAX_CONSECUTIVE_EMPTY = 5
@@ -550,6 +607,40 @@ _MAX_CONSECUTIVE_EMPTY = 5
 # popped on the permission event and wholesale-cleared per prompt; this is just a
 # backstop for the pathological no-permission case).
 _MAX_CACHED_TOOL_PARAMS = 256
+
+#: Basename a skill body lives under. Duplicated from ``skills`` deliberately —
+#: the ACP layer must not import the skills machinery just to test a substring.
+_SKILL_FILE_BASENAME = "SKILL.md"
+
+#: Backstop on the per-session set of tool-call ids already credited as skill
+#: reads. Far above any real turn's distinct skill reads; bounds memory for a
+#: long-lived session at the cost of at most one duplicate credit after a reset.
+_MAX_NOTED_SKILL_READS = 512
+
+
+def _mentions_skill_file(raw_params: dict | None, command: str | None) -> bool:
+    """Whether a tool call's arguments name a skill body at all.
+
+    A cheap pre-filter so observing skill reads costs a substring scan on the
+    overwhelming majority of tool calls, which touch no skill. Scans only string
+    and string-sequence values, since a model-authored argument dict may hold
+    arbitrary shapes.
+    """
+    if isinstance(command, str) and _SKILL_FILE_BASENAME in command:
+        return True
+    if not isinstance(raw_params, dict):
+        return False
+    for value in raw_params.values():
+        if isinstance(value, str):
+            if _SKILL_FILE_BASENAME in value:
+                return True
+        elif isinstance(value, (list, tuple)):
+            if any(
+                isinstance(v, str) and _SKILL_FILE_BASENAME in v for v in value
+            ):
+                return True
+    return False
+
 
 # Emitted by kiro-cli as a plain agent_message_chunk when its built-in, non-overridable
 # security filter cancels every tool use in an assistant turn (e.g. shell commands
@@ -1734,6 +1825,14 @@ class AcpClient:
         # the later permission_request event (which carries no kind) can inherit
         # the canonical shell signal. Mirrors _tool_call_inputs lifecycle.
         self._tool_call_is_shell: dict[str, bool] = {}
+        # toolCallIds already credited to the skill-usage ledger as a body read.
+        # The arguments arrive on either the initial tool_call or its refinement
+        # depending on the provider, so both are observed and this prevents one
+        # read being counted twice. Mirrors _tool_call_is_shell's lifecycle.
+        self._skill_read_noted: set[str] = set()
+        # toolCallId -> skill keys resolved at call time, credited only when
+        # the tool reports completion so a denied read leaves no delivery.
+        self._pending_skill_reads: dict[str, list[str]] = {}
         # Map toolCallId → trusted MCP server name (_meta.kiro.mcpServerName),
         # cached from the tool_call notification so the later permission_request
         # event (which carries no _meta) can inherit it — the signal the
@@ -2968,14 +3067,29 @@ class AcpClient:
             return None
         except (ValueError, asyncio.LimitOverrunError) as exc:
             # A single JSON-RPC line exceeded the stdout StreamReader buffer
-            # (_STDOUT_BUFFER_LIMIT). asyncio leaves the stream in a corrupted
-            # state after an overrun — every subsequent read also fails — so
-            # treat the process as dead and let session recovery respawn it
-            # instead of freezing the session on an unhandled exception.
-            raise AcpProcessDied(
-                f"ACP stdout line exceeded {_STDOUT_BUFFER_LIMIT}-byte buffer: {exc}"
-            ) from exc
-
+            # (_STDOUT_BUFFER_LIMIT). This does NOT corrupt the stream, contrary
+            # to what this call site used to assume: before raising ValueError,
+            # readline() deletes the oversize line through its terminating
+            # newline when one is already buffered, else clears the buffer, then
+            # resumes the transport (CPython asyncio.streams.StreamReader
+            # .readline — its docstring states this). So drop the frame and let
+            # the caller read the next one, exactly like the blank-line and
+            # non-JSON paths below; raising AcpProcessDied here ended a healthy
+            # live turn over one unreadably large frame.
+            #
+            # NOTE the deliberate asymmetry with AcpRuntime._reader_loop, which
+            # additionally enforces a drain budget: that reader is a standalone
+            # task with no deadline, so an endlessly unterminated stream needs an
+            # explicit terminal state there. HERE every call is bounded by the
+            # caller's `timeout` and the callers run their own deadlines, so the
+            # worst case is one turn ending on its deadline instead of a frame —
+            # no unbounded state, and still strictly better than killing the turn
+            # on the first oversize frame. Computing a byte budget would require
+            # readuntil (readline reports neither the branch taken nor the bytes
+            # dropped), i.e. hand-rolling readline's buffer repair on the path
+            # that is NOT the reported failure.
+            logger.warning("Dropped an oversize ACP stdout frame: %s", exc)
+            return None
         if not line:
             # EOF — process likely died or closing. Check and avoid busy-loop.
             if self._process and self._process.returncode is not None:
@@ -3590,6 +3704,8 @@ class AcpClient:
         self.last_prompt_stats = self.last_prompt_stats.carry_over()
         self._tool_call_inputs.clear()
         self._tool_call_is_shell.clear()
+        self._skill_read_noted.clear()
+        self._pending_skill_reads.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
         self._tool_call_params.clear()
@@ -3710,6 +3826,7 @@ class AcpClient:
                     # with the main agent / SubagentManager. PostToolUse fires
                     # separately on the tool_result branch below (fire_tool_hooks
                     # is Pre-only). No-op unless audit_source is set.
+                    await self._maybe_note_skill_read(tool_event)
                     await self._maybe_fire_pre_tool_hooks(tool_event)
                     yield tool_event
                 # Real-time tool result from `tool_call_update` session updates.
@@ -3729,6 +3846,7 @@ class AcpClient:
                     # (and its output) exists — the Pre-vs-Post split is required
                     # because fire_tool_hooks above is PreToolUse-only. No-op
                     # unless audit_source is set.
+                    self._maybe_credit_skill_read(tool_result_event)
                     await self._maybe_fire_post_tool_hooks(tool_result_event)
                     yield tool_result_event
                 # claude-agent-acp emits a separate `tool_call_update` carrying
@@ -3739,6 +3857,7 @@ class AcpClient:
                 # patched in place — see `EVENT_TOOL_CALL_UPDATE` in chat_runner.
                 tool_refine_event = self._extract_tool_call_refinement(msg)
                 if tool_refine_event:
+                    await self._maybe_note_skill_read(tool_refine_event)
                     yield tool_refine_event
             elif action == "metadata":
                 self._track_metadata(msg)
@@ -4179,9 +4298,11 @@ class AcpClient:
                             tool_event.tool_kind or "",
                         )
                     await self._maybe_audit_tool_call(tool_event)
+                    await self._maybe_note_skill_read(tool_event)
                     await self._maybe_fire_pre_tool_hooks(tool_event)
                 tool_result_event = self._extract_tool_call_update(msg)
                 if tool_result_event:
+                    self._maybe_credit_skill_read(tool_result_event)
                     await self._maybe_fire_post_tool_hooks(tool_result_event)
             elif action == "metadata":
                 self._track_metadata(msg)
@@ -4328,6 +4449,85 @@ class AcpClient:
             )
         except Exception:
             logger.warning("ACP-layer SEL audit failed", exc_info=True)
+
+    async def _maybe_note_skill_read(self, tool_event: "AcpEvent") -> None:
+        """Resolve which skills a tool call is about to read, crediting later.
+
+        Lives here because the ACP layer is the one place that sees EVERY
+        surface's tool calls — dashboard, Slack, subagents, task runner. The
+        per-surface permission gate (``HookManager.on_tool_call``) is not usable
+        for this: file reads are auto-approved, so they never reach it.
+
+        Resolution is filesystem-bound (a skills-tree walk after cache expiry,
+        plus a ``resolve()`` per served skill), so it is offloaded to a thread —
+        on the event loop it would stall every session in the gateway. Nothing
+        is recorded here: the keys are held until ``_maybe_credit_skill_read``
+        sees the tool complete, so a denied or failed read leaves no delivery.
+
+        Fires for the initial ``tool_call`` and its ``tool_call_update``
+        refinement, whichever first carries the arguments (claude-agent-acp
+        leaves ``rawInput`` empty on the initial notification), deduped by
+        ``tool_call_id``.
+
+        Gated on the skill basename appearing in the arguments BEFORE any
+        offload, so a tool call unrelated to skills costs one substring scan.
+        Whether the call is a content-delivering READ (rather than a delete,
+        move, or grep that merely names the path) is decided by the observer.
+        Failures are swallowed: telemetry must not disturb the tool call.
+        """
+        observer = get_global_skill_read_observer()
+        if observer is None:
+            return
+        tool_id = tool_event.tool_call_id or ""
+        if tool_id and tool_id in self._skill_read_noted:
+            return
+        raw_params = tool_event.raw_tool_params
+        command = tool_event.shell_command
+        if not _mentions_skill_file(raw_params, command):
+            return
+        if tool_id:
+            if len(self._skill_read_noted) >= _MAX_NOTED_SKILL_READS:
+                # A single turn cannot legitimately hold this many distinct
+                # skill reads; drop the tracking wholesale rather than letting
+                # it grow for the life of the session. Worst case after a reset
+                # is one duplicate credit, not a leak.
+                self._skill_read_noted.clear()
+                self._pending_skill_reads.clear()
+            self._skill_read_noted.add(tool_id)
+        try:
+            keys = await asyncio.to_thread(
+                observer.resolve_tool_read_keys,
+                tool_event.tool_name or "",
+                raw_params,
+                command,
+            )
+        except Exception:
+            logger.warning("skill-read resolution failed", exc_info=True)
+            return
+        if keys and tool_id:
+            self._pending_skill_reads[tool_id] = keys
+
+    def _maybe_credit_skill_read(self, tool_result_event: "AcpEvent") -> None:
+        """Credit the reads resolved for a tool call that has now completed.
+
+        Only a ``status == "completed"`` result (``tool_final``) credits, so a
+        read that was denied, errored, or never ran contributes no delivery.
+        In-memory only — the ledger debounces its own disk write — so this is
+        safe to run inline on the event loop.
+        """
+        if not tool_result_event.tool_final:
+            return
+        tool_id = tool_result_event.tool_call_id or ""
+        keys = self._pending_skill_reads.pop(tool_id, None) if tool_id else None
+        if not keys:
+            return
+        observer = get_global_skill_read_observer()
+        if observer is None:
+            return
+        try:
+            observer.credit_skill_reads(keys)
+        except Exception:
+            logger.warning("skill-read credit failed", exc_info=True)
 
     async def _maybe_fire_pre_tool_hooks(self, tool_event: "AcpEvent") -> None:
         """Fire the PreToolUse HOOK ENGINE for a tool_call, for audit-source clients.
