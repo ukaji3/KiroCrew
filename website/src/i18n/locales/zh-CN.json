@@ -5508,6 +5508,11 @@
       "split_right_d": "向右分屏（⌘D）",
       "terminal_pane_coming_in_phase_2": "终端窗格 — 将在第二阶段推出"
     },
+    "sessionRefStrip": {
+      "n_messages": "{{n}} 条消息",
+      "remove_reference": "移除引用",
+      "remove_reference_to": "移除对 {{name}} 的引用"
+    },
     "settings": {
       "click_to_reset": "点击重置",
       "decrease": "减少",
@@ -6629,6 +6634,7 @@
       "folder_actions": "文件夹操作",
       "folder_breadcrumb": "文件夹面包屑",
       "folder_color": "文件夹颜色",
+      "from_your_chats": "来自你的聊天",
       "gallery": "画廊",
       "import_from_a_file": "从文件导入…",
       "kind": "类型",
@@ -6665,6 +6671,9 @@
       "slug": "Slug",
       "source": "来源",
       "star_artifact": "为工件加星标",
+      "show_all_count": "显示全部（{{count}}）",
+      "show_less": "收起",
+      "star_a_document_in_from_your_chats_to_save_it_he": "还没有已保存的工件——在\"来自你的聊天\"中为文档加星即可保存到这里。",
       "star_creates_a_starred_artifact_from_this_docume": "加星（从此文档创建一个已加星的工件）",
       "star_document": "为文档加星",
       "starred": "已加星",
@@ -6968,6 +6977,7 @@
         "recovered_continuing": "已恢复 · 继续中",
         "resuming_the_interrupted_turn": "正在从中断处继续",
         "safety_policy_continuing": "安全策略 · 正在自动继续",
+        "session_busy_continuing": "会话繁忙 · 正在自动继续",
         "tool_call_blocked": "工具调用被阻止",
         "tool_stopped_responding": "工具停止响应",
         "turn_interrupted": "轮次被中断",
@@ -7277,6 +7287,7 @@
       "double_click_to_rename": "双击可重命名",
       "drag_to_reorder": "拖动可重新排序",
       "drop_here_to_remove_from_folder": "拖到此处可从文件夹中移出",
+      "drop_to_reference_session": "拖到此处可引用该会话",
       "duplicate": "复制",
       "expand_folder_name": "展开文件夹 {{name}}",
       "expand_group_results": "展开 {{group}} 的结果",
@@ -7351,6 +7362,7 @@
       "pinned": "已置顶",
       "pinned_sessions_are_kept": "置顶的会话会被保留。",
       "popped_out_to_a_separate_window": "已弹出到独立窗口",
+      "private_session_cannot_be_referenced": "私密会话无法被引用",
       "rename": "重命名",
       "rename_flag_as_status_or_delete_tags_changes_app": "重命名标签、标记为状态或删除标签。更改会在所有显示标签的位置生效。",
       "resets_its_conversation": "重置其对话",
@@ -9681,7 +9693,8 @@
         "sources": "来源",
         "test": "测试",
         "use_default": "使用默认",
-        "volume": "音量"
+        "volume": "音量",
+        "preset_pulse": "脉冲"
       },
       "postureDisclosure": {
         "filter": "筛选 {{label}}",

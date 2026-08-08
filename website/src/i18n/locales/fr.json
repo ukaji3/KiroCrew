@@ -5676,6 +5676,11 @@
       "split_right_d": "Diviser à droite (⌘D)",
       "terminal_pane_coming_in_phase_2": "Volet terminal — à venir en phase 2"
     },
+    "sessionRefStrip": {
+      "n_messages": "{{n}} msgs",
+      "remove_reference": "Supprimer la référence",
+      "remove_reference_to": "Supprimer la référence à {{name}}"
+    },
     "settings": {
       "click_to_reset": "Cliquer pour réinitialiser",
       "decrease": "Diminuer",
@@ -6819,6 +6824,7 @@
       "folder_actions": "Actions du dossier",
       "folder_breadcrumb": "Fil d'Ariane des dossiers",
       "folder_color": "Couleur du dossier",
+      "from_your_chats": "Depuis vos chats",
       "gallery": "Galerie",
       "import_from_a_file": "Importer depuis un fichier…",
       "kind": "Type",
@@ -6855,6 +6861,9 @@
       "slug": "Slug",
       "source": "Source",
       "star_artifact": "Ajouter l’artefact aux favoris",
+      "show_all_count": "Tout afficher ({{count}})",
+      "show_less": "Afficher moins",
+      "star_a_document_in_from_your_chats_to_save_it_he": "Aucun artefact enregistré pour l'instant — ajoutez un document de \"Depuis vos chats\" aux favoris pour l'enregistrer ici.",
       "star_creates_a_starred_artifact_from_this_docume": "Ajouter aux favoris (crée un artefact favori à partir de ce document)",
       "star_document": "Ajouter le document aux favoris",
       "starred": "Favoris",
@@ -7164,6 +7173,7 @@
         "recovered_continuing": "récupéré · poursuite",
         "resuming_the_interrupted_turn": "reprise du tour interrompu",
         "safety_policy_continuing": "politique de sécurité · poursuite automatique",
+        "session_busy_continuing": "session occupée · poursuite automatique",
         "tool_call_blocked": "Appel d'outil bloqué",
         "tool_stopped_responding": "L'outil ne répond plus",
         "turn_interrupted": "Tour interrompu",
@@ -7479,6 +7489,7 @@
       "double_click_to_rename": "Double-cliquez pour renommer",
       "drag_to_reorder": "Faites glisser pour réordonner",
       "drop_here_to_remove_from_folder": "Déposez ici pour retirer du dossier",
+      "drop_to_reference_session": "Déposez ici pour référencer cette session",
       "duplicate": "Dupliquer",
       "expand_folder_name": "Développer le dossier {{name}}",
       "expand_group_results": "Développer les résultats de {{group}}",
@@ -7557,6 +7568,7 @@
       "pinned": "Épinglées",
       "pinned_sessions_are_kept": "Les sessions épinglées sont conservées.",
       "popped_out_to_a_separate_window": "Détachée dans une fenêtre séparée",
+      "private_session_cannot_be_referenced": "Les sessions privées ne peuvent pas être référencées",
       "rename": "Renommer",
       "rename_flag_as_status_or_delete_tags_changes_app": "Renommez, marquez comme statut ou supprimez des étiquettes. Les modifications s'appliquent partout où les étiquettes sont affichées.",
       "resets_its_conversation": "réinitialise sa conversation",
@@ -9909,7 +9921,8 @@
         "sources": "Sources",
         "test": "Tester",
         "use_default": "Utiliser la valeur par défaut",
-        "volume": "Volume"
+        "volume": "Volume",
+        "preset_pulse": "Pulsion"
       },
       "postureDisclosure": {
         "filter": "Filtrer {{label}}",

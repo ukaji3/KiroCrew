@@ -533,9 +533,20 @@ STALE_RECOVERY_PREFIX = "[Stalled turn — automatic recovery]"
 # partial results and continue. Rendered as an "inject" message (not a user
 # bubble) and never mirrored to a linked Slack thread as user input.
 TOOL_STALL_RECOVERY_PREFIX = "[Tool stall — automatic recovery]"
+# Prefix on the continuation injected after a reset recovers an interrupted
+# connection. The body lives in chat_utils so queue provenance and turn routing
+# share one canonical instruction.
+CONN_RECOVERY_PREFIX = "[Connection lost — automatic recovery]"
+# Prefix on the continuation injected when a reset recovers a turn the backend
+# refused because the session was still busy. Separate from
+# CONN_RECOVERY_PREFIX even though both requeue the same continuation shape:
+# nothing was disconnected, and the marker is what the transcript renders, so
+# sharing the connection marker would report a dropped connection to a user
+# whose status card reads "Session busy". Body: _BUSY_RECOVER_MSG in chat_utils.
+BUSY_RECOVERY_PREFIX = "[Session busy — automatic recovery]"
 # Prefix on the runner-injected CONTINUE that resumes a turn cut short by a
 # transient backend 5xx after tokens/tools had already streamed. The body lives
-# in chat_utils as _POSTTOKEN_RECOVER_MSG; the prefix is here so all five
+# in chat_utils as _POSTTOKEN_RECOVER_MSG; the prefix is here so all eight
 # recovery markers share one home and the frontend has one list to mirror.
 POSTTOKEN_RECOVERY_PREFIX = "[Interrupted turn — automatic recovery]"
 # Prefix on the runner-injected nudge that breaks a repeated empty-generation
@@ -575,10 +586,11 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
     """Build the body of an automatic continuation after a recoverable tool refusal.
 
     When a tool call is refused for a recoverable, system-side reason — a
-    host-gate policy deny or the read-only bash safety gate — kiro-cli ends the
-    turn early with an attribution-free "tool uses were interrupted" marker. The
-    refusal reason is otherwise surfaced only to the dashboard pill and the SEL
-    audit log, never to the model, so the agent stalls and waits for the user.
+    host-gate policy deny, the read-only bash safety gate, or a PreToolUse policy
+    hook block — kiro-cli ends the turn early with an attribution-free
+    "tool uses were interrupted" marker. The refusal reason is otherwise surfaced
+    only to the dashboard pill and the SEL audit log, never to the model, so the
+    agent stalls and waits for the user.
 
     ``refusals`` is a list of ``(tool_title, reason)`` tuples recorded during the
     turn (already redacted by the caller). The returned text hands those reasons
@@ -814,6 +826,7 @@ class _ChatSlot:
         "_trust_reads",
         "_trusted_patterns",
         "_titled",
+        "_auto_tagged",
         "_title_in_flight",
         "_title_retry_pending",
         "_artifact",
@@ -926,6 +939,7 @@ class _ChatSlot:
         self._trust_reads: bool = False  # auto-approve read-only bash commands
         self._trusted_patterns: set[str] = set()  # session-scoped fnmatch globs
         self._titled: bool = False  # True once a title has been assigned
+        self._auto_tagged: bool = False  # True once auto-tag has been attempted
         # Guards against concurrent LLM auto-title attempts (on-send trigger vs
         # the end-of-turn chat_done trigger racing on the same slot).
         self._title_in_flight: bool = False
@@ -1104,7 +1118,9 @@ class _ChatSlot:
         # no-blocking-call-on-event-loop rule forbids. Refreshed at the save
         # boundary, where the lock is already held and the foreign lines are
         # already parsed.
-        self._disk_tail_ts: str | None = None        # Cached frozen-prefix bytes for the append-safe save model.
+        self._disk_tail_ts: str | None = (
+            None  # Cached frozen-prefix bytes for the append-safe save model.
+        )
         # The session file is FROZEN-PREFIX (the first _disk_older_count on-disk
         # message lines, OLDER than the in-memory window) + a fresh re-serialize
         # of the whole window. The prefix is never rewritten, so a restart that
@@ -1444,13 +1460,16 @@ class _ChatSlot:
         self._queue.append({"id": qid, "content": content, "kind": kind})
         return qid
 
-    def queue_insert(self, index: int, content: str, kind: str = "") -> str:
+    def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
-        See :meth:`queue_append` for the ``kind`` structural origin tag.
+        See :meth:`queue_append` for the ``kind`` structural origin tag. ``payload``
+        is the orthogonal question of whether the TEXT is runner-authored, read by
+        ``is_synthetic_payload_item``; a recovery entry that replays the user's own
+        message shares the recovery kind but is not machine speech.
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.insert(index, {"id": qid, "content": content, "kind": kind})
+        self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
         return qid
 
     def queue_pop(self, index: int = 0) -> dict[str, str]:
@@ -2046,6 +2065,12 @@ class DashboardState:
         self._cron_folders: list[dict[str, Any]] = []  # cron job folder groupings
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
+        # True once load_tags() parsed tags.json successfully (or seeded a
+        # fresh install). False means the vocabulary state is UNKNOWN (parse
+        # or I/O failure) — restore-time pruning must fail open then, because
+        # a legitimately-empty vocabulary (user deleted every tag) must still
+        # prune dangling ids while an unreadable one must not wipe anything.
+        self._tags_authoritative: bool = False
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -3099,9 +3124,7 @@ class DashboardState:
                 # The previous owner's slot may already be gone; fall back to
                 # deriving its key from the name in that case.
                 old_key = (
-                    effective_session_key(old_slot)
-                    if old_slot
-                    else _history_key_for(old_owner)
+                    effective_session_key(old_slot) if old_slot else _history_key_for(old_owner)
                 )
                 self.sessions.set_slack_link(old_key, "", "")
         slot._slack_linked = True
@@ -3112,9 +3135,7 @@ class DashboardState:
         if self.sessions:
             from kiro_crew.dashboard.chat_utils import effective_session_key
 
-            self.sessions.set_slack_link(
-                effective_session_key(slot), thread_ts, channel_id
-            )
+            self.sessions.set_slack_link(effective_session_key(slot), thread_ts, channel_id)
         self.push_slots_update()
 
     def get_or_create_slot(
@@ -3559,14 +3580,27 @@ class DashboardState:
         tags_path = config_dir() / self._TAGS_FILE
         file_existed = tags_path.exists()
         try:
+            vocab_ok = True
             if file_existed:
                 raw = json.loads(tags_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     self._tags = [t for t in raw if isinstance(t, dict) and t.get("id")]
+                else:
+                    # Valid JSON but not a list (e.g. {}): the vocabulary
+                    # state is UNKNOWN, same as a parse failure — do not let
+                    # restore-time pruning wipe assignments against it.
+                    vocab_ok = False
+                    logger.warning("tags.json is not a list; treating vocabulary as unknown")
+            # Authoritative only when the file is missing (fresh install,
+            # seeded below) or parsed as a list — INCLUDING a legitimately-
+            # empty [] — so restore-time pruning of dangling ids is safe.
+            self._tags_authoritative = vocab_ok
         except Exception:
             logger.warning("Failed to load tags", exc_info=True)
             # Treat a parse error like a present file: do not re-seed.
             file_existed = True
+            # Vocabulary state unknown — restore-time pruning must fail open.
+            self._tags_authoritative = False
         # Back-fill the status flag for legacy tags saved before the field existed.
         # The 5 seed ids are canonical status tags; everything else defaults to False.
         seed_ids = {t["id"] for t in self._DEFAULT_TAGS}
@@ -3597,9 +3631,37 @@ class DashboardState:
         """Persist tag vocabulary to disk (atomic write)."""
         self._atomic_write_json(config_dir() / self._TAGS_FILE, self._tags)
 
+    def save_tags_snapshot(self, snapshot: list[dict]) -> None:
+        """Persist a pre-captured tag snapshot to disk (strict -- raises on failure).
+
+        Used by the serialized tag-write path in chat_tags.py: the snapshot is
+        captured on the event loop under the tags write lock, then this write
+        runs in a worker thread. Lives here (not in chat_tags.py) so the file
+        location resolves through this module's ``config_dir`` exactly like
+        ``save_tags`` -- keeping tests that patch it working unchanged.
+
+        Raises on I/O failure so callers can roll back in-memory state and
+        surface HTTP 5xx rather than silently losing data.
+        """
+        self._atomic_write_json_strict(config_dir() / self._TAGS_FILE, snapshot)
+
     def save_tag_boards(self) -> None:
         """Persist sidebar column layout to disk (atomic write)."""
         self._atomic_write_json(config_dir() / self._TAG_BOARDS_FILE, self._tag_boards)
+
+    def save_tag_boards_snapshot(self, snapshot: list[dict]) -> None:
+        """Persist a pre-captured boards snapshot to disk (strict -- raises on failure).
+
+        Used by the tag-delete path in chat_tags.py: the snapshot is captured
+        on the event loop under the tags write lock, then this write runs in a
+        worker thread. Lives here (not in chat_tags.py) so the file location
+        resolves through this module's ``config_dir`` exactly like
+        ``save_tag_boards`` -- keeping tests that patch it working unchanged.
+
+        Raises on I/O failure so callers can roll back in-memory state and
+        surface HTTP 5xx rather than silently losing data.
+        """
+        self._atomic_write_json_strict(config_dir() / self._TAG_BOARDS_FILE, snapshot)
 
     @staticmethod
     def _atomic_write_json_strict(path: Path, data: Any) -> None:

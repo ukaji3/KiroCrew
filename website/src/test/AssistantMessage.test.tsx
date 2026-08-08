@@ -34,6 +34,22 @@ describe('AssistantMessage', () => {
     expect(screen.queryByText(/Send/)).not.toBeInTheDocument()
   })
 
+  // Regression: OPTION_MARKER_RE anchors on a closing bracket that ends the line,
+  // so a half-arrived marker can't match it and used to type itself out as prose
+  // for the width of the marker line before flipping to pills at turn end.
+  it('hides a half-streamed [OPTIONS: marker from the streamed text', () => {
+    render(<AssistantMessage content={'All done.\n\n[OPTIONS: Merge it now | Show me the d'} isStreaming={true} slotRunning={true} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('All done.')
+    expect(screen.getByTestId('md').textContent).not.toMatch(/\[OPTION/i)
+  })
+
+  // …but on a FINISHED message an unterminated marker is real content (prose about
+  // the syntax, or a truncated turn), so it must render as written.
+  it('keeps an unterminated marker once the message is no longer streaming', () => {
+    render(<AssistantMessage content={'The tag looks like [OPTIONS: A | B'} isStreaming={false} slotRunning={false} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('[OPTIONS: A | B')
+  })
+
   it('shows "Use as Plan" button for valid plan JSON', () => {
     const planContent = '<!-- plan_task_id:test-123 -->\nHere is the plan:\n```json\n[{"title":"Step 1","description":"Do thing"}]\n```'
     render(<AssistantMessage content={planContent} isStreaming={false} slotRunning={false} planTaskId="test-123" onApplyPlan={() => Promise.resolve(true)} />)
@@ -223,6 +239,27 @@ describe('AssistantMessage', () => {
     expect(forkBtn).not.toBeDisabled()
   })
 
+})
+
+describe('action footer on touch devices', () => {
+  // The footer is opacity-0 until group-hover, and a touch pointer never
+  // hovers — without the hover:none override the actions (copy, speak,
+  // regenerate, fork) are permanently invisible on phones. happy-dom does not
+  // evaluate media queries, so pin the utility class itself.
+  const footer = () => screen.getByTitle('Copy').closest('div') as HTMLElement
+
+  it('reveals the footer where the pointer cannot hover', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    expect(footer().className).toContain('[@media(hover:none)]:opacity-100')
+  })
+
+  it('keeps the footer hover-revealed for hover-capable pointers', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    const cls = footer().className
+    expect(cls).toContain('opacity-0')
+    expect(cls).toContain('group-hover/msg:opacity-100')
+    expect(cls).toContain('group-focus-within/msg:opacity-100')
+  })
 })
 
 describe('parseOptions', () => {

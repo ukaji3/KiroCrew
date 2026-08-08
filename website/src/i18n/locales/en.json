@@ -4065,6 +4065,11 @@
       "split_right_d": "Split right (⌘D)",
       "terminal_pane_coming_in_phase_2": "Terminal pane — coming in Phase 2"
     },
+    "sessionRefStrip": {
+      "n_messages": "{{n}} msgs",
+      "remove_reference": "Remove reference",
+      "remove_reference_to": "Remove reference to {{name}}"
+    },
     "settings": {
       "decrease": "Decrease",
       "increase": "Increase"
@@ -4767,6 +4772,7 @@
       "folder_actions": "Folder actions",
       "folder_breadcrumb": "Folder breadcrumb",
       "folder_color": "Folder color",
+      "from_your_chats": "From your chats",
       "kind": "Kind",
       "loading": "Loading…",
       "name": "Name",
@@ -4783,6 +4789,9 @@
       "rename_folder": "Rename folder",
       "slug": "Slug",
       "source": "Source",
+      "show_all_count": "Show all ({{count}})",
+      "show_less": "Show less",
+      "star_a_document_in_from_your_chats_to_save_it_he": "No saved artifacts yet — star a document in \"From your chats\" to save it here.",
       "star_creates_a_starred_artifact_from_this_docume": "Star (creates a starred artifact from this document)",
       "star_document": "Star document",
       "starred": "Starred",
@@ -4976,6 +4985,7 @@
         "recovered_continuing": "recovered · continuing",
         "resuming_the_interrupted_turn": "resuming the interrupted turn",
         "safety_policy_continuing": "safety policy · continuing automatically",
+        "session_busy_continuing": "session busy · continuing automatically",
         "tool_call_blocked": "Tool call blocked",
         "tool_stopped_responding": "Tool stopped responding",
         "turn_interrupted": "Turn interrupted",
@@ -5161,6 +5171,7 @@
       "double_click_to_rename": "Double-click to rename",
       "drag_to_reorder": "Drag to reorder",
       "drop_here_to_remove_from_folder": "Drop here to remove from folder",
+      "drop_to_reference_session": "Drop to reference this session",
       "duplicate": "Duplicate",
       "failed_to_load_preview": "Failed to load preview.",
       "filter": "Filter",
@@ -5202,6 +5213,7 @@
       "pinned": "Pinned",
       "pinned_sessions_are_kept": "Pinned sessions are kept.",
       "popped_out_to_a_separate_window": "Popped out to a separate window",
+      "private_session_cannot_be_referenced": "Private sessions can't be referenced",
       "rename": "Rename",
       "rename_flag_as_status_or_delete_tags_changes_app": "Rename, flag as status, or delete tags. Changes apply everywhere tags are shown.",
       "resets_its_conversation": "resets its conversation",
