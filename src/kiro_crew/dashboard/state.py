@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog  # noqa: F401
     from kiro_crew.messaging.transport import MessagingTransport  # noqa: F401
     from kiro_crew.power import SleepInhibitor  # noqa: F401
+    from kiro_crew.slack.outbound import PostedOptions  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -826,6 +827,9 @@ class _ChatSlot:
         "_trust_reads",
         "_trusted_patterns",
         "_titled",
+        "_title_origin",
+        "_title_epoch",
+        "_title_refresh_mark",
         "_auto_tagged",
         "_title_in_flight",
         "_title_retry_pending",
@@ -834,10 +838,12 @@ class _ChatSlot:
         "_todo",
         "_on_message",
         "_has_reader",
-        "_stop_state",
+        "_stop_state_raw",
+        "_stop_generation",
         "_stop_event_id",
         "_stop_escalated_card_id",
         "_pending_reset_history_key",
+        "_eager_spawn_task",
         "_dirty_flag",
         "_dirty_gen",
         "_orch_tracker",
@@ -869,6 +875,8 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_transient_5xx_retries",
         "_posttoken_retry_used",
+        "_prestream_exhausted_cycles",
+        "_poisoned_reset_used",
         "_empty_response_retries",
         "_batch_rejected",
         "_compaction_fail_streak",
@@ -939,6 +947,25 @@ class _ChatSlot:
         self._trust_reads: bool = False  # auto-approve read-only bash commands
         self._trusted_patterns: set[str] = set()  # session-scoped fnmatch globs
         self._titled: bool = False  # True once a title has been assigned
+        # Provenance of the current title: "auto" (LLM auto-titler or its
+        # fallback) or "user" (manual rename). Governs the background title
+        # REFRESH: only "auto" titles are ever refreshed, so a manual rename is
+        # final. Persisted as ``title_origin`` and rehydrated in
+        # chat_persistence; a legacy title with no stored origin rehydrates as
+        # "user" so a possibly-manual name is never rewritten. "" = untitled.
+        self._title_origin: str = ""
+        # Monotonic counter bumped on every EXPLICIT title assignment (manual
+        # rename or the manual generate-title endpoint). Background title tasks
+        # snapshot it before generating and re-check it after each await, so an
+        # explicit title landing mid-generation is never overwritten (see
+        # chat_title._maybe_auto_title / maybe_refresh_title).
+        self._title_epoch: int = 0
+        # User-message count at the last background title refresh ATTEMPT (0 =
+        # never refreshed). Each milestone in chat_title._TITLE_REFRESH_MILESTONES
+        # fires at most once, attempt-counted (a KEEP/SKIP/error consumes it), so
+        # the refresh token budget is hard-bounded. Persisted so a gateway
+        # restart cannot re-spend consumed milestones.
+        self._title_refresh_mark: int = 0
         self._auto_tagged: bool = False  # True once auto-tag has been attempted
         # Guards against concurrent LLM auto-title attempts (on-send trigger vs
         # the end-of-turn chat_done trigger racing on the same slot).
@@ -964,7 +991,15 @@ class _ChatSlot:
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         self._has_reader: bool = False  # True when HTTP SSE stream is draining
-        self._stop_state: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
+        self._stop_state_raw: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
+        # Monotonic count of stop INITIATIONS (idle → active edges of
+        # _stop_state). Teardown resets _stop_state back to "idle" but never
+        # touches this, so long-running decision points (the poisoned-
+        # conversation canary probe) can capture it before a wait and detect
+        # a Stop that fired AND resolved during the wait — re-reading
+        # _stop_state alone would miss it (the exact race documented in
+        # chat_handlers._make_stop_resolver).
+        self._stop_generation: int = 0
         self._stop_event_id: str | None = None  # transcript message id for in-flight stop
         # Id of the stop card the user escalated to a hard kill, or None. Kept
         # separate from `_stop_state` because turn teardown resets that back to
@@ -980,6 +1015,10 @@ class _ChatSlot:
         # inline because the endpoint can be reached from inside the kiro-cli
         # process group via the set_project MCP tool.
         self._pending_reset_history_key: str | None = None
+        # Debounced speculative session-creation task (session.eager_spawn).
+        # At most one per slot: scheduling a new one cancels the previous, so
+        # rapid signals (create + project set) collapse into a single spawn.
+        self._eager_spawn_task: asyncio.Task[None] | None = None
         self._dirty_flag: bool = False  # True when messages changed since last flush
         # Bumped by the _dirty setter on every True. Lets the periodic flush tell
         # "the True I started this save under" from "a NEW True set during it".
@@ -1060,6 +1099,21 @@ class _ChatSlot:
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
         # completed turn alongside _transient_5xx_retries.
         self._posttoken_retry_used: bool = False
+        # Poisoned-conversation escalation (cross-cycle). A cycle that EXHAUSTS
+        # the transient-5xx ladder with ZERO output counts one pre-stream
+        # exhaustion; consecutive exhausted cycles indicate the backend is
+        # deterministically rejecting this session's persisted conversation
+        # (not a momentary blip — a fresh session on the same gateway works).
+        # At the threshold, chat_runner discards the native conversation
+        # (clearing the poisoned resume sid, keeping the session-map entry)
+        # and re-queues once. Streak broken only by a LANDED turn or a
+        # non-matching terminal error.
+        self._prestream_exhausted_cycles: int = 0
+        # One-shot guard for that discard+retry: consumed when a discard is
+        # enqueued, re-armed only by a LANDED turn — so a genuine prolonged
+        # outage gets at most one fresh-conversation attempt, never a
+        # discard loop.
+        self._poisoned_reset_used: bool = False
         self._empty_response_retries: int = 0
         self._batch_rejected: bool = False
         # Per-turn compaction-status failure tracking (Mesh compaction-spam
@@ -1218,6 +1272,20 @@ class _ChatSlot:
     @property
     def _plan_stage_count(self) -> int:
         return len(self._stage_titles)
+
+    @property
+    def _stop_state(self) -> str:
+        return self._stop_state_raw
+
+    @_stop_state.setter
+    def _stop_state(self, value: str) -> None:
+        # Count stop INITIATIONS (idle → active edge) in a monotonic
+        # generation that teardown never rewinds — see __init__ comment.
+        # Escalations (soft_pending → killing) and resets (→ idle) are not
+        # new initiations and do not bump it.
+        if value != "idle" and self._stop_state_raw == "idle":
+            self._stop_generation += 1
+        self._stop_state_raw = value
 
     @property
     def _stopping(self) -> bool:
@@ -1667,6 +1735,7 @@ class _ChatSlot:
                     "/pull/" not in candidate
                     and "/merge_requests/" not in candidate
                     and "/issues/" not in candidate
+                    and "/browse/" not in candidate
                 ):
                     continue
                 # Every attempt is charged, whether it parses or not -- that is
@@ -1687,6 +1756,12 @@ class _ChatSlot:
                         # "change" for older payloads, so the frontend defaults
                         # rather than requires it.
                         "kind": ref.kind,
+                        # Jira chips label as PROJECT-NUMBER, so the project key
+                        # (carried in ``repo``) is identity, not decoration.
+                        # Sent only for Jira: GitHub/GitLab chips label by
+                        # number alone and their repo would be payload for
+                        # nothing on every slots push.
+                        **({"repo": ref.repo} if ref.provider == "jira" else {}),
                     }
         links = list(found.values())
         self._source_links_cache = (cache_key, links)
@@ -2038,6 +2113,20 @@ class DashboardState:
         self.notification_channel_settings = ChannelSettings()
         self._slots: dict[str, _ChatSlot] = {}
         self._slack_to_slot: dict[str, str] = {}  # Slack session_key → slot name
+        # Live OPTIONS controls, keyed by the SESSION KEY that owns them.
+        #
+        # Deliberately here and not on ``_ChatSlot``: a plain Slack thread often
+        # has no dashboard slot at all, and a slot-held record was simply dropped
+        # for those sessions — so the whole expiry lifecycle never engaged and the
+        # stale click it exists to prevent stayed possible (#1694). Keying by
+        # session key makes the slotless case ordinary rather than special.
+        #
+        # One store, not a slot field plus a fallback: a slot can come into
+        # existence at any moment (the channel surface reconciler creates one), so
+        # a fallback map would go invisible the instant one appeared. It also
+        # removes the two-store divergence that let a record be filed under one
+        # index and cleared under another.
+        self._slack_options_by_key: dict[str, tuple[PostedOptions, ...]] = {}
         self._slot_counter = 0
         # slot key → last context-meter reading, for seeding the bar when a
         # session is reopened after its ACP session is gone. Readings this
@@ -2762,9 +2851,7 @@ class DashboardState:
             # snapshots — do not narrow it without giving this set its own lock.
             seen = set(keys)
             keys.extend(
-                k
-                for k in getattr(self, "unrestored_slot_keys", frozenset())
-                if k not in seen
+                k for k in getattr(self, "unrestored_slot_keys", frozenset()) if k not in seen
             )
             payload = json.dumps({"keys": keys, "ts": time.time()})
             # Use the canonical atomic_write helper, not a deterministic
@@ -2944,6 +3031,32 @@ class DashboardState:
     def get_slot(self, name: str) -> _ChatSlot | None:
         """Look up a slot by name without creating it. Returns None if absent."""
         return self._slots.get(name)
+
+    def running_session_keys(self) -> frozenset[str]:
+        """Session keys with a turn in flight right now.
+
+        This is the only signal for "something is using this session at this
+        instant", as distinct from "this session could be resumed" — which is what
+        a ``session_map`` entry means. Storage reclamation needs the first
+        question: moving a session's files is dangerous while a turn is running,
+        and merely being resumable is not.
+
+        Exposed as a method rather than leaving callers to read ``_slots`` so a
+        test double cannot invent the interface: a fake that grants an attribute
+        this class does not have would assert against a fiction while the feature
+        is dead at runtime.
+        """
+        # Local import: chat_utils imports from this module, so a top-level import
+        # would close a cycle. Same shape as the other call sites in this file.
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        # Snapshot the values first. This is called from a worker thread (the
+        # storage scan runs off the event loop), so the loop can create or drop a
+        # slot mid-iteration — which raises RuntimeError and turns an inventory
+        # read into a 500. A list() copy is atomic enough for that.
+        return frozenset(
+            effective_session_key(slot) for slot in list(self._slots.values()) if slot.running
+        )
 
     def spend_slot_by_session(self) -> dict[str, str]:
         """Map each live slot's SESSION key to the SLOT key its spend is filed under.
@@ -3285,6 +3398,24 @@ class DashboardState:
         except Exception:
             pass
         self._slots[name] = slot
+        # Publish the updated key set to SessionManager and the surface
+        # registry NOW, not just on the HTTP slot endpoints. Slots born here
+        # programmatically (auto-research campaign workers, cron/workflow
+        # inject, task runner, spec builder) never pass through those
+        # endpoints, so ``_active_dashboard_slots`` stayed stale and the idle
+        # sweep's orphan branch reaped their live sessions as "slot gone" —
+        # killing the companion subagent runtime (and any subagent mid-prompt
+        # on it) along the way. Guarded: tests build this state without a
+        # SessionManager, and a sync failure must never break slot creation.
+        if self.sessions:
+            try:
+                from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
+
+                _sync_dashboard_slots(self)
+            except Exception:
+                logger.warning(
+                    "get_or_create_slot: active-slot sync failed for %s", name, exc_info=True
+                )
         self.push_slots_update()
         return slot
 

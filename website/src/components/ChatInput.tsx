@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, FolderOpen, FileText, ChevronDown, Check } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import VoiceStatusBar from './VoiceStatusBar'
@@ -26,14 +26,14 @@ import TrustDropdown from './TrustDropdown'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
-import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import BusySendButton, { useBusySendMode } from './BusySendButton'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useImeGuard } from '../hooks/useImeGuard'
 import ContextBar, { contextTip, contextPctClamped, contextColor } from './ContextBar'
 import PasteHighlightLayer, { INPUT_TYPO } from './PasteHighlightLayer'
 import FollowUpBar from './FollowUpBar'
 import { dispatchLightbox } from './MarkdownRenderer'
-import { IMG_EXT } from '../utils/fileTokens'
+import { IMG_EXT, buildFileLabels } from '../utils/fileTokens'
 import type { ResizeInfo } from '../utils/resizeImage'
 import type { SubagentActivity } from '../types'
 import { platformShortcut } from '../utils/platform'
@@ -70,6 +70,7 @@ export {
 import { effortLabel } from '../lib/effort'
 import SlashCommandMenu from './SlashCommandMenu'
 import FilePickerMenu from './FilePickerMenu'
+import type { FileKind } from './FilePickerMenu'
 import SkillPickerMenu from './SkillPickerMenu'
 import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
@@ -88,39 +89,6 @@ const FILE_PREVIEW_H = 81 // h-16 (64px) + py-2 (16px) + border-t (1px)
 const SESSION_REF_STRIP_H = 43
 const INPUT_DRAG_MAX_RATIO = 0.5
 const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
-
-// Send behavior while a turn is RUNNING. 'steer' (default) injects the
-// composer into the running turn; 'queue' defers it to the next turn. The
-// user picks via the split send button's dropdown; choice persists.
-const BUSY_SEND_MODE_LS_KEY = 'mc-busy-send-mode'
-type BusySendMode = 'steer' | 'queue'
-/**
- * Catalog KEYS for the two busy-send modes' menu copy.
- *
- * Keys, not strings: `BUSY_SEND_MODES` is built at module load, so an `i18nT()`
- * call in it would freeze whatever language was active at boot and never
- * re-resolve on a language switch. The lookups happen in the menu's render.
- *
- * Held apart from `BUSY_SEND_MODES` and shaped as flat `Record`s of full literal
- * keys, indexed inline at the `i18nT()` call, because that is the only form
- * `scripts/check-i18n-keys.mjs` can resolve statically — nested in the array and
- * read as `i18nT(m.labelKey)` the gate cannot see the key at all.
- *
- * `steer` reuses the label the split button's `aria-label` already ships rather
- * than sending a duplicate English string to ten locales.
- */
-const BUSY_SEND_MODE_LABEL_KEY: Record<BusySendMode, string> = {
-  steer: 'components.chatInput.steer',
-  queue: 'components.chatInput.queue',
-}
-const BUSY_SEND_MODE_DESC_KEY: Record<BusySendMode, string> = {
-  steer: 'components.chatInput.steer_desc',
-  queue: 'components.chatInput.queue_desc',
-}
-const BUSY_SEND_MODES: Array<{ mode: BusySendMode; icon: React.ReactNode }> = [
-  { mode: 'steer', icon: <Target size={15} /> },
-  { mode: 'queue', icon: <ArrowUpFromLine size={15} /> },
-]
 
 // Prompt undo/redo tuning. The chat textarea is a controlled component, so any
 // programmatic value reset (send-clear, ↑/↓ history recall, prompt optimize)
@@ -224,14 +192,18 @@ interface ChatInputProps {
    * surfaces like the feature tip can never drift out of alignment the way
    * parallel sibling containers with percentage widths do. */
   aboveComposer?: React.ReactNode
-  /** When true (turn is running), show the split Steer/Queue send button.
-   * v1 gates on turn-running only; if the slot's backend is not steer-capable
-   * (e.g. claude), the POST safely falls through to the queue server-side.
+  /** When true (composer is busy — a running turn, or background sub-agents
+   * still running for the slot), show the split Steer/Queue send button.
+   * Steer's meaning follows the state: mid-turn it injects into the live turn;
+   * with only sub-agents running it starts a turn now instead of parking the
+   * message behind them. If the slot's backend is not steer-capable (e.g.
+   * claude), the POST safely falls through to the queue server-side.
    * Plumbing a per-slot capability flag is a follow-up. */
   canSteer?: boolean
-  /** Inject a mid-turn steer into the running turn. Reads the composer text
-   * and pending files itself (ChatPage) and clears them atomically — ChatInput
-   * must NOT clear the value around this call. */
+  /** Act on the composer NOW rather than queueing: a mid-turn steer into the
+   * running turn, or a fresh turn when only sub-agents are running. Reads the
+   * composer text and pending files itself (ChatPage) and clears them
+   * atomically — ChatInput must NOT clear the value around this call. */
   onSteer?: () => void
   disabled?: boolean
   placeholder?: string
@@ -245,10 +217,14 @@ interface ChatInputProps {
   uploading?: boolean
   /** Pending file paths (images + non-images) for preview strip */
   pendingFiles?: string[]
+  /** Pending folder references for the preview strip: RELATIVE paths with trailing slash, derived from `@rel/` composer tokens (a path reference handed to the agent, not an upload) */
+  pendingDirs?: string[]
   /** Resize details keyed by pending-file path; renders a badge on the chip */
   resizedInfo?: Record<string, ResizeInfo>
   /** Remove a pending file by path */
   onRemoveFile?: (path: string) => void
+  /** Remove a pending folder reference by its relative path (strips its composer token) */
+  onRemoveDir?: (path: string) => void
   /** Session references staged by dragging a session onto the chat pane.
    *  Rendered as chips above the textarea, the same treatment as attachments.
    *  Serialized as links (never transcripts) when the message is sent. */
@@ -281,6 +257,8 @@ interface ChatInputProps {
   voiceError?: string | null
   voiceLevel?: number
   voiceDeviceLabel?: string
+  /** deviceId of the track actually capturing (data-driven picker checkmark). */
+  voiceDeviceId?: string
   onClearVoiceError?: () => void
   /** Show the animated dictation panel while recording (stt.dictation_panel). */
   voiceDictationPanel?: boolean
@@ -336,7 +314,11 @@ interface ChatInputProps {
   reasoningEffort?: string
   onReasoningEffortClick?: (rect: DOMRect) => void
   providerId?: string
-  onFileSelect?: (path: string) => void
+  /** Invoked when an @-mention picks a file or directory. `kind` defaults to
+   *  'file'. `token` is the exact composer text the pick inserted (e.g.
+   *  "@src/pages/"), computed against the picker's search root — the staging
+   *  side records it so a later chip-remove can strip precisely this token. */
+  onFileSelect?: (path: string, kind?: FileKind, token?: string) => void
   onFileOpen?: (path: string) => void
   project?: string
   /** Checked-out branch of the active project (or short SHA when detached). */
@@ -422,10 +404,10 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   )
 }
 
-function FilePreviewStrip({ files, resizedInfo, onRemove }: { files: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void }) {
+function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
   const imgs = files.filter(p => IMG_EXT.test(p))
   const nonImgs = files.filter(p => !IMG_EXT.test(p))
-  if (!imgs.length && !nonImgs.length) return null
+  if (!imgs.length && !nonImgs.length && !dirs.length) return null
   return (
     // NOTE: rendered height must match FILE_PREVIEW_H constant, update both together
     <div className="flex gap-2 px-5 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-end" data-image-scope="">
@@ -463,6 +445,31 @@ function FilePreviewStrip({ files, resizedInfo, onRemove }: { files: string[]; r
           )}
         </div>
       ))}
+      {/* Folder references: a path handed to the agent, not an upload. No
+          /api/file-raw thumbnail is fetched — there is no content to preview.
+          Labels are basename-first and widen by parent segments on collision
+          (shared buildFileLabels rule), so two staged `pages/` folders from
+          different parents stay tellable apart. */}
+      {(() => {
+        // buildFileLabels splits on `/` only, so normalize Windows separators
+        // for label computation; keys and tooltips keep the original rel.
+        const normDir = (d: string) => d.replace(/\\/g, '/').replace(/\/+$/, '')
+        const dirLabels = buildFileLabels(dirs.map(normDir))
+        return dirs.map(path => (
+        <div
+          key={path}
+          data-dir-chip=""
+          title={path}
+          className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
+        >
+          <Folder size={12} aria-label={i18nT('components.filePickerMenu.folder')} className="shrink-0 lucide-inline" />
+          <span>{(dirLabels.get(normDir(path)) || path) + '/'}</span>
+          {onRemoveDir && (
+            <button aria-label={i18nT('components.filePickerMenu.remove_folder')} className="text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0" onClick={() => onRemoveDir(path)} title={i18nT('components.filePickerMenu.remove_folder')}><X size={12} /></button>
+          )}
+        </div>
+        ))
+      })()}
     </div>
   )
 }
@@ -485,8 +492,10 @@ function ChatInput({
   onUploadFiles,
   uploading = false,
   pendingFiles = [],
+  pendingDirs = [],
   resizedInfo,
   onRemoveFile,
+  onRemoveDir,
   pendingSessions = [],
   onRemoveSessionRef,
   isMac = false,
@@ -504,6 +513,7 @@ function ChatInput({
   voiceError = null,
   voiceLevel = 0,
   voiceDeviceLabel = '',
+  voiceDeviceId = '',
   voiceDictationPanel = false,
   voiceStreaming = false,
   voiceSampleRef,
@@ -914,59 +924,13 @@ function ChatInput({
     el.click()
     setPlusOpen(false)
   }
-  // Split send button (running turn): 'steer' (default) vs 'queue', chosen via
-  // the chevron dropdown and persisted so the preference sticks across sessions.
-  const [busySendMode, setBusySendMode] = useState<BusySendMode>(() => {
-    try { return localStorage.getItem(BUSY_SEND_MODE_LS_KEY) === 'queue' ? 'queue' : 'steer' } catch { return 'steer' }
-  })
-  const [busyMenuOpen, setBusyMenuOpen] = useState(false)
-  const [busyMenuRect, setBusyMenuRect] = useState<DOMRect | null>(null)
-  const busySplitRef = useRef<HTMLDivElement>(null)
-  const busyMenuRef = useRef<HTMLDivElement>(null)
-  const busyCaretRef = useRef<HTMLButtonElement>(null)
-  // This menu has no filter input; the ref stays null so useListboxKeyboard
-  // treats ArrowUp from the first option as a no-op instead of a focus jump.
-  const busyNoInputRef = useRef<HTMLElement | null>(null)
-  const closeBusyMenuToTrigger = useCallback(() => {
-    setBusyMenuOpen(false)
-    busyCaretRef.current?.focus()
-  }, [])
-  // Keyboard operability for the portaled menu (WAI-ARIA menu pattern):
-  // focus moves into the first option on open, ArrowUp/Down + Home/End roam,
-  // Escape/Tab close and return focus to the caret trigger.
-  const { onListKeyDown: onBusyMenuKeyDown } = useListboxKeyboard({
-    open: busyMenuOpen,
-    dropdownRef: busyMenuRef,
-    inputRef: busyNoInputRef,
-    hasFilterInput: false,
-    filteredCount: BUSY_SEND_MODES.length,
-    onEnterSingleMatch: () => {},
-    closeToTrigger: closeBusyMenuToTrigger,
-  })
-  useEffect(() => {
-    if (!busyMenuOpen) return
-    // Menu is portaled to <body> (escapes the input's overflow-hidden), so the
-    // outside-click guard must exclude both the split button and the menu.
-    const h = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (!busySplitRef.current?.contains(t) && !busyMenuRef.current?.contains(t)) setBusyMenuOpen(false)
-    }
-    document.addEventListener('mousedown', h)
-    return () => document.removeEventListener('mousedown', h)
-  }, [busyMenuOpen])
-  const toggleBusyMenu = () => {
-    if (!busyMenuOpen && busySplitRef.current) setBusyMenuRect(busySplitRef.current.getBoundingClientRect())
-    setBusyMenuOpen(o => !o)
-  }
-  const selectBusyMode = (m: BusySendMode) => {
-    setBusySendMode(m)
-    safeSetItem(BUSY_SEND_MODE_LS_KEY, m)
-    closeBusyMenuToTrigger()
-  }
-  // Steer is the active Enter/send action only while a live (not stopping)
-  // turn is running on a steer-capable slot and the user hasn't switched the
+  // Split send button while the composer is BUSY: 'steer' (default) vs 'queue'.
+  // The mode is a shared, persisted preference — see BusySendButton.
+  const [busySendMode, setBusySendMode] = useBusySendMode()
+  // Steer is the active Enter/send action only while the composer is busy and
+  // not stopping, on a steer-capable slot, and the user hasn't switched the
   // split button to Queue. Everywhere else the composer falls back to onSend
-  // (normal send, or server-side queue while running).
+  // (normal send, or server-side queue while busy).
   const steerActive = isRunning && (!stopState || stopState === 'idle') && !!canSteer && !!onSteer && busySendMode === 'steer'
   const fireComposer = useCallback(() => {
     if (disabled) return
@@ -1730,8 +1694,8 @@ function ChatInput({
       // default Enter behavior (newline insert into draft) doesn't leak
       // through when the gateway is offline. The action itself is gated on
       // `connected` to match the disabled-state on the Send button.
-      // While a turn is running, Enter follows the split-button mode:
-      // steer (default) injects into the running turn; queue defers.
+      // While the composer is busy, Enter follows the split-button mode:
+      // steer (default) acts on the text now; queue defers it.
       e.preventDefault()
       if (connected) fireComposer()
       return
@@ -2019,7 +1983,10 @@ function ChatInput({
     e.target.value = '' // reset so same file can be re-selected
   }, [onUploadFiles])
 
-  const hasFiles = pendingFiles.length > 0
+  // The preview strip renders for folder references too, so height
+  // compensation must key off both staged families — otherwise a dirs-only
+  // strip appears with no wrapper expansion and eats into the textarea.
+  const hasFiles = pendingFiles.length > 0 || pendingDirs.length > 0
   const hasSessionRefs = pendingSessions.length > 0
   /** Combined height of every strip currently stacked above the textarea. The
    *  manual-resize floor and the transient height adjustment below both work off
@@ -2295,10 +2262,13 @@ function ChatInput({
           open={filePickerOpen}
           project={project}
           onFileOpen={onFileOpen}
-          onSelect={({ path, relativePath }) => {
+          onSelect={({ path, relativePath, kind }) => {
+            // relativePath already carries a trailing slash for directories
+            // (see selectionFor in FilePickerMenu), so the inserted token reads
+            // as e.g. "@src/pages/ " and is unambiguously a folder.
             applyPickedToken(/(^|[\s])@\S*$/, `@${relativePath} `)
             setFilePickerOpen(false); setFileQuery('')
-            onFileSelect(path)
+            onFileSelect(path, kind, `@${relativePath}`)
           }}
           onClose={() => { setFilePickerOpen(false); setFileQuery('') }}
         />
@@ -2351,12 +2321,12 @@ function ChatInput({
         onDrop={onDrop}
       >
         <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} />
-        <FilePreviewStrip files={pendingFiles} resizedInfo={resizedInfo} onRemove={onRemoveFile} />
+        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} />
 
         {showDictation ? (
-          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} />
+          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} />
         ) : (
-          <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} />
+          <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} />
         )}
 
         {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-yellow-400" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
@@ -2582,66 +2552,12 @@ function ChatInput({
               // waits for the turn to end and rides the idle send button.
               value.trim() || pendingFiles.length ? (
                 canSteer && onSteer ? (
-                  /* Split send button (mock: [ action | ▾ ]) — main area fires the
-                   * selected busy-send mode (steer by default, same as Enter);
-                   * the chevron opens a dropdown to switch modes (persisted). */
-                  <div className="relative flex items-center" ref={busySplitRef}>
-                    <div className={`flex items-stretch h-8 rounded-full overflow-hidden transition-colors ${busySendMode === 'steer' ? 'bg-accent text-accent-fg' : 'bg-warn text-warn-fg'}`}>
-                      <button
-                        className="w-8 h-8 bg-transparent border-none flex items-center justify-center cursor-pointer hover:bg-black/15 transition-all text-inherit"
-                        onClick={fireComposer}
-                        disabled={disabled}
-                        title={busySendMode === 'steer' ? i18nT('components.chatInput.steer_inject_into_the_running_turn_enter') : i18nT('components.chatInput.queue_run_after_the_current_turn_finishes_enter')}
-                        aria-label={busySendMode === 'steer' ? i18nT('components.chatInput.steer') : i18nT('components.chatInput.queue_message')}
-                        data-testid="busy-send-button"
-                      >
-                        {busySendMode === 'steer' ? <Target size={16} /> : <ArrowUpFromLine size={16} />}
-                      </button>
-                      <div className="w-px my-1.5 bg-current opacity-40" aria-hidden="true" />
-                      <button
-                        ref={busyCaretRef}
-                        className="w-6 h-8 bg-transparent border-none flex items-center justify-center cursor-pointer hover:bg-black/15 transition-all text-inherit"
-                        onClick={toggleBusyMenu}
-                        aria-haspopup="menu"
-                        aria-expanded={busyMenuOpen}
-                        aria-label={i18nT('components.chatInput.send_options')}
-                        title={i18nT('components.chatInput.send_options')}
-                        data-testid="busy-send-caret"
-                      >
-                        <ChevronDown size={14} className={`transition-transform ${busyMenuOpen ? 'rotate-180' : ''}`} />
-                      </button>
-                    </div>
-                    {busyMenuOpen && busyMenuRect && createPortal(
-                      <div
-                        ref={busyMenuRef}
-                        role="menu"
-                        onKeyDown={onBusyMenuKeyDown}
-                        className="fixed w-[250px] rounded-xl bg-bg-elevated border border-border shadow-xl p-1.5 animate-slide-up z-[60]"
-                        style={{ left: Math.max(8, Math.min(busyMenuRect.right - 250, window.innerWidth - 250 - 8)), bottom: window.innerHeight - busyMenuRect.top + 8 }}
-                      >
-                        {BUSY_SEND_MODES.map(({ mode, icon }) => (
-                          <button
-                            key={mode}
-                            role="menuitemradio"
-                            aria-checked={busySendMode === mode}
-                            data-option=""
-                            tabIndex={-1}
-                            onClick={() => selectBusyMode(mode)}
-                            className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover focus:bg-bg-hover focus:outline-none transition-colors cursor-pointer text-left border-none"
-                            data-testid={`busy-send-mode-${mode}`}
-                          >
-                            <span className={`shrink-0 ${mode === 'steer' ? 'text-accent' : 'text-warn'}`}>{icon}</span>
-                            <div className="min-w-0 flex-1">
-                              <div className="text-[12px] font-medium text-text">{i18nT(BUSY_SEND_MODE_LABEL_KEY[mode])}</div>
-                              <div className="text-[11px] text-muted leading-snug">{i18nT(BUSY_SEND_MODE_DESC_KEY[mode])}</div>
-                            </div>
-                            {busySendMode === mode && <Check size={14} className="text-accent shrink-0" />}
-                          </button>
-                        ))}
-                      </div>,
-                      document.body
-                    )}
-                  </div>
+                  <BusySendButton
+                    mode={busySendMode}
+                    onModeChange={setBusySendMode}
+                    onFire={fireComposer}
+                    disabled={disabled}
+                  />
                 ) : (
                   <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 disabled:opacity-30 disabled:cursor-not-allowed transition-all" onClick={fireComposer} disabled={disabled} title={i18nT('components.chatInput.queue_message')} aria-label={i18nT('components.chatInput.queue_message')}>
                     <ArrowUpFromLine size={18} />

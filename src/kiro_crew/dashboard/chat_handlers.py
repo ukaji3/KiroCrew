@@ -21,6 +21,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     _workspace_name_for_dir,
@@ -34,6 +35,8 @@ from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_orchestrator import _stage_loop
 from kiro_crew.dashboard.chat_persistence import (
     _attach_variants,
+    _rehydrate_title_origin,
+    _rehydrate_title_refresh_mark,
     get_reasoning_effort_values,
     save_slot_off_loop,
 )
@@ -41,6 +44,7 @@ from kiro_crew.dashboard.chat_runner import (
     _context_usage_payload,
     _run_chat,
     _start_next_queued_turn,
+    schedule_eager_spawn,
 )
 from kiro_crew.dashboard.chat_title import _maybe_auto_title
 from kiro_crew.dashboard.chat_utils import (
@@ -957,6 +961,13 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             title, _ = redact_credentials(title)
             slot.title = title
             slot._titled = True
+            # A pinned title is caller-explicit: record origin "user" so the
+            # background title refresh never rewrites it (this endpoint can
+            # address an ALREADY-auto-titled slot whose origin would otherwise
+            # stay "auto"), and bump the epoch so an in-flight background
+            # attempt stands down instead of clobbering the pin.
+            slot._title_origin = "user"
+            slot._title_epoch += 1
         # Bind to an artifact if provided (companion chat). Validate
         # against the artifact slug grammar so an injection-shaped value can never
         # land on the slot; anything invalid is silently dropped. Uniqueness (≤1
@@ -1008,8 +1019,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # client's slot updates behind one session's file lock. The in-memory slot
     # is the source of truth and was already broadcast at block exit; a failed
     # write re-arms the periodic flush (best_effort).
-    if folder_id:
+    # A pinned title must persist too (not just a folder move): without the
+    # write, a restart rehydrates the previous title with a refreshable "auto"
+    # origin and the background refresh may rewrite the pin.
+    if folder_id or title:
         await save_slot_off_loop(state, slot, force=True)
+    # Speculative session creation: overlap the ACP handshake with the user's
+    # think-time before their first message. No-op unless session.eager_spawn.
+    schedule_eager_spawn(state, slot)
     return web.json_response(state.serialize_slot(slot))
 
 
@@ -1913,6 +1930,13 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     # ask_question holds an MCP worker on a blocked HTTP request, and the slot
     # is going away, so nobody will ever answer its card.
     _unblock_pending_waits(state, slot)
+    # Cancel any pending speculative session creation. Without this, an
+    # eager task mid-debounce or mid-handshake outlives the slot; combined
+    # with the task's own post-create liveness re-check this closes both
+    # halves of the delete/recreate race.
+    _eager = getattr(slot, "_eager_spawn_task", None)
+    if _eager is not None and not _eager.done():
+        _eager.cancel()
     if slot.running and slot.task is not None:
         slot.task.cancel()
         try:
@@ -2103,17 +2127,34 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             # the slot had recorded the alias's workspace. A materialized agent
             # previously matched nothing here at all, so the slot kept the
             # PREVIOUS agent's project — latent until app agents could dispatch.
-            bindings = resolve_agent_bindings(cfg, agent_name)
+            # Resolve WITH the slot's project scope (warmed off-loop first) so a
+            # project agent counts as resolved rather than falling back.
+            await warm_project_agent_names(slot.project or None)
+            bindings = resolve_agent_bindings(cfg, agent_name, slot.project or None)
             ws_name = _workspace_name_for_dir(cfg, bindings.workspace_dir)
             slot.workspace = ws_name
             workspace = ws_name
-            slot.project = default_project_dir(workspace)
+            # A project-scope agent exists only inside slot.project: kiro-cli
+            # resolves --agent against $PWD/.kiro/agents, so resetting the
+            # project here would make the very agent just selected unresolvable
+            # on the next turn (slot advertises it, default answers — the
+            # silent-substitution bug #1684 exists to remove). Aliases keep the
+            # reset: their project comes from their own workspace bindings.
+            is_project_agent = agent_name not in cfg.agents and agent_name in (
+                cached_project_agent_names(slot.project or None) or frozenset()
+            )
+            if not is_project_agent:
+                slot.project = default_project_dir(workspace)
     except Exception:
         logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
 
     # Reset session so next message uses the new agent
     logger.info("Slot %s agent switched to %r, resetting session", name, agent_name or "kirocrew")
     await _reset_slot_session(state, slot, _history_key_for(name))
+    # The reset destroyed any eagerly created session; picking an agent is
+    # itself a strong first-message intent signal (it also resets the
+    # project), so re-arm the speculative spawn for the new bindings.
+    schedule_eager_spawn(state, slot)
     # Persist the new agent so the session resumes under the correct agent
     # after a gateway restart.  Written after reset succeeds so we never
     # advertise an agent we couldn't actually switch to.
@@ -2610,6 +2651,11 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     # inline reset would killpg() the caller. Consumed in chat_runner.
     if project != old_project:
         slot._pending_reset_history_key = _history_key_for(name)
+        # Speculatively re-create the session rooted at the new project so the
+        # cwd change is paid during think-time. The eager task consumes the
+        # deferred reset itself, but only when no turn is running — the
+        # same killpg constraint that deferred the reset applies to it.
+        schedule_eager_spawn(state, slot)
     state.push_slots_update()
     return web.json_response({"ok": True, "project": project})
 
@@ -2936,19 +2982,44 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         # map can no longer name its session.
         channel_origin=is_channel_session_key(history_key),
     )
+    # PERSISTED METADATA IS AUTHORITATIVE for the title. The sidebar's resume
+    # call always sends a ``title`` (see website/src/api/client.ts
+    # resumeChatSlot: ``title: title || key``), and that value is client
+    # chrome — often a STALE echo of an older name (a notification deep link,
+    # a sidebar row rendered before a background refresh landed). Classifying
+    # request titles (echo vs override) is unwinnable against staleness: a
+    # stale echo is indistinguishable from a deliberate override. So the
+    # request title is used ONLY when no persisted title exists; otherwise the
+    # persisted title and its provenance are restored exactly like the
+    # chat_persistence loaders (resume is the THIRD hydration path).
+    meta = state.conversation_log.get_metadata(history_key)
+    raw_persisted_title = meta.get("title")
+    # Accept the persisted title only when it is a string: a legacy or
+    # hand-corrupted JSONL could carry a non-string here, and redacting it
+    # would raise TypeError and 500 the resume. Non-string == absent.
+    persisted_title = raw_persisted_title if isinstance(raw_persisted_title, str) else ""
     title = body.get("title", "")
-    if title:
+    if persisted_title:
+        safe_title, _ = redact_exfiltration_urls(persisted_title)
+        safe_title, _ = redact_credentials(safe_title)
+        slot.title = safe_title
+        slot._titled = True
+        slot._title_origin = _rehydrate_title_origin(True, meta.get("title_origin"))
+        slot._title_refresh_mark = _rehydrate_title_refresh_mark(
+            meta.get("title_refresh_mark")
+        )
+    elif title:
+        # Never-titled session with a caller-supplied name: apply it, with
+        # conservative "user" provenance (unknown origin — the background
+        # refresh must never rewrite it) and an epoch bump so any in-flight
+        # background attempt stands down.
         slot.title = title
         slot._titled = True
-    else:
-        sessions = state.conversation_log.list_sessions()
-        for s in sessions:
-            if s.get("key") == history_key:
-                slot.title = s.get("title", history_key)
-                slot._titled = True
-                break
-    # Restore original created_at from history metadata
-    meta = state.conversation_log.get_metadata(history_key)
+        slot._title_origin = "user"
+        slot._title_epoch += 1
+    # else: untitled on disk and no caller name — leave the slot untitled
+    # (mirrors _rehydrate_slot_from_history: ``_titled = bool(meta title)``),
+    # so the auto-titler can still name it on the next turn.
     if meta.get("created_at"):
         slot.created_at = meta["created_at"]
     if meta.get("agent"):

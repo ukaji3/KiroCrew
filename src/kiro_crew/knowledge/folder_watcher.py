@@ -18,7 +18,7 @@ from kiro_crew.sel import sel
 
 from .chunker import CHUNK_TOKEN_SIZE, MAX_CHUNKS_PER_FILE
 from .dedup import dedup_document
-from .ingestion import DUPLICATE_JOB_STATUS
+from .ingestion import DUPLICATE_JOB_STATUS, run_to_completion
 from .kiroignore import KIROIGNORE_FILENAME
 from .kiroignore import load as load_kiroignore
 from .readers import FileReader
@@ -533,12 +533,28 @@ class FolderWatcher:
         # copy collapses any matching one-shot upload. O(k*n) over the k changed files
         # rather than a full O(n^2) corpus sweep (knowledge/dedup.py).
         if getattr(self.pipeline, "_dedup_enabled", True):
-            for fpath in ingested_paths:
-                try:
-                    dedup_document(self.store, source_id, file_path=fpath, apply=True)
-                except Exception:
-                    logger.debug("Per-file dedup skipped for %s", fpath, exc_info=True)
+            # Offloaded in ONE hop for all k files: dedup_document rebuilds the entire
+            # entity graph per collapse (_load_graph), so the cost scales with the
+            # corpus AND the number of duplicates found. Run inline it stalls the loop
+            # past the loop-stall watchdog on a large KB and the supervisor respawns
+            # straight into the same scan -- a crash loop. Mirrors the already-offloaded
+            # dedup sites in ingestion.py and watcher.py; the RLock-guarded graph plus
+            # thread-local sqlite connections make this thread-safe.
+            await asyncio.to_thread(self._dedup_ingested, source_id, ingested_paths)
         return stats
+
+    def _dedup_ingested(self, source_id: str, paths: list[str]) -> None:
+        """Targeted cross-source dedup for each freshly ingested path.
+
+        Synchronous by design and always reached through ``asyncio.to_thread`` --
+        it is the blocking half of the scan and must never run on the event loop.
+        One path's failure must not abandon the rest, so each is guarded.
+        """
+        for fpath in paths:
+            try:
+                dedup_document(self.store, source_id, file_path=fpath, apply=True)
+            except Exception:
+                logger.debug("Per-file dedup skipped for %s", fpath, exc_info=True)
 
     def _walk(self, root: str, ignore_patterns: list[str], extra_skip_dirs: set[str],
               include_extensions: set[str] | None = None,
@@ -732,23 +748,31 @@ class FolderWatcher:
     async def _handle_deleted(self, source_id: str, file_path: str, state: dict):
         """Archive items for a deleted file and remove state row."""
         item_ids = json.loads(state.get("item_ids", "[]"))
-        if item_ids:
-            # The file is gone from THIS folder; a copy another source holds survives.
-            self.store.delete_items_batch(item_ids, owner_source_id=source_id)
-        else:
-            # No group to detach -- which is exactly the case for a file that LOST a
-            # dedup: its row is 'deduped' with an empty group, while this source is
-            # still recorded as a location of the winner's items. That claim is what
-            # would later hand this source a document whose file is gone, so it is
-            # released by content hash. Nothing is deleted: the items are the winner's.
-            # The TEXT hash, not the bytes one: this resolves items, and for a PDF or
-            # HTML file the two differ.
-            self.store.detach_source_location_by_hash(
-                source_id, state.get("text_hash") or "")
-        self.store.db.execute(
-            "DELETE FROM folder_file_state WHERE source_id = ? AND file_path = ?",
-            (source_id, file_path))
-        self.store.db.commit()
+
+        def _archive_and_forget() -> None:
+            # ONE off-loop hop: delete_items_batch rebuilds the entity graph and
+            # cannot run on the loop, and the folder_file_state removal must
+            # travel with it -- a cancellation between the two would leave a
+            # state row pointing at item_ids that are already gone.
+            if item_ids:
+                # The file is gone from THIS folder; a copy another source holds survives.
+                self.store.delete_items_batch(item_ids, owner_source_id=source_id)
+            else:
+                # No group to detach -- which is exactly the case for a file that LOST a
+                # dedup: its row is 'deduped' with an empty group, while this source is
+                # still recorded as a location of the winner's items. That claim is what
+                # would later hand this source a document whose file is gone, so it is
+                # released by content hash. Nothing is deleted: the items are the winner's.
+                # The TEXT hash, not the bytes one: this resolves items, and for a PDF or
+                # HTML file the two differ.
+                self.store.detach_source_location_by_hash(
+                    source_id, state.get("text_hash") or "")
+            self.store.db.execute(
+                "DELETE FROM folder_file_state WHERE source_id = ? AND file_path = ?",
+                (source_id, file_path))
+            self.store.db.commit()
+
+        await run_to_completion(_archive_and_forget)
         logger.info("Deleted file removed: %s (%d items)", file_path, len(item_ids))
 
     async def _ingest_file(self, file_path: str, source_id: str, namespace: str, props: dict,

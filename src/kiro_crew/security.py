@@ -27,7 +27,7 @@ except ImportError:
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.executors import maintenance_executor
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
@@ -1510,9 +1510,36 @@ _RULE_ID_BY_PATTERN: dict[str, str] = {r.pattern: r.id for r in BUILTIN_DENIED_R
 # always-on floor already covers every case these patterns would (protected
 # targets denied, feature branches allowed), so skipping them loses no coverage.
 _GIT_PUBLISH_RULE_CATEGORY = "git-publish"
-_GIT_PUBLISH_RULE_PATTERNS: frozenset[str] = frozenset(
-    r.pattern for r in BUILTIN_DENIED_RULES if r.category == _GIT_PUBLISH_RULE_CATEGORY
+# Single filtered view of the catalog so the pattern set and the id set below
+# cannot drift apart (both must cover exactly the git-publish rules).
+_GIT_PUBLISH_RULES: tuple[DeniedCommandRule, ...] = tuple(
+    r for r in BUILTIN_DENIED_RULES if r.category == _GIT_PUBLISH_RULE_CATEGORY
 )
+_GIT_PUBLISH_RULE_PATTERNS: frozenset[str] = frozenset(r.pattern for r in _GIT_PUBLISH_RULES)
+
+# Catalog rules whose ENFORCEMENT is an always-on floor rather than the
+# configurable regex tier.  Derived from the category (never a hand-maintained
+# id list) so a future git-publish rule is covered automatically.
+_FLOOR_ENFORCED_RULE_IDS: frozenset[str] = frozenset(r.id for r in _GIT_PUBLISH_RULES)
+
+
+def floor_enforced_builtin_command_ids() -> frozenset[str]:
+    """Built-in rule ids enforced by an always-on floor (not opt-out-able).
+
+    These rules exist in the catalog for display parity, but their enforcement
+    is the unconditional verb-anchored git-publish floor (``_is_git_publish`` /
+    ``_is_push_to_protected_branch``) evaluated before the configurable tiers,
+    which consults no opt-out state.  Persisting one of these ids into
+    ``disabled_ids`` therefore changes nothing — the Settings surface must
+    render them locked/forced-on and the toggle API must reject a disable, or
+    the opt-out is a silent no-op (UI reports success, the floor still denies).
+
+    DISPLAY/API accessor only: nothing in the enforcement path reads it, so it
+    cannot weaken the floor.  Pure and deterministic (module-scope derivation
+    from the catalog category), safe to call from any thread.
+    """
+    return _FLOOR_ENFORCED_RULE_IDS
+
 
 # The two self-protection rules whose enforcement lives in the argv-structural
 # floor (``_is_credential_mint`` / ``_is_self_kill``) rather than in the regex
@@ -2252,6 +2279,24 @@ _GIT_PUBLISH_SUBST_PROGRAM_RE = re.compile(
 # Human-readable label recorded in the denial reason + SEL audit event when
 # a git-publish invocation is blocked (the regexes above are the mechanism).
 _GIT_PUBLISH_DENY_LABEL = "git push"
+
+#: The refusal prefix, exported so guards cannot drift from the producer.
+#: ``RecoveryCard.tsx`` parses refusals with
+#: ``/Blocked by security policy:\s*(.+?)\s*$/gm`` — GLOBAL and per-line — so any
+#: line carrying this literal is read as a deny pattern.  An operator note is
+#: emitted on its own line, which means a note containing this literal would be
+#: parsed as a SECOND, fabricated pattern.  Callers that accept operator text
+#: reject or drop it on this constant (see ``hooks.resolve_denied_notes`` and the
+#: dashboard add handler) rather than hardcoding the string again.
+DENY_REASON_PREFIX = "Blocked by security policy: "
+
+#: The form to GUARD against, which is NOT the form we emit. ``RecoveryCard``'s
+#: regex is ``Blocked by security policy:\s*`` — the whitespace after the colon is
+#: optional — so ``"Blocked by security policy:forged"`` parses as a refusal line
+#: while NOT containing :data:`DENY_REASON_PREFIX` (which carries a trailing
+#: space). Guarding on the full prefix therefore leaves a bypass. Derived from the
+#: same string so the two can never drift apart.
+DENY_REASON_MATCH_PREFIX = DENY_REASON_PREFIX.rstrip()
 
 
 # ── Self-protection floor (argv-structural, not a regex) ──
@@ -5077,10 +5122,10 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
 # ── URL Exfiltration Detection ──
 # Detects URLs whose path/query contain credential-like data. We flag the
 # PAYLOAD, not the destination: any URL with secrets is suspicious regardless of
-# host. The sole host-sensitive carve-out is a companion-supplied exact-host
-# exemption (see _exfil_url_warning) that narrows ONLY the base64-blob and
-# query-length heuristics for trusted tenants; the hard-credential floor and the
-# heavy percent-encoding detector stay unconditional for every host.
+# host. The general redactors have one narrow carve-out for companion-supplied
+# exact tenant hosts. A separate, opt-in carve-out for standard OAuth params is
+# available only to ``oauth_url_contains_credential`` on the ACP banner path.
+# Fixed/encoded credentials and heavy percent encoding remain unconditional.
 
 # Host group (group 1) matches THREE host shapes so a raw-IP exfil destination
 # is not silently skipped: a DNS name with a letter TLD, a raw
@@ -5122,13 +5167,88 @@ _EXFIL_PATTERNS = re.compile(
 
 # Heavy URL-encoding detector — the same "20+ consecutive percent-encoded
 # octets" branch carved out of _EXFIL_PATTERNS. This stays UNCONDITIONAL: the
-# exact-host exemption below skips only the base64-blob and query-length
-# heuristics (which false-positive on legitimate long base64 document
-# pointers), NOT this percent-encoding detector, so an encoded exfil payload to
-# a trusted-tenant host is still caught.
+# context-specific exemptions below skip only the base64-blob and query-length
+# heuristics (which false-positive on legitimate document pointers or banner
+# state/PKCE), NOT this detector, so a heavily encoded payload is still caught.
 _EXFIL_PERCENT_RE = re.compile(
     r"%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}",
     re.IGNORECASE,
+)
+
+# Percent-decoding passes applied when re-scanning a URL for encoded
+# credentials. More than one is required because a double-encoded payload
+# survives a single pass; the bound stops a deliberately over-encoded URL from
+# making the scan loop indefinitely.
+_MAX_URL_DECODE_PASSES = 3
+
+# Exact, code-owned OAuth authorization endpoints whose standard front-channel
+# parameters may legitimately contain high-entropy state/PKCE values on the ACP
+# banner-safety path. This is deliberately NOT configurable and never uses
+# suffix matching: an agent-owned
+# setting or ``api.notion.com.attacker.example`` must not lower the redaction
+# ceiling. Paths are exact and case-sensitive; explicit ports and HTTP are not
+# exempted.
+_OAUTH_AUTHORIZATION_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("accounts.google.com", "/o/oauth2/v2/auth"),
+        ("api.notion.com", "/v1/oauth/authorize"),
+        ("auth.atlassian.com", "/authorize"),
+        ("github.com", "/login/oauth/authorize"),
+        ("linear.app", "/oauth/authorize"),
+        ("login.microsoftonline.com", "/common/oauth2/v2.0/authorize"),
+        ("slack.com", "/oauth/v2/authorize"),
+        # MCP-server authorization servers. A provider's *MCP* server usually
+        # runs its own authorization server, distinct from the classic web-OAuth
+        # endpoint above -- so the pairs above are NOT sufficient for the
+        # Connections launch set. Each pair below was taken from the provider's
+        # own advertised `authorization_endpoint` (RFC 8414 metadata reached via
+        # RFC 9728 protected-resource discovery from the registry's mcp_url) and
+        # independently corroborated by an authorize URL kiro-cli actually
+        # minted. A launch provider missing from this set cannot be connected at
+        # all: its banner fails closed with "authentication failed: URL
+        # contained credential or exfiltration pattern", which is how the gap
+        # was found. Every entry added to the Connections registry needs its
+        # MCP authorization server here too.
+        ("access.stripe.com", "/mcp/oauth2/authorize"),
+        ("gitlab.com", "/oauth/authorize"),
+        ("mcp.linear.app", "/authorize"),
+        ("mcp.notion.com", "/authorize"),
+        ("vercel.com", "/oauth/authorize"),
+    }
+)
+
+# OAuth 2.0 / OIDC front-channel parameters whose values are expected to be
+# opaque and high-entropy. The banner-only exemption is valid ONLY at an exact
+# endpoint above. Every unknown parameter still receives the full query
+# heuristics, even when it shares an otherwise-approved authorization URL.
+_OAUTH_QUERY_PARAMS = frozenset(
+    {
+        "access_type",
+        "acr_values",
+        "allow_signup",
+        "audience",
+        "client_id",
+        "code_challenge",
+        "code_challenge_method",
+        "display",
+        "domain_hint",
+        "id_token_hint",
+        "login",
+        "login_hint",
+        "max_age",
+        "nonce",
+        "prompt",
+        "redirect_uri",
+        "request_uri",
+        "resource",
+        "response_mode",
+        "response_type",
+        "scope",
+        "state",
+        "team",
+        "ui_locales",
+        "user_scope",
+    }
 )
 
 # S3 presigned URLs contain X-Amz-Signature (a 64-char hex string) that
@@ -5280,95 +5400,133 @@ def _exfil_url_warning(
     domain: str,
     path_and_query: str,
     exempt_hosts: frozenset[str],
+    *,
+    port: str = "",
+    is_https: bool = True,
+    allow_safe_presigned: bool = True,
+    allow_oauth_entropy: bool = False,
 ) -> str | None:
     """Classify one matched URL — the single per-URL exfil verdict.
 
     Shared by scan_exfiltration_urls (which collects the warnings) and
     redact_exfiltration_urls (which redacts every URL that returns non-None), so
-    the two paths can never drift — redact_ early-returns on scan_'s warnings, so
-    a divergence would silently produce warnings-without-redaction. Returns the
-    warning string, or None if the URL is clean/exempt.
+    the two paths can never drift. Returns the warning string, or None if clean.
     """
     qmark = path_and_query.find("?")
     query = path_and_query[qmark + 1 :] if qmark != -1 else ""
 
-    # Valid S3 presigned URLs carry AKIA in X-Amz-Credential legitimately, so
-    # exempt them wholesale BEFORE the hard-credential path scan below would
-    # otherwise flag them.
-    if query and _is_safe_presigned(domain, query):
+    # Valid S3 presigned URLs carry AKIA in X-Amz-Credential legitimately. This
+    # exemption is disabled for OAuth-banner validation.
+    if allow_safe_presigned and query and _is_safe_presigned(domain, query):
         return None
 
-    # Hard credential markers ANYWHERE in the path or query.
-    # The base64/length heuristics below are query-only, so a secret embedded in
-    # the URL PATH (``https://evil/AKIA…`` — no ``?``) escaped them entirely, and
-    # a raw-IP host never even matched _URL_RE. These markers (AKIA/ASIA,
-    # key=value creds, SSH/PEM, Slack) are unambiguous, so flag regardless of
-    # domain — a real AWS key in a URL is exfil even to an otherwise-safe (or
-    # exempted) host. This hard-credential floor is UNCONDITIONAL.
+    # Hard credential markers are unconditional across the full path/query.
     if _HARD_CREDENTIAL_RE.search(path_and_query):
         return f"Suspicious URL with credential in path/query: {domain}"
+
+    # Fixed credential signatures ANYWHERE in the full authority/path/query are
+    # unconditional. This uses canonical provider-token patterns (GitHub,
+    # Stripe, etc.) in addition to the older AWS/SSH/Slack hard floor, but NOT
+    # the bare-secret entropy classifier that false-positives on OAuth state.
+    full_payload = f"{domain}{port}{path_and_query}"
+    if _contains_fixed_credential(full_payload):
+        return f"Suspicious URL with credential in path/query: {domain}"
+
+    # Decode the whole authority/path/query payload as one invariant. Component-
+    # specific passes risk leaving newly handled URL structure outside the scan.
+    # Decoding ONCE is not enough: a double-encoded payload ("%2542" -> "%42" ->
+    # "B") survives a single pass, so decode until the text stops changing.
+    # Bounded so a deliberately over-encoded URL cannot spin here.
+    decoded_payload = full_payload
+    for _ in range(_MAX_URL_DECODE_PASSES):
+        next_payload = unquote_plus(decoded_payload)
+        if next_payload == decoded_payload:
+            break
+        decoded_payload = next_payload
+        if _HARD_CREDENTIAL_RE.search(
+            decoded_payload
+        ) or _contains_fixed_credential(decoded_payload):
+            return f"Suspicious URL with encoded credential in path/query: {domain}"
+
+    # Fail closed when the budget above ran out with layers still to go. A
+    # payload that is STILL decodable was never seen in plaintext, and neither
+    # remaining check covers it: the credential patterns match literal markers
+    # rather than percent text, and _EXFIL_PERCENT_RE needs 20+ CONSECUTIVE
+    # octets, which the intermediate forms of a wrapped payload ("%252520") do
+    # not form. Treating saturation as clean therefore made the bound an escape
+    # hatch -- wrap a credential in one more layer than the cap and it passed.
+    # Raising the cap only moves that line, so the bound is priced as lost
+    # precision (a pathologically encoded URL is refused) instead of lost
+    # soundness. Benign traffic reaches a stable payload in one or two passes
+    # and never gets here.
+    if unquote_plus(decoded_payload) != decoded_payload:
+        return f"Suspicious URL with encoded credential in path/query: {domain}"
+
+    # Heavy percent-encoding is always suspicious, including inside a standard
+    # OAuth parameter at an approved endpoint. It runs before either
+    # host-sensitive heuristic exemption below.
+    if _EXFIL_PERCENT_RE.search(path_and_query):
+        return f"Suspicious URL with credential-like query data: {domain}"
 
     if qmark == -1:
         return None
 
-    # UNCONDITIONAL base64 decode-and-scan: a hard credential (AWS key, SSH/PEM,
-    # Slack token) that is base64-ENCODED into the query would slip past the raw
-    # _HARD_CREDENTIAL_RE floor above (which matches literal markers, not encoded
-    # bytes) AND, on an exempt host, past the raw base64-blob heuristic below.
-    # Decode any base64 chunk and re-scan the decoded bytes for credential
-    # markers; a legitimate base64 *document* decodes to non-credential text and
-    # _decode_b64_safe returns "" (so it still qualifies for the exemption).
-    # This runs for EVERY host, closing the encoded-credential-to-trusted-tenant
-    # gap without re-flagging benign document pointers.
-    if query and _decode_b64_safe(query):
-        return f"Suspicious URL with encoded credential in query: {domain}"
-
-    # Exact-host heuristic exemption (companion-supplied trusted tenants),
-    # matched case-insensitively and EXACTLY (not by suffix) so a shared
-    # multi-tenant domain does not exempt every tenant. The exemption skips ONLY
-    # the raw base64-blob and query-length heuristics below — the ones that
-    # false-positive on legitimate long base64 document pointers. Everything
-    # else stays unconditional: the hard-credential floor above already ran, the
-    # decode-and-scan just above catches ENCODED credentials on every host, and
-    # the heavy percent-encoding detector below runs even for exempted hosts, so
-    # an encoded exfil payload to a trusted tenant is still caught.
+    # Choose the exact payload that receives generic base64/entropy + aggregate
+    # length heuristics. The OAuth-param carve-out is available ONLY to the
+    # dedicated ACP banner-safety path. General text redactors leave the flag
+    # false and remain strict for arbitrary agent/model text.
     _dom = domain.lower()
-    _exempt = _dom in exempt_hosts
-    if not _exempt:
-        # (Valid S3 presigned URLs were already exempted at the top, so no
-        # _is_safe_presigned re-check is needed here.)
-        if len(query) >= _EXFIL_QUERY_MIN_LEN:
+    _oauth_endpoint = (
+        allow_oauth_entropy
+        and is_https
+        and not port
+        and (_dom, path_and_query.split("?", 1)[0]) in _OAUTH_AUTHORIZATION_ENDPOINTS
+    )
+    if _oauth_endpoint:
+        # Names are matched literally and case-sensitively; encoded/mixed-case
+        # aliases fail closed as unknown parameters.
+        heuristic_query = "&".join(
+            segment
+            for segment in query.split("&")
+            if segment.partition("=")[0] not in _OAUTH_QUERY_PARAMS
+        )
+    elif _dom in exempt_hosts:
+        heuristic_query = ""
+    else:
+        heuristic_query = query
+
+    if heuristic_query:
+        if len(heuristic_query) >= _EXFIL_QUERY_MIN_LEN:
             return (
-                f"Suspicious URL with long query params ({len(query)} chars): "
+                f"Suspicious URL with long query params ({len(heuristic_query)} chars): "
                 f"{domain}{path_and_query[:60]}..."
             )
-        if _EXFIL_PATTERNS.search(query):
+        if _EXFIL_PATTERNS.search(heuristic_query) or _EXFIL_PATTERNS.search(
+            unquote_plus(heuristic_query)
+        ):
             return f"Suspicious URL with credential-like query data: {domain}"
-
-    # Heavy percent-encoding is a hard heuristic, NOT part of the exempted
-    # base64/length set — it runs for every host (for non-exempt hosts it was
-    # already covered by _EXFIL_PATTERNS above, so this only adds coverage on
-    # exempted hosts).
-    if _EXFIL_PERCENT_RE.search(query):
-        return f"Suspicious URL with credential-like query data: {domain}"
     return None
 
 
 def scan_exfiltration_urls(text: str) -> list[str]:
     """Scan text for URLs that may be exfiltrating data via query params.
 
-    Flags the PAYLOAD, not the destination: the hard-credential floor and the
-    base64/length heuristics inspect the URL path+query for secret patterns
-    regardless of host. The one host-sensitive exception is a companion-supplied
-    exact-host exemption that narrows ONLY the base64/length heuristics for
-    trusted tenants (see _exfil_url_warning); the hard-credential floor and the
-    percent-encoding detector stay unconditional. Returns list of warning
-    strings, empty if clean.
+    Flags the PAYLOAD, not the destination: fixed credentials and the
+    base64/length heuristics inspect the URL path+query regardless of host. Only
+    companion-supplied exact tenant hosts skip the base64/length heuristics here;
+    the OAuth-param carve-out is disabled for this general text scanner. Returns
+    list of warning strings, empty if clean.
     """
     exempt_hosts = _exfil_exempt_hosts()
     warnings: list[str] = []
     for match in _URL_RE.finditer(text):
-        warning = _exfil_url_warning(match.group(1), match.group(3) or "", exempt_hosts)
+        warning = _exfil_url_warning(
+            match.group(1),
+            match.group(3) or "",
+            exempt_hosts,
+            port=match.group(2) or "",
+            is_https=match.group(0).lower().startswith("https://"),
+        )
         if warning:
             warnings.append(warning)
     return warnings
@@ -5387,7 +5545,13 @@ def redact_exfiltration_urls(text: str) -> tuple[str, list[str]]:
     result = text
     for match in _URL_RE.finditer(text):
         domain = match.group(1)
-        if _exfil_url_warning(domain, match.group(3) or "", exempt_hosts):
+        if _exfil_url_warning(
+            domain,
+            match.group(3) or "",
+            exempt_hosts,
+            port=match.group(2) or "",
+            is_https=match.group(0).lower().startswith("https://"),
+        ):
             result = result.replace(match.group(0), f"[REDACTED: suspicious URL to {domain}]")
     return result, warnings
 
@@ -5797,6 +5961,140 @@ def _decode_b64_safe(text: str) -> str:
         except Exception:
             continue
     return ""
+
+
+def _contains_fixed_credential(text: str) -> bool:
+    """Return True for canonical literal or base64-encoded credentials.
+
+    Deliberately excludes the bare 40-character entropy heuristic. OAuth
+    front-channel state and PKCE values are high-entropy by design, while the
+    canonical signatures and decoded credentials remain unambiguous.
+    """
+    return bool(_CREDENTIAL_PATTERNS.search(text) or _decode_b64_safe(text))
+
+
+_PKCE_S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def _text_contains_bare_secret(text: str) -> bool:
+    """Return True when *text* contains an isolated bare AWS-secret run."""
+    return any(
+        _contains_bare_secret(match.group())
+        for match in _BARE_SECRET_RUN_RE.finditer(text)
+    )
+
+
+def _oauth_credential_scan_target(
+    url: str,
+    query: str,
+    *,
+    approved_endpoint: bool,
+) -> str:
+    """Blank only structurally approved OAuth values from a whole-URL scan."""
+    if not approved_endpoint or not query:
+        return url
+
+    segments = [segment.partition("=") for segment in query.split("&")]
+    s256_methods = [
+        unquote(value)
+        for key, separator, value in segments
+        if separator and key == "code_challenge_method"
+    ]
+    sanitized_segments: list[str] = []
+    for key, separator, value in segments:
+        decoded_value = unquote(value)
+        approved_value = (
+            bool(separator)
+            and key in _OAUTH_QUERY_PARAMS
+            and key == "code_challenge"
+            and s256_methods == ["S256"]
+            and bool(_PKCE_S256_CHALLENGE_RE.fullmatch(decoded_value))
+            and not _contains_fixed_credential(value)
+            and not _contains_fixed_credential(decoded_value)
+            and not _text_contains_bare_secret(decoded_value)
+        )
+        # A value is omitted because it was explicitly approved, never because
+        # its URL component was forgotten by the credential scan.
+        sanitized_segments.append(
+            f"{key}{separator}" if approved_value else f"{key}{separator}{value}"
+        )
+
+    query_start = url.find("?")
+    if query_start == -1:
+        return url
+    fragment_start = url.find("#", query_start + 1)
+    suffix = "" if fragment_start == -1 else url[fragment_start:]
+    sanitized_query = "&".join(sanitized_segments)
+    return url[: query_start + 1] + sanitized_query + suffix
+
+
+def oauth_url_contains_credential(url: str) -> bool:
+    """Return True when an ACP-provided OAuth banner URL is unsafe.
+
+    This is the sole path allowed to exempt standard OAuth entropy from the
+    generic URL heuristics. After subtracting only a structurally valid PKCE
+    challenge at an approved endpoint, credential checks scan every remaining
+    byte of the URL in raw and once-percent-decoded form.
+    """
+    if not url:
+        return False
+
+    decoded_url = unquote(url)
+    if (
+        "\\" in url
+        or "\\" in decoded_url
+        or _contains_fixed_credential(url)
+        or _contains_fixed_credential(decoded_url)
+    ):
+        return True
+
+    try:
+        parsed = urlparse(url)
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        return True
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return True
+
+    # Browsers and RFC-style parsers disagree on userinfo handling.
+    if "@" in parsed.netloc or "@" in unquote(parsed.netloc):
+        return True
+
+    approved_endpoint = (
+        parsed.scheme.lower() == "https"
+        and not port
+        and (parsed.hostname.lower(), parsed.path) in _OAUTH_AUTHORIZATION_ENDPOINTS
+    )
+    scan_target = _oauth_credential_scan_target(
+        url,
+        parsed.query,
+        approved_endpoint=approved_endpoint,
+    )
+    for candidate in (scan_target, unquote(scan_target)):
+        if _contains_fixed_credential(candidate) or _text_contains_bare_secret(
+            candidate
+        ):
+            return True
+
+    # Provider consent URLs need neither path params nor fragments. Keep these
+    # parser-differential forms fail-closed after the whole URL has been scanned.
+    if parsed.params or ";" in parsed.path or parsed.fragment:
+        return True
+
+    path_and_query = parsed.path
+    if parsed.query:
+        path_and_query += f"?{parsed.query}"
+    return bool(
+        _exfil_url_warning(
+            parsed.hostname,
+            path_and_query,
+            frozenset(),
+            port=port,
+            is_https=parsed.scheme.lower() == "https",
+            allow_safe_presigned=False,
+            allow_oauth_entropy=True,
+        )
+    )
 
 
 # Standard replacement tag for a redacted credential. Shared between the batch
@@ -6242,6 +6540,7 @@ def is_denied(
     extra_patterns: list[str] | None = None,
     *,
     denied_regexes: list[str] | None = None,
+    reason_notes: dict[str, str] | None = None,
 ) -> str | None:
     """Check tool name against the built-in/effective + extra deny patterns.
 
@@ -6303,12 +6602,35 @@ def is_denied(
             ``auto_deny_tools`` + companion overlay).
         denied_regexes: The effective enabled rule regexes (regex tier).  When
             ``None``, fails closed to all built-in rules enabled.
+        reason_notes: Optional ``{pattern: operator note}`` map.  When the pattern
+            that matched has a note, the note is appended to the refusal on its
+            OWN line.  Presentation only — it never affects whether something is
+            denied.
 
     Returns:
         Denial reason string (mentioning the matched pattern), or
         ``None`` if the input is allowed.
     """
     lower = tool_name.lower()
+
+    def _reason(matched: str) -> str:
+        """Refusal text for *matched*, with the operator note on a SECOND line.
+
+        The first line is byte-for-byte what it has always been. That is load
+        bearing, not stylistic: ``RecoveryCard.tsx`` extracts the pattern with
+        ``/Blocked by security policy:\\s*(.+?)\\s*$/gm`` — per-line and
+        end-anchored — so anything appended to the SAME line is captured as part
+        of the pattern, and ``_denied_by`` in the test suite partitions on the
+        exact ``"Blocked by security policy: "`` separator.  A note therefore
+        goes on its own line, where both readers ignore it.
+
+        Built-in rules never carry a note (the map holds user patterns only), so
+        for them this returns exactly the historical string.
+        """
+        head = f"{DENY_REASON_PREFIX}{matched}"
+        note = (reason_notes or {}).get(matched, "").strip()
+        return f"{head}\n{note}" if note else head
+
     glob_patterns = list(extra_patterns or [])
     if denied_regexes is None:
         regex_patterns = compute_effective_denied(BUILTIN_DENIED_RULES, (), False, (), ())
@@ -6347,7 +6669,7 @@ def is_denied(
             try:
                 if re.search(interpreter_pattern, joined, re.IGNORECASE):
                     _emit_deny_event(tool_name, interpreter_pattern, lower)
-                    return f"Blocked by security policy: {interpreter_pattern}"
+                    return _reason(interpreter_pattern)
             except re.error:  # pragma: no cover - patterns are validated at load
                 continue
     # Ordered (pattern, is_regex) pairs so the two passes share one code path;
@@ -6373,7 +6695,7 @@ def is_denied(
     if _is_git_publish(lower):
         if _is_push_to_protected_branch(lower):
             _emit_deny_event(tool_name, _GIT_PUBLISH_DENY_LABEL, lower)
-            return f"Blocked by security policy: {_GIT_PUBLISH_DENY_LABEL}"
+            return _reason(_GIT_PUBLISH_DENY_LABEL)
         push_allow_pending = True
 
     # ── Self-protection floor (argv-structural, not a glob) ──
@@ -6393,7 +6715,7 @@ def is_denied(
             # Report the rule's own pattern, exactly as the regex tier does, so
             # the denial reason and the SEL event still map back to the rule id.
             _emit_deny_event(tool_name, pattern, lower)
-            return f"Blocked by security policy: {pattern}"
+            return _reason(pattern)
 
     # ── Pass 1: whole-string deny ──
     # If any pattern matches the full input AND no exception matches the
@@ -6413,7 +6735,7 @@ def is_denied(
             )
             if not whole_string_exception_match:
                 _emit_deny_event(tool_name, pattern, lower)
-                return f"Blocked by security policy: {pattern}"
+                return _reason(pattern)
 
     # ── Pass 2: per-segment (re-)evaluation ──
     # Split into segments and check each.  This runs UNCONDITIONALLY: besides
@@ -6433,14 +6755,14 @@ def is_denied(
                 if exceptions and any(fnmatch.fnmatch(seg_lower, e.lower()) for e in exceptions):
                     if not _emit_deny_exception_event(tool_name, pattern):
                         _emit_deny_event(tool_name, pattern, seg_lower)
-                        return f"Blocked by security policy: {pattern}"
+                        return _reason(pattern)
                     # Exception granted for this pattern on this segment;
                     # continue to evaluate any remaining patterns against
                     # the same segment (a different pattern without an
                     # exception must still cause a deny).
                     continue
                 _emit_deny_event(tool_name, pattern, seg_lower)
-                return f"Blocked by security policy: {pattern}"
+                return _reason(pattern)
     # All windows cleared the deny passes — the input is allowed.  If it was a
     # feature-branch push, emit the deferred allow audit now (final outcome).
     if push_allow_pending:

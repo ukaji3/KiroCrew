@@ -40,6 +40,7 @@ from kiro_crew.dashboard import (
     handlers_instances,
     handlers_project,
     openai_compat,
+    session_transfer,
     stt_stream,
     tailnet,
     ws,
@@ -51,6 +52,7 @@ from kiro_crew.dashboard.crash_dump_store import (
     newest_dump_with_stacks,
     open_dump_file,
     rotate_dumps,
+    sweep_stale_dumps,
 )
 from kiro_crew.dashboard.handlers.artifacts import (
     api_artifact_comments,
@@ -322,6 +324,10 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/slack/reactions",
         "/api/slack-profile",  # MCP-only (slack_profile tool); no browser caller
         "/api/sessions/summarize",  # MCP-only (list_sessions summarize leg); internal-secret, no browser caller
+        # MCP-only (knowledge_add_document tool); no browser caller — the
+        # dashboard ingests via its own cookie-authed knowledge routes. Same
+        # wiring class as "/api/notifications/agent" above.
+        "/api/knowledge/agent-document",
         "/api/mcp/servers",
     }
 )
@@ -425,6 +431,33 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         # anything holding the internal secret. This route is local-only triage
         # state — no forge write, no shared ledger.
         "/api/apps/issue-radar/investigation",
+        # Ops Mission Control agent surface — the routes the app's SOP-driven
+        # crons and investigation slots call through the ``ops_mission_control_api``
+        # MCP tool (the app's ONLY credentialed agent path; same trust model as
+        # ``/api/apps/issue-radar/investigation`` above: agents hold no cookie,
+        # no gateway IPC secret, and the CLI credential mint is denied by the
+        # builtin ``credential-exfil`` rules — deliberately, see security.py).
+        # Enumerated EXACT paths, never the app prefix: prefix-matching
+        # ``/api/apps/ops-mission-control`` would also admit provider
+        # configuration/secret writes, ``/settings``, the external ``/webhook``
+        # ingest and the human-only ``/incident/proposal/decide`` route to
+        # anything holding the internal secret. Bare ``/incident`` is excluded
+        # for the same reason (this matcher is exact-or-prefix, so admitting it
+        # would admit ``/incident/propose`` and ``/incident/proposal/decide``);
+        # single-incident reads go through ``/incidents?id=`` instead. The
+        # ``/rotation`` and ``/ledger`` entries DO cover their sub-routes
+        # (``/rotation/arm``, ``/ledger/contradictions``, ``/ledger/hygiene``)
+        # — all agent-surface by design.
+        "/api/apps/ops-mission-control/state",
+        "/api/apps/ops-mission-control/signals",
+        "/api/apps/ops-mission-control/incidents",
+        "/api/apps/ops-mission-control/handover",
+        "/api/apps/ops-mission-control/rotation",
+        "/api/apps/ops-mission-control/ledger",
+        "/api/apps/ops-mission-control/dispatch",
+        "/api/apps/ops-mission-control/incident/transition",
+        "/api/apps/ops-mission-control/incident/claim",
+        "/api/apps/ops-mission-control/incident/action",
         # Registry skill discovery — the READ leg only, for the
         # ``skill_discover`` / ``skill_fetch`` MCP tools. The Skills page calls
         # the same two routes with cookie auth, hence mixed rather than strict.
@@ -2046,6 +2079,13 @@ async def start_dashboard(
     app.router.add_get("/api/status", handlers.api_status)
     app.router.add_get("/api/system", handlers.api_system)
     app.router.add_get("/api/system/session-storage", handlers.api_session_storage)
+    # The inventory list and its per-row detail. Registered before the {uid} route
+    # so the literal path cannot be swallowed by the pattern.
+    app.router.add_get("/api/system/session-storage/sessions", handlers.api_session_inventory)
+    app.router.add_get(
+        "/api/system/session-storage/sessions/{uid}", handlers.api_session_inventory_detail
+    )
+    app.router.add_post("/api/system/session-storage/trash", handlers.api_session_inventory_trash)
     app.router.add_post("/api/system/session-storage/cleanup", handlers.api_session_storage_cleanup)
     app.router.add_post("/api/system/session-storage/restore", handlers.api_session_storage_restore)
     app.router.add_post("/api/system/session-storage/empty", handlers.api_session_storage_empty)
@@ -2267,6 +2307,7 @@ async def start_dashboard(
     # Shared MCP gateway (pool)
     app.router.add_get("/api/mcp-gateway/status", handlers.api_mcp_gateway_status)
     app.router.add_post("/api/mcp-gateway/enable", handlers.api_mcp_gateway_enable)
+    app.router.add_post("/api/mcp-gateway/apps-enable", handlers.api_mcp_gateway_apps_enable)
     app.router.add_get("/api/mcp-gateway/metrics", handlers.api_mcp_gateway_metrics)
     app.router.add_get("/api/mcp-gateway/servers", handlers.api_mcp_gateway_servers)
     app.router.add_post("/api/mcp-gateway/servers/poolable", handlers.api_mcp_gateway_set_poolable)
@@ -2302,6 +2343,10 @@ async def start_dashboard(
     app.router.add_post("/api/chat/slots", chat.api_chat_slot_create)
     app.router.add_post("/api/chat/slots/cleanup", chat.api_chat_slots_cleanup)
     app.router.add_post("/api/chat/slots/model", chat.api_chat_slots_model)
+    # Static segment BEFORE the {slot} routes below, matching the cleanup/model
+    # precedent: aiohttp resolves in registration order, so a later
+    # ``/api/chat/slots/{slot}`` POST would otherwise shadow this path.
+    app.router.add_post("/api/chat/slots/import", session_transfer.api_chat_slot_import)
     app.router.add_get("/api/chat/slots/{slot}", chat.api_chat_slot_detail)
     app.router.add_post("/api/chat/slots/{slot}/stop", chat.api_chat_slot_stop)
     app.router.add_post("/api/chat/slots/{slot}/interrupt", chat.api_chat_slot_interrupt)
@@ -2335,6 +2380,14 @@ async def start_dashboard(
     app.router.add_post("/api/chat/slots/{slot}/side/open", handlers.api_side_open)
     app.router.add_post("/api/chat/slots/{slot}/side/turn", handlers.api_side_turn)
     app.router.add_post("/api/chat/slots/{slot}/side/close", handlers.api_side_close)
+    app.router.add_delete(
+        "/api/chat/slots/{slot}/side/queue/{queue_id}",
+        handlers.api_side_queue_cancel,
+    )
+    app.router.add_patch(
+        "/api/chat/slots/{slot}/side/queue/{queue_id}",
+        handlers.api_side_queue_edit,
+    )
     # Workspaces
     app.router.add_get("/api/workspaces", handlers.api_workspaces)
     app.router.add_post("/api/workspaces", handlers.api_workspaces_create)
@@ -2552,6 +2605,9 @@ async def start_dashboard(
         "/api/instances/{id}/disconnect", handlers_instances.api_instances_disconnect
     )
     app.router.add_post("/api/instances/{id}/restart", handlers_instances.api_instances_restart)
+    app.router.add_post(
+        "/api/instances/{id}/send-session", handlers_instances.api_instances_send_session
+    )
 
     # Misc (notifications GET/clear and send-message via _register_mcp_routes)
     app.router.add_get("/api/notifications", handlers.api_notifications)
@@ -2565,6 +2621,7 @@ async def start_dashboard(
     )
     app.router.add_get("/api/update/check", handlers.api_update_check)
     app.router.add_get("/api/changelog", handlers.api_changelog)
+    app.router.add_get("/api/releases", handlers.api_releases)
     app.router.add_post("/api/update", handlers.api_update_apply)
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
@@ -3148,6 +3205,11 @@ async def start_dashboard(
     # Crash-dump discoverability: route dumps to a dedicated file under
     # ~/.kiro/crew/logs/crash-dumps/ so they are findable via `kirocrew doctor`
     # and startup warnings, rather than buried in interleaved stderr/journal.
+    # Crash-dump hygiene: sweep header-only dumps left by prior sessions that
+    # exited without ever wedging (every startup pre-creates one for
+    # faulthandler's fd), THEN rotate. Sweeping first keeps empty startup files
+    # from aging real stall dumps out of the rotation window.
+    await asyncio.to_thread(sweep_stale_dumps)
     await asyncio.to_thread(rotate_dumps)
     _dump_file = await asyncio.to_thread(open_dump_file)
     # exit_after is configurable because the right budget is host-dependent: a

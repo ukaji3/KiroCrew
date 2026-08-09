@@ -4,6 +4,7 @@ import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
 import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns2, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
+import JiraLogo from '../components/icons/JiraLogo'
 import FolderGlyph from '../components/FolderGlyph'
 import { DndContext, closestCenter, pointerWithin, KeyboardSensor, PointerSensor, useSensor, useSensors, useDroppable, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy, useSortable, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
@@ -386,9 +387,10 @@ interface Slot {
   tags?: string[]
   forked_from?: string | null
   source_links?: Array<{
-    provider: 'github' | 'gitlab'
+    provider: 'github' | 'gitlab' | 'jira'
     number: number
     url: string
+    repo?: string
     ci?: 'running' | 'passed' | 'failed' | null
     state?: 'open' | 'draft' | 'merged' | 'closed'
     // Owner-gated chips spread the whole cached chip-status entry, which also
@@ -709,9 +711,22 @@ function ChatSidebar({
   // Ephemeral: reset on every query change so a fresh search shows all groups.
   const [collapsedHistoryGroups, setCollapsedHistoryGroups] = useState<Set<string>>(() => new Set())
   useEffect(() => { setCollapsedHistoryGroups(new Set()) }, [historyFilter])
-  const slotSearchKeys = useDebouncedSessionSearch(
+  // Backend relevance rank per slot key (0 = best). A Map instead of a Set so
+  // `filteredSlots` can ORDER matches by the backend's ranking (title matches
+  // carry a strong field boost server-side) rather than re-sorting them by
+  // date, which buries a title match below every fresher session that merely
+  // mentions the query in its body. First-wins on canonical-key collisions so
+  // a duplicate file cannot demote the better-ranked entry.
+  const slotSearchRanks = useDebouncedSessionSearch(
     slotFilter,
-    sessions => new Set(sessions.map(s => s.key.replace(/^dashboard_/, ''))),
+    sessions => {
+      const ranks = new Map<string, number>()
+      sessions.forEach((s, i) => {
+        const key = s.key.replace(/^dashboard_/, '')
+        if (!ranks.has(key)) ranks.set(key, i)
+      })
+      return ranks
+    },
   )
   const [renamingSlot, setRenamingSlot] = useState<string | null>(null)
   // In board view a multi-tag chat renders once per matching column, so
@@ -985,7 +1000,7 @@ function ChatSidebar({
   const creatingSlot = useAppSelector(s => s.chat.creatingSlot)
   const connected = useConnected()
   // O(1) lookup set for the filter predicate (mirrors the `pinned` and
-  // `slotSearchKeys` patterns elsewhere in this file).
+  // `slotSearchRanks` patterns elsewhere in this file).
   const unreadSet = useMemo(() => new Set(unreadSlots), [unreadSlots])
   // Heartbeat that re-evaluates recency even when nothing else re-renders.
   // Sidebar interactions (new messages, status changes, opening the menu) all
@@ -1466,19 +1481,23 @@ function ChatSidebar({
 
   const filteredSlots = useMemo(() => {
     const activeFilterDefs = SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
+    // Active content search: order by the backend's relevance ranking instead
+    // of the sidebar sort (mirrors the Older Sessions lane and the command
+    // palette). Pinning stays a reachability promise for browsing, not a
+    // ranking hint inside explicit search results.
+    const searchRanked = slotFilter.trim().length >= SEARCH_MIN_CHARS ? slotSearchRanks : null
     return enrichedSlots
       .filter(slot => {
         if (activeFilterDefs.length > 0 && !activeFilterDefs.some(filterDef => slot[filterDef.key])) return false
         if (!slotFilter) return true
-        if (slotFilter.trim().length >= SEARCH_MIN_CHARS) {
-          if (slotSearchKeys) return slotSearchKeys.has(slot.key)
-          return ((slot.title || '') + slot.key + (slot.agent || '')).toLowerCase().includes(slotFilter.toLowerCase())
-        }
+        if (searchRanked) return searchRanked.has(slot.key)
         return ((slot.title || '') + slot.key + (slot.agent || '')).toLowerCase().includes(slotFilter.toLowerCase())
       })
-      .sort((a, b) => comparePinnedThenSort(a, b, sortKey, pinned))
+      .sort((a, b) => searchRanked
+        ? (searchRanked.get(a.key) ?? Infinity) - (searchRanked.get(b.key) ?? Infinity)
+        : comparePinnedThenSort(a, b, sortKey, pinned))
   },
-    [enrichedSlots, slotFilter, slotSearchKeys, pinned, sortKey, activeFilters]
+    [enrichedSlots, slotFilter, slotSearchRanks, pinned, sortKey, activeFilters]
   )
 
   // Folder IDs whose sessions are excluded from the flat lane because the
@@ -2458,8 +2477,8 @@ function ChatSidebar({
                       onClick={revealInPanel(link)}
                       className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
                       title={chipTitle(link)}>
-                      {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
-                      {link.provider === 'github' ? `#${link.number}` : `!${link.number}`}
+                      {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : link.provider === 'jira' ? <JiraLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
+                      {link.provider === 'github' ? `#${link.number}` : link.provider === 'jira' ? `${link.repo}-${link.number}` : `!${link.number}`}
                       {link.state === 'merged' && (
                         <span className="inline-flex shrink-0 text-aim" aria-label={i18nT('pages.chatSidebar.merged')} title={i18nT('pages.chatSidebar.merged')}>
                           <GitMerge className="lucide-inline" aria-hidden="true" />
@@ -2486,9 +2505,9 @@ function ChatSidebar({
                       onClick={revealInPanel(link)}
                       className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
                       title={chipTitle(link)}>
-                      {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
-                      <CircleDot className="lucide-inline shrink-0" aria-hidden="true" />
-                      {`#${link.number}`}
+                      {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : link.provider === 'jira' ? <JiraLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
+                      {link.provider !== 'jira' && <CircleDot className="lucide-inline shrink-0" aria-hidden="true" />}
+                      {link.provider === 'jira' ? `${link.repo}-${link.number}` : `#${link.number}`}
                     </a>
                   ))}
                   {hidden > 0 && (
@@ -3714,14 +3733,29 @@ function ChatSidebar({
                   }
                   return ((s.title || '') + s.key).toLowerCase().includes(historyFilter.toLowerCase())
                 })
+                // One definition of "search active" for every site below: results
+                // are present AND the query is still at/above the search threshold.
+                // The compound check matters on the clear-X frame: historyFilter
+                // empties synchronously but useDebouncedSessionSearch nulls its
+                // result in a passive effect (one render later), so a bare
+                // `historySearchResults` test would treat that stale frame as an
+                // active search and paint date segment headers over a
+                // relevance-ordered list.
+                const searchActive = historyFilter.trim().length >= SEARCH_MIN_CHARS && !!historySearchResults
                 // Hide date segments when the user has an active search — results are
                 // Segments only make sense when the list is date-ordered. For name/created
                 // sorts (or active search, which is relevance-ranked) they'd interleave.
-                const showSegments = !(historyFilter.trim().length >= SEARCH_MIN_CHARS && historySearchResults)
+                const showSegments = !searchActive
                   && (sortKey === 'date-desc' || sortKey === 'date-asc')
-                // Skip the sort only when the backend already returns date-desc order, i.e.
-                // no active search (search results are relevance-ranked, not date-ranked).
-                const sortedHistory = (sortKey === 'date-desc' && !historySearchResults) ? filteredHistory : [...filteredHistory].sort((a, b) => compareBySort(a, b, sortKey))
+                // Active search: keep the backend's relevance ranking (title-boosted;
+                // see search_sessions in history.py). Re-sorting search results by the
+                // sidebar sort key buried an exact title match under fresher sessions
+                // that merely mention the query in their content — and defeated
+                // groupHistoryByFolder's documented order-preserving contract. The
+                // command palette's Sessions tab already preserves backend order.
+                // No search: skip the sort only when the backend already returns
+                // date-desc order.
+                const sortedHistory = (searchActive || sortKey === 'date-desc') ? filteredHistory : [...filteredHistory].sort((a, b) => compareBySort(a, b, sortKey))
                 let prevSeg = ''
                 // Derive agent color the same way renderSessionRow does so history rows
                 // match the session-row visual language (agent name tinted by source).
@@ -3794,7 +3828,7 @@ function ChatSidebar({
                 // Folder-grouped view: during an active content search, regroup the
                 // relevance-ranked results under collapsible folder headers (+ Unfiled)
                 // by the folder each session was filed in, instead of date segments.
-                if (historyFilter.trim().length >= SEARCH_MIN_CHARS && historySearchResults) {
+                if (searchActive) {
                   return groupHistoryByFolder(sortedHistory, folders).map(({ key: gid, folder, rows }) => {
                     const collapsed = collapsedHistoryGroups.has(gid)
                     const groupName = folder ? folder.name : i18nT('pages.chatSidebar.unfiled')

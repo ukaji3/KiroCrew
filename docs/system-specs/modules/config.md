@@ -349,22 +349,43 @@ a per-agent model pin (per-agent pin > global default). Reads only the kiro
 `kiro_agents_dir()`.
 
 ### `kiro_agents_dir() -> Path` (`config/paths.py`)
-Leaf helper returning `~/.kiro/agents`. Lives in the leaf module so `loader.py`
-(and `_resolve_named_agent_model`'s `agents_dir` DI seam) can locate installed
-agent JSONs without importing `kiro_crew.agent` — which imports `config.loader`
-and would create an import cycle.
+Leaf helper returning `~/.kiro/agents` — the **user-level** scope. Lives in the leaf
+module so `loader.py` (and `_resolve_named_agent_model`'s `agents_dir` DI seam) can
+locate installed agent JSONs without importing `kiro_crew.agent` — which imports
+`config.loader` and would create an import cycle.
 
-### `resolve_agent_bindings(config, agent_name=None) -> ResolvedBindings`
+Deliberately **single-valued**: it is the WRITE target as well as a read scope
+(`bridges._register_agents` and `agent.rebuild_agent_config` both write here), so it
+is never widened into a search path.
+
+### `project_agents_dir(project_dir)` / `project_kiro_dir(project_dir)` (`config/paths.py`)
+The **project** scope, read-only: `<project>/.kiro/agents` (kiro-cli's own workspace
+agents dir) and `<project>/.kiro` (which holds Kiro Crew's older
+`*.agent-spec.json` convention). kiro-cli resolves `--agent` against
+`$PWD/.kiro/agents` before the user-level dir with **no upward walk**, and Kiro Crew
+spawns kiro-cli with the session's project directory as its cwd, so this is exactly
+the directory the backend searches for that session.
+
+Only `.kiro/agents/*.json` is **dispatchable**: kiro-cli does not read
+`*.agent-spec.json`, so `agent_discovery.project_agent_files()` excludes it unless
+the caller opts in with `include_legacy=True` (only the Slack handler does, for its
+own pre-existing listing/resolution). Offering a legacy-only name on a dispatch
+surface would have it accepted by the picker and by `spawn_run`, then fail at
+`session/set_mode`.
+
+### `resolve_agent_bindings(config, agent_name=None, project_dir=None) -> ResolvedBindings`
 Resolves the workspace, memory store and **kiro agent** a session runs under.
 Resolution order:
 
 1. `agent_name` is a key in `config.agents` — use that alias's bindings.
-2. `agent_name` is a **materialized kiro agent config** — a `~/.kiro/agents/*.json`
-   whose **declared `name`** matches (the filename stem only when the config
-   declares no name) — take the *default* alias's workspace/memory bindings but
-   dispatch **that agent itself**. `kiro-cli agent list` enumerates agents by
-   declared name, so a namespaced filename stem such as `mochi--mochi` is NOT a
-   name kiro-cli can resolve and must not be treated as dispatchable.
+2. `agent_name` is a **materialized kiro agent config** — a `*.json` under
+   `~/.kiro/agents/` or, when `project_dir` is given, under
+   `<project>/.kiro/agents/` — whose **declared `name`** matches (the filename stem
+   only when the config declares no name) — take the *default* alias's
+   workspace/memory bindings but dispatch **that agent itself**. `kiro-cli agent
+   list` enumerates agents by declared name, so a namespaced filename stem such as
+   `mochi--mochi` is NOT a name kiro-cli can resolve and must not be treated as
+   dispatchable.
 3. otherwise `config.default_agent`, then the first available alias, then bare
    defaults.
 
@@ -375,9 +396,50 @@ to `config.agents`** — that mapping is authored by setup / the user. Without i
 app-bound session fell through to `default_agent` and the DEFAULT agent answered
 while the slot still advertised the requested name, with none of the app's MCP
 tools. The rung is deliberately wider than app agents: **any** parseable config in
-that directory dispatches with default bindings, because the directory *is* the
+those directories dispatches with default bindings, because they *are* the
 kiro-cli agent registry and narrowing to app-registered names would require
-provenance it does not record.
+provenance they do not record.
+
+`project_dir` must be the directory the session actually runs in (the same value
+passed as the kiro-cli cwd).
+
+**Neither scope touches the filesystem on the event loop.** The user-level scope is
+served from the process-wide materialized snapshot (refreshed off-loop by the
+writer); the project scope differs per session, so it is served by
+`agent_discovery.project_agent_names()` — a per-project name set revalidated by a
+stat-only signature, so a repeat scan costs two `scandir` walks rather than
+re-reading every spec. `_project_declares_agent` splits on whether a loop is running:
+off-loop it scans, on-loop it reads `cached_project_agent_names()`, which performs
+**no syscalls at all** and reports "not declared" on a cold cache so the caller falls
+back — exactly as the cold-snapshot user-level path does. Bounding the file *count*
+is not the same guarantee as bounding *latency*: this runs on every turn of a
+project-bound session, so a network or otherwise slow checkout would become a
+recurring gateway stall the loop-stall watchdog blames on chat.
+
+Async callers therefore **warm the cache before resolving**:
+`agent_discovery.warm_project_agent_names()` runs the scan on
+`executors.discovery_executor()` (the pool `/api/agents/installed` uses), after which
+the on-loop read is a hit. `chat_runner._run_chat` and the side-turn handler both do
+this.
+
+`subagent._validate_agent` cannot warm — `spawn()` is synchronous and already on the
+loop — so it reads the project scope from `cached_project_agent_names()` only. A
+project agent is accepted once that project's cache is warm (any session that
+resolved bindings for it has warmed it); a cold cache reports the name unknown, which
+is fail-closed and matches that function's existing rule of refusing an unknown name
+rather than silently running the default. Widening its pre-existing user-level scan to
+a second directory instead would stall the gateway.
+
+`slack/handler._resolve_agent_name` runs on the loop too, so it prefilters on the
+**filename** and reads at most the one matching spec — resolving every spec's declared
+name would stall Slack on a checkout with many agents.
+
+**Only the warm is offloaded — never `resolve_agent_bindings` itself.** The resolver
+can raise `StopIteration` (its defensive `next(iter(config.agents))` branch on a
+malformed config), and `StopIteration` cannot be delivered through a `Future`:
+asyncio rejects it, so an awaiting caller hangs instead of seeing the error, and the
+`except Exception` that callers rely on never runs. Keeping resolution synchronous
+preserves its exception contract for every call site.
 
 `ResolvedBindings` additionally reports `requested_resolved` (whether the
 requested name was honored — False means the default answered) and
@@ -569,6 +631,8 @@ class AgentConfig:
     subagent_auto_max: int = 16    # ceiling on the auto-sized cap (max_subagents=0 only). Load-time clamped to [3, 64]
     subagent_max_turns: int = 100  # default per-subagent tool-call budget. Load-time clamped to [1, 200]
     subagent_result_ttl_secs: int = 3600  # seconds a delivered subagent's result.txt is retained before the reaper prunes it
+    chat_turn_timeout_secs: int = 7200  # wall-clock ceiling for one chat turn. Load-time clamped to [300, 7200] and to the ACP prompt timeout
+    tool_approval_timeout_secs: int = 600  # how long a chat turn waits for a human to answer a tool-approval prompt. Load-time clamped to [30, 7200] AND to 60s below chat_turn_timeout_secs
 
 @dataclass
 class SessionConfig:
@@ -759,8 +823,8 @@ screenshot.
 
 ### Security-Bounded Config Clamp
 
-Three resource-limit knobs are clamped to hard ceilings **at load time**, not just
-at the dashboard write gate. The ceilings are the single source of truth in
+Resource-limit and timeout knobs are clamped to hard ceilings **at load time**, not
+just at the dashboard write gate. The ceilings are the single source of truth in
 `loader.py`:
 
 | Constant | Value | Field |
@@ -768,6 +832,8 @@ at the dashboard write gate. The ceilings are the single source of truth in
 | `SUBAGENT_AUTO_MAX_CEILING` | 64 | `agent.subagent_auto_max`, `agent.max_subagents` |
 | `SUBAGENT_MAX_TURNS_CEILING` | 200 | `agent.subagent_max_turns` |
 | `POOL_SIZE_MAX` | 10 | `session.pool_size` |
+| `CHAT_TURN_TIMEOUT_MIN` / `_MAX` | 300 / 7200 | `agent.chat_turn_timeout_secs` |
+| `TOOL_APPROVAL_TIMEOUT_MIN` / `_MAX` | 30 / 7200 | `agent.tool_approval_timeout_secs` |
 
 `_SECURITY_BOUNDED_FIELDS` lists each `(section, key, min, max)`; the mins match
 the existing runtime floors (0/1) so a legitimate in-range value is never
@@ -777,6 +843,23 @@ serve clamped values. It clamps out-of-range real integers in place (a JSON
 `true`/`false` bool or any non-int is skipped and left to dataclass
 coercion/defaults), logs a WARNING, and emits a best-effort `config_bounds_clamped`
 SEL security event (never fatal — config loading must not raise).
+
+Two **cross-field** clamps run after that generic pass, so both operands are
+already in range:
+
+- `agent.max_subagents`: 0 is the auto-size sentinel, so an explicit pin below
+  `MAX_SUBAGENTS_FIXED_FLOOR` (3) is raised UP to the floor.
+- `agent.tool_approval_timeout_secs` is pulled to `APPROVAL_TURN_MARGIN_SECS`
+  (60) below `agent.chat_turn_timeout_secs`. An approval window that reaches the
+  turn ceiling can never fire: the turn is cut first and reports itself as a turn
+  timeout, so the unanswered approval is never named and an unattended run burns
+  the whole ceiling on every prompt. `dashboard/turn_dispatch.py`
+  `tool_approval_timeout_secs()` repeats the cap against the **resolved** ceiling,
+  which the ACP prompt timeout can lower below the configured one, and then
+  against the budget REMAINING in the running turn (`_TURN_DEADLINE`, published by
+  `_bounded_turn`). The arm-time bound is the one that makes the invariant hold
+  for a prompt arming late in a long turn; with under a margin left it returns
+  `0.0` and the runner declines without waiting.
 
 Why load-time (not just the API): the REST API rejects out-of-range writes, but a
 direct edit of `config.json` (any process running as the same OS user — including

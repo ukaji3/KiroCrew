@@ -9,14 +9,14 @@ KiroCrew implements defense-in-depth security across multiple layers: OS-level p
 | Threat | Vector | Mitigation |
 |--------|--------|------------|
 | XPIA credential theft | LLM reads `~/.aws`, `~/.ssh` via `fs_read` or `cat` | Hook-layer path blocking + OS sandbox |
-| XPIA data exfiltration | LLM embeds secrets in URLs posted to Slack/dashboard | Output scanning + URL redaction |
+| XPIA data exfiltration | LLM embeds secrets in URLs posted to a chat channel or the dashboard | Output scanning + URL redaction |
 | Cross-origin WebSocket hijack | Malicious page connects to `ws://127.0.0.1:5476/api/ws` | Origin header validation |
 | Cross-origin mutation (CSRF) | Malicious page POSTs to dashboard API | Origin/Referer validation on non-safe methods |
 | DNS rebinding | Attacker domain resolves to `127.0.0.1`; browser sends forged `Host` to the loopback-bound dashboard (incl. GET exfil) | `Host`-header allowlist validation on every method (`check_host` / `host_validation_middleware`), deny-by-default, 403 + SEL audit. Sole exemption: the three `PROBE_PATHS` liveness probes (orchestrators address containers by IP); their handlers strip identity fields via a second `check_host` gate, leaking nothing beyond TCP reachability |
 | Unauthenticated remote access | Dashboard bound to `0.0.0.0` | Loopback-only by default (`127.0.0.1`); when user opts in via `dashboard.url`, token auth middleware requires HMAC-SHA256 signed, IP-pinned, single-use tokens on every request |
 | Unauthenticated remote access (AEA tunnel) | `tunnel.enabled` exposes dashboard via public HTTPS URL | Double auth: Tunnels validates Midway OIDC at edge + KiroCrew token auth middleware. Security gate refuses tunnel start without token auth active. Owner-only access (Tunnels restricts by username). SEL audit on connect/disconnect/denial |
 | Unauthorized dashboard access | No auth on localhost | Token auth middleware on all requests (loopback bypass removed); file-based IPC secret for internal paths |
-| Non-owner Slack interaction | Any workspace member clicks YOLO/approve buttons | 5-layer owner verification |
+| Non-owner channel interaction | Any workspace/server member clicks YOLO/approve buttons | 5-layer owner verification |
 | Fail-open owner lock | `KIROCREW_OWNER_ID` unset → no check | Deny-by-default: refuse connect + reject messages |
 | MCP input injection | Malformed/oversized tool inputs from LLM | Centralized schema validation (`validation.py`) |
 | MCP response DoS | Unbounded tool output fills memory | Response truncation at 100K |
@@ -94,6 +94,8 @@ On macOS the marker must additionally **agree with the kernel**, and the two cov
 **Why standard is safe**: The hook layer (`is_sensitive_path()`) still blocks direct file reads of `~/.aws/*` and `~/.ssh/*`. Denied commands block `cat`/`head`/`tail`/`python open()` on those paths. `redact_credentials()` catches any credential patterns that leak through tool output. Three independent layers must all be bypassed simultaneously.
 
 Config: `agent.sandbox` in `config.json` — `"auto"` (standard), `"strict"`, or `"off"`.
+
+**Callers must pass the configured tier explicitly.** `wrap_argv`'s `mode` parameter defaults to `"auto"`, which coincides with the shipped `agent.sandbox` default but is **not** the same thing: it ignores what the operator actually configured. Where `agent.sandbox` is an explicit `"off"` (isolation deferred to kiro-cli's internal sandbox), a spawn that omits `mode` requests isolation the operator did not ask for, and on a host with no backend (any Windows host, macOS >= 26) it fail-closes where the same binary spawned by the chat path succeeds. Passing the configured value is what keeps a one-shot read from being *stricter* than the long-lived chat session it accompanies; it can never make it looser, since both read the same key. The interactive ACP spawns thread the value through their `sandbox_mode` constructor argument; one-shot `kiro-cli` reads call `sandbox.configured_sandbox_mode()` (owning module: `sandbox.py`) instead of relying on the default. This is deliberately **not** a change to `wrap_argv`'s own default, which must stay fail-secure for callers that genuinely want a tier independent of config — the prerequisite probes' `strict`, the credential-free registry clones. See `modules/acp-client.md` for the affected sites and the user-visible symptoms.
 
 Wired into `AcpClient._spawn()` — all kiro-cli processes are sandboxed. Parent KiroCrew process is unaffected. Zero new dependencies (stdlib + system binaries only).
 
@@ -354,7 +356,7 @@ Making `PR Readiness` a required status remains an explicit branch-protection
 or ruleset setting outside the workflow.
 
 The aggregate covers the latest PR run for CI, Build,
-Code Review, Opus 5 Review, GPT 5.6 Review (the reconciled result of its three
+Code Review, Opus 4.8 Review, GPT 5.6 Review (the reconciled result of its three
 calls), and Design Review, plus the managed dynamic CodeQL workflow conclusion.
 Grading the CodeQL
 workflow conclusion, rather than its neutral summary check, preserves failures
@@ -442,7 +444,9 @@ than an automatic readiness failure.
 - **Half-formed shape fallback**: if either `service_name` or `operation_name` is missing/empty/non-string, synthesis returns None and deny-by-default remains armed.
 - **Evidence note**: no captured event in the security event log contains the raw `operation_name` value (the SEL records tool names, not params). The kiro-cli binary strings contain PascalCase AWS SDK operation names (`GetId`, `CreateToken`, `DeleteStack`), and the tool spec states params "MUST conform to the AWS CLI specification" (kebab-case), but since the value is model-authored, BOTH casings can arrive. Normalization makes the assumption non-load-bearing.
 
-- `is_denied(tool_name, extra_patterns, *, denied_regexes)` evaluates the *effective* denied-command set plus a dedicated verb-anchored git-publish detector. The **regex tier** (`denied_regexes`, matched via `re.search`, case-insensitive) is the enabled subset of `BUILTIN_DENIED_RULES` plus the user's `user_added` patterns from the keystone `denied_commands.json` opt-out state, which the hooks layer resolves via `compute_effective_denied(...)` and passes in; the **glob tier** (`extra_patterns`, fnmatch) carries legacy `auto_deny_tools` + the companion overlay. "Agent-configured patterns" no longer means a kiro agent JSON `deniedCommands` array — that injection path is retired. When `denied_regexes` is `None` the check fails closed to all built-ins enabled. The git-publish detector and protected-branch gate are unchanged always-on floors that run before either tier:
+- `is_denied(tool_name, extra_patterns, *, denied_regexes, reason_notes)` evaluates the *effective* denied-command set plus a dedicated verb-anchored git-publish detector. The **regex tier** (`denied_regexes`, matched via `re.search`, case-insensitive) is the enabled subset of `BUILTIN_DENIED_RULES` plus the user's `user_added` patterns from the keystone `denied_commands.json` opt-out state, which the hooks layer resolves via `compute_effective_denied(...)` and passes in; the **glob tier** (`extra_patterns`, fnmatch) carries legacy `auto_deny_tools` + the companion overlay. `reason_notes` is an optional `{pattern: operator note}` map (from `hooks.resolve_denied_notes`, forwarded opaquely by `PolicyAuthority.is_denied`) that decorates the refusal text only — it cannot add, remove, or alter a match. "Agent-configured patterns" no longer means a kiro agent JSON `deniedCommands` array — that injection path is retired. When `denied_regexes` is `None` the check fails closed to all built-ins enabled. The git-publish detector and protected-branch gate are unchanged always-on floors that run before either tier:
+
+  - **Refusal string (a parsed micro-format, not free text):** the first line is always exactly `f"{DENY_REASON_PREFIX}{matched}"` — `DENY_REASON_PREFIX` is exported from `security.py` precisely so guards cannot drift from the producer. It is byte-stable on purpose, because three consumers parse it: `website/src/pages/chat/RecoveryCard.tsx` extracts the pattern with `/Blocked by security policy:\s*(.+?)\s*$/gm`, the test helper `_denied_by` partitions on the exact `"Blocked by security policy: "` separator, and `chat_runner` reads it for display (after redaction). When the matched pattern has an operator note, the note is appended as a **second line** — never on the first, which would be captured as part of the pattern. Because `RecoveryCard`'s regex is GLOBAL and per-line, a note containing the prefix would be parsed as a second, fabricated pattern; that is why notes carrying it are rejected at the endpoint and dropped in `resolve_denied_notes`. Both guards test `DENY_REASON_MATCH_PREFIX` (the colon-terminated form derived from the emitted prefix), NOT the emitted prefix itself: the regex makes the space after the colon optional, so `"Blocked by security policy:forged"` parses as a refusal line without containing the emitted string. Anything added to this format must keep line one intact.
   - **Git publish (verb-anchored regex):** `git push` is detected by `_is_git_publish()` (`_GIT_PUBLISH_RE` + `_GIT_PUBLISH_GLUE_RE`), **not** a substring glob. `push` must be the git *subcommand* (first non-flag token after `git`, allowing intervening `-x` / `-C path` / `-c k=v` options), so a commit message, branch name, grep pattern, or ssh remote payload that merely contains the word "push" is **not** blocked (e.g. `git commit -m '...push...'`, `git log --grep push`, `git switch -c fix/git-push`). Checked on the whole string first to catch command-substitution glue-evasion (`git$(echo ' ')push`, `git\`echo\`push`, `git_push`) and on segment-spanning chains (`git stash push && git push origin main`). Replaces the former broad `*git*push*` glob + ` stash push` exception, which over-blocked benign commands and surfaced as a silent `Tool use aborted` on the removed standalone provider.
   - **Protected-branch gate:** `_is_git_publish()` is a **pure, side-effect-free detector** — it only answers "is this a git push?". Whether the push is *allowed* (feature branch) or *denied* (protected/bare) is decided by `_is_push_to_protected_branch()` at the single enforcement point in `is_denied` (via a deferred `push_allow_pending` flag), which is also where **both** SEL audits fire: `_emit_deny_event` on deny and `_schedule_push_allow_audit` (SEL `push_allowed`, operation `git_push`) on allow. The `push_allowed` audit is deferred to the *final* allow exit, so a compound `<feature push> && <denied command>` chain that later trips a deny pass logs a **deny**, not an allow.
     - `_PROTECTED_BRANCHES` covers `main`/`mainline` plus the legacy Git default-branch name (see `_PROTECTED_BRANCHES` in `security.py`), plus ambiguous runtime-resolved refs `_AMBIGUOUS_REFS` = {`head`, `@`, `fetch_head`} — all matched by `_is_protected_branch_name()`. A push to any of these (or a **bare** `git push` / `git push <remote>` with no explicit branch, since the current branch might be protected) is denied.
@@ -502,9 +506,19 @@ agent-readable `config.json`. The file's root IS the opt-out object:
 {
   "disable_all": false,
   "disabled_ids": ["<builtin-rule-id>", ...],
-  "user_added": [{"id": "user-xxxxxxxx", "pattern": "rm -rf /tmp/mine", "enabled": true}]
+  "user_added": [{"id": "user-xxxxxxxx", "pattern": "rm -rf /tmp/mine", "enabled": true,
+                  "note": "use a scoped path instead"}]
 }
 ```
+
+`note` is optional operator prose, surfaced in the refusal when that rule fires so
+the caller reads remediation instead of a raw regex. It is metadata: it never
+participates in matching. Create-only, mirroring `pattern` — neither has an edit
+endpoint. Two constraints follow from the refusal being a parsed micro-format
+(see "Refusal string" below): the add endpoint collapses whitespace and rejects a
+note containing `DENY_REASON_PREFIX` (`note_forges_reason`), and
+`hooks.resolve_denied_notes` drops any note that still carries the prefix, which
+is the guard that holds for a keystone file edited by hand.
 
 The file is on `_SENSITIVE_HOME_DIRS` (read+write block) AND the governance
 boot-integrity `required` tuple, so the agent can neither READ nor WRITE its own
@@ -549,7 +563,18 @@ and an add-your-own field for custom patterns. Built-ins are never deletable —
 only disableable. Disabling a built-in (or the disable-all toggle) requires an
 explicit acknowledgment in a confirm modal and writes a SEL audit entry
 recording the weakened state. A governance-pinned rule renders locked (forced-on)
-and cannot be toggled off. When *any* rule is governance-pinned
+and cannot be toggled off. The seven `git-publish` category rules render the same
+lock treatment for a different reason: their enforcement is the always-on
+verb-anchored floor (`_is_git_publish` / `_is_push_to_protected_branch`), which
+consults no opt-out state, so the snapshot forces them `enabled` and marks them
+with `lock_reason: "floor"` (governance pins carry `lock_reason: "policy"`;
+`pinned` keeps its governance-only meaning). `floor_enforced_builtin_command_ids()`
+derives the set from the rule category — never a hand-maintained id list — and is
+display/API-only: nothing in the enforcement path reads it. A `PATCH` disable for
+a floor-enforced id is rejected with the same 409 shape as a governance pin
+(`code: "floor_enforced"`, SEL-audited as denied with `=floor_enforced`) and
+never persists into `disabled_ids`; re-enabling stays a no-op success. When *any*
+rule is governance-pinned
 (`governance_locked`), the **disable-all** toggle stays available and functional
 (it shows the pinned-policy tooltip alongside the still-live control): the
 backend keeps pinned rules enforced under `disable_all` via
@@ -569,8 +594,11 @@ consistency).
 
 **Defense-in-depth nuance** — ~45 of the 130 rules overlap an independent,
 always-on keystone control (sensitive-file reads, IMDS, git-publish, cred-env
-dumps). All 130 rules are disableable, but disabling a rule does **not** disable
+dumps). Most rules are disableable, but disabling a rule does **not** disable
 its keystone control — such a command stays blocked by defense-in-depth. The
+`git-publish` rules go one step further: the floor is their *only* enforcement
+(their ReDoS-prone patterns never reach the regex tier), so they are not
+disableable at all and the Settings surface locks them (see above). The
 ~85 purely-opinionated destructive rules (AWS delete/mutate, `cdk`/`terraform`/
 `pulumi destroy`, `rm -rf`, `DROP DATABASE`, kill-kirocrew, reverse shells) have
 no keystone backup, so disabling those fully unblocks them (the actual user ask).

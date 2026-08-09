@@ -37,6 +37,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
+from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.autonudge import get_instance
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -63,6 +64,7 @@ from kiro_crew.dashboard.chat_title import (
     _maybe_auto_title,
     _rephrase_plan_lite,
     _reset_auto_run_for_new_plan,
+    maybe_refresh_title,
 )
 from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
@@ -86,7 +88,9 @@ from kiro_crew.dashboard.chat_utils import (
     _validate_tool_name,
     build_recovery_requeue,
     effective_session_key,
+    expire_slack_options,
     is_system_injection_item,
+    remember_slack_options,
     slot_history_key,
 )
 from kiro_crew.dashboard.handlers import (
@@ -126,7 +130,13 @@ from kiro_crew.dashboard.state import (
     should_queue_refusal_recovery,
     unsafe_bash_reason,
 )
-from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
+from kiro_crew.dashboard.steer_settle import settle_consumed_steers
+from kiro_crew.dashboard.turn_dispatch import (
+    format_approval_no_budget_card,
+    format_approval_timeout_card,
+    spawn_guarded_turn,
+    tool_approval_timeout_secs,
+)
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import (
     HOOK_EVENT_AGENT_SPAWN,
@@ -147,10 +157,11 @@ from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
     acp_error_is_transient,
     record_interaction_event,
+    run_bg_oneliner,
     transient_retry_delay,
 )
 from kiro_crew.messaging.identity import publish_turn_identity
-from kiro_crew.messaging.link import SLACK_NAMESPACE
+from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
 from kiro_crew.messaging.renderer import chunk_text
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
@@ -176,8 +187,9 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionClosingError
+from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
+from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.validation import ValidationError, infer_use_case, validate_ask_user_question
 from kiro_crew.widget_artifacts import register_widgets_off_loop
 
@@ -530,6 +542,29 @@ _MAX_SNAPSHOT = 200_000  # cap per-file snapshot to bound message meta size
 # this size the stored snapshot is truncated to _MAX_SNAPSHOT anyway, so
 # reconstruction declines instead of stalling the loop on a huge file.
 _MAX_RECONSTRUCT_BYTES = 2_000_000
+
+# Poisoned-conversation escalation threshold: number of CONSECUTIVE turn
+# cycles that must each exhaust the full pre-stream transient-5xx ladder
+# (TRANSIENT_RETRIES + 1 attempts, zero output) before the terminal error
+# branch stops advising "retry in a moment" and instead destroys the native
+# session and re-queues once on a fresh conversation. Two cycles ⇒ at least
+# 2×(TRANSIENT_RETRIES+1) consecutive pre-stream failures spanning a user
+# action (Continue / new message), which a momentary capacity blip does not
+# survive but a backend-rejected persisted conversation always does.
+POISONED_SESSION_CYCLES = 2
+
+# Canary probe for the poisoned-conversation escalation: before any discard,
+# ONE tool-free prompt is run through an ephemeral fresh background session
+# (run_bg_oneliner). Only a canary that SUCCEEDS while this conversation keeps
+# failing constitutes conversation-specific rejection evidence — the exact
+# incident signature ("a fresh session works instantly while this session
+# fails every prompt"). A canary that also fails means the backend itself is
+# down/throttled, so no discard fires and nothing is consumed; the next
+# user-initiated exhausted cycle re-probes. This replaces any error-text
+# classification: the ACP classifier contract forbids branching on formatted
+# message wording, and the canary needs no classification at all.
+_POISON_CANARY_PROMPT = "Reply with the single word OK."
+_POISON_CANARY_TIMEOUT_SECS = 30.0
 
 
 def _truncate_snapshot(content: str) -> str:
@@ -2112,6 +2147,165 @@ async def _consume_pending_reset(state: DashboardState, slot: _ChatSlot) -> None
         )
 
 
+# Debounce before a speculative spawn. Absorbs rapid consecutive signals
+# (slot create immediately followed by a project set, or a user re-picking
+# the project) so only the settled state spawns a session.
+_EAGER_SPAWN_DEBOUNCE_SECS = 1.5
+
+# Global cap on concurrent speculative spawns. Bounds the process/RSS burst
+# when many slots fire signals at once (bulk restore, slot surfing); a spawn
+# that cannot get a permit simply skips — the first message cold-starts as
+# it does today, so the cap only ever degrades back to current behavior.
+_EAGER_SPAWN_MAX_CONCURRENT = 2
+_eager_spawn_sem = asyncio.Semaphore(_EAGER_SPAWN_MAX_CONCURRENT)
+
+
+def schedule_eager_spawn(state: "DashboardState", slot: "_ChatSlot") -> None:
+    """Speculatively create *slot*'s session ahead of its first message.
+
+    Fire-and-forget: called from the slot-create and project-set handlers so
+    the multi-second ACP handshake (spawn + session/new, or session/load for
+    a resumable slot) overlaps with the user's think-time instead of being
+    paid on the first send. No-op unless ``session.eager_spawn`` is enabled.
+
+    At most one pending task per slot: a newer signal cancels the older task,
+    so the spawn always reflects the slot's settled agent/model/project.
+    """
+    try:
+        cfg = KiroCrewConfig.load()
+        if not cfg.session.eager_spawn:
+            return
+    except Exception:
+        return
+    prev = getattr(slot, "_eager_spawn_task", None)
+    if prev is not None and not prev.done():
+        prev.cancel()
+    slot._eager_spawn_task = asyncio.create_task(_eager_spawn(state, slot))
+
+
+async def _eager_spawn(state: "DashboardState", slot: "_ChatSlot") -> None:
+    """Debounce, re-validate, then create the slot's session and release it.
+
+    Ordering is load-bearing:
+
+    1. The turn-in-flight bail (``slot.running``) MUST precede the pending-
+       reset consume. The project-set endpoint is reachable from inside the
+       kiro-cli process group via the ``set_project`` MCP tool, and consuming
+       the reset kills that session's process group — mid-turn that would
+       kill the caller, which is exactly what the deferred-reset design
+       exists to prevent. When a turn is running, its own end-of-turn path
+       consumes the reset instead.
+    2. ``get_or_create`` acquires the per-session semaphore; it is released
+       immediately below because no turn follows. A first message arriving
+       mid-handshake blocks on that same semaphore and then reuses the
+       created session — the per-key serialization in ``get_or_create`` is
+       what makes the eager call and the real call converge on one session.
+    """
+    try:
+        await asyncio.sleep(_EAGER_SPAWN_DEBOUNCE_SECS)
+        sessions = getattr(state, "sessions", None)
+        if sessions is None:
+            return
+        if state.get_slot(slot.key) is not slot:
+            return  # slot deleted or replaced while debouncing
+        if slot.running:
+            return  # a real turn owns session creation (and the pending reset)
+        if _eager_spawn_sem.locked():
+            logger.info("Eager spawn: concurrency cap reached, skipping slot %s", slot.key)
+            return
+        async with _eager_spawn_sem:
+            await _consume_pending_reset(state, slot)
+            session_key = effective_session_key(slot)
+            # Snapshot the bindings the handshake is about to bake in. A
+            # switch handler (workspace, model, reasoning effort) that fires
+            # mid-handshake resets the session key — but the reset no-ops
+            # because nothing is registered yet, so without this check the
+            # eager task would register a session carrying the OLD bindings
+            # and the first real turn would silently reuse it (e.g. run tools
+            # in the wrong workspace). Agent/project changes re-arm through
+            # schedule_eager_spawn and cancel this task, but the other
+            # switches don't — the snapshot covers them all uniformly.
+            _bound = (slot.agent, slot.model, slot.project, slot.reasoning_effort)
+            kiro_agent: str | None = None
+            agent_model = ""
+            try:
+                cfg = KiroCrewConfig.load()
+                bindings = resolve_agent_bindings(cfg, slot.agent or None)
+                kiro_agent = bindings.kiro_agent
+                agent_model = normalize_agent_model(bindings.model)
+            except Exception:
+                logger.warning(
+                    "Eager spawn: failed to resolve agent bindings for slot %s",
+                    slot.key,
+                    exc_info=True,
+                )
+            _t0 = time.monotonic()
+            try:
+                # speculative=True keeps the one-shot first-turn flag armed for
+                # the real first message (atomically, at registration) and
+                # refuses resumable keys — the real turn must be the one that
+                # observes resumed=True. See get_or_create's docstring.
+                _, is_new, resumed = await sessions.get_or_create(
+                    session_key,
+                    agent=kiro_agent or slot.agent or None,
+                    model=slot.model or agent_model or None,
+                    cwd=slot.project or None,
+                    speculative=True,
+                    reasoning_effort_override=slot.reasoning_effort or None,
+                )
+            except SpeculativeResumeRefused:
+                logger.info("Eager spawn: %s is resumable, leaving to first turn", session_key)
+                return
+            sessions.release(session_key)
+            # The cleanup below may only tear down a session THIS task created.
+            # is_new=False means another creator won the same-key race (or the
+            # claim attached to an already-registered session): a real turn
+            # owns that runtime, may have finished its turn already, and may
+            # have background work (subagents) still attached — removing it
+            # here would terminate the winner's session out from under it. The
+            # winner registered with its own current bindings, so the stale-
+            # bindings hazard these guards exist for does not apply to it.
+            if not is_new:
+                logger.info(
+                    "Eager spawn: another creator won %s, leaving session alone", session_key
+                )
+                return
+            # The slot can be deleted while the handshake ran; the delete
+            # handler's sessions.remove() may have executed before this task
+            # registered the session, which would leave an orphan that a
+            # recreated slot with the same key would silently reuse with THIS
+            # slot's (now stale) agent/cwd bindings. Tear it down.
+            if state.get_slot(slot.key) is not slot:
+                logger.info(
+                    "Eager spawn: slot %s vanished mid-handshake, removing session", slot.key
+                )
+                await sessions.remove(session_key)
+                return
+            # Same shape for a binding change: a switch handler's reset ran
+            # before registration and found nothing, so the session we just
+            # registered carries stale bindings. Remove it — the first real
+            # message cold-starts with the current bindings, exactly as if
+            # eager spawn never ran.
+            if (slot.agent, slot.model, slot.project, slot.reasoning_effort) != _bound:
+                logger.info(
+                    "Eager spawn: slot %s bindings changed mid-handshake, removing session",
+                    slot.key,
+                )
+                await sessions.remove(session_key)
+                return
+            logger.info(
+                "Eager spawn: session ready for %s in %.0fms (new=%s resumed=%s)",
+                session_key,
+                (time.monotonic() - _t0) * 1000.0,
+                is_new,
+                resumed,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Eager spawn failed for slot %s", slot.key, exc_info=True)
+
+
 async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", message: str) -> None:
     """Handle the ``/goal`` slash command (v0 self-verdict loop).
 
@@ -2204,38 +2398,20 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
 def _settle_consumed_steers(slot: "_ChatSlot", snapshot: str) -> None:
     """Settle pending steers covered by a ``steering_consumed`` echo.
 
-    kiro-cli injects the CONCATENATION of every steer queued since the last
-    consumption; the echo text carries each one ``<user_message>``-wrapped.
-    Parse the snapshot into its individual blocks and settle by EQUALITY —
-    substring containment would false-positive short steers against longer
-    ones or against the wrapper text itself, and a falsely-settled steer is
-    silently lost when the turn dies. A steer registered after kiro-cli
-    snapshotted (not among the blocks) stays pending. Settling is COUNT-AWARE: each snapshot block settles at
-    most one pending entry, so a duplicate identical steer registered after
-    the snapshot stays pending instead of being swept by set membership.
-    When the echo carries no usable text (older backend, redacted echo),
-    fall back to settling all — worst case is a visible, cancellable
-    duplicate, never a silent loss.
+    The parse-and-match rules live in ``steer_settle.settle_consumed_steers``,
+    shared with the ``/side`` sidecar, which hands kiro-cli the same
+    fire-and-forget steers and needs the same answer.
     """
     if not slot._pending_steers:
         return
-    if snapshot.strip():
-        consumed_blocks = re.findall(r"<user_message>\n(.*?)\n</user_message>", snapshot, re.DOTALL)
-        # The steer RPC wraps message.strip(); pending stores the raw message.
-        # Strip for parity so whitespace never causes a false NON-match (the
-        # safe direction is a duplicate, but exact settling is better).
-        consumed_counts: dict[str, int] = {}
-        for block in consumed_blocks:
-            consumed_counts[block] = consumed_counts.get(block, 0) + 1
-        remaining = []
-        for m in slot._pending_steers:
-            key = m.strip()
-            if consumed_counts.get(key, 0) > 0:
-                consumed_counts[key] -= 1
-            else:
-                remaining.append(m)
-    else:
-        remaining = []
+    # settle_all_on_empty preserves this path's long-standing behaviour on an
+    # empty echo. The /side sidecar deliberately chose the opposite (an empty
+    # echo is no evidence, so keep entries pending and let the requeue show a
+    # cancellable card); whether the main chat should follow is a separate
+    # change, because its requeue is not exercised here.
+    remaining = settle_consumed_steers(
+        slot._pending_steers, snapshot, settle_all_on_empty=True
+    )
     logger.debug(
         "Steer consumed for slot %s (%d settled, %d still pending)",
         slot.key,
@@ -2463,6 +2639,42 @@ def _finish_queue_cycle(state: DashboardState, slot: _ChatSlot) -> None:
         title_task = asyncio.create_task(_maybe_auto_title(state, slot))
         state._background_tasks.add(title_task)
         title_task.add_done_callback(state._background_tasks.discard)
+    else:
+        # Already titled: re-examine an AUTO title at bounded milestones so
+        # long sessions aren't stuck with a name generated from their very
+        # first message. Self-guarding (origin/milestone/in-flight checks in
+        # maybe_refresh_title) — the common case returns without any LLM call.
+        refresh_task = asyncio.create_task(maybe_refresh_title(state, slot))
+        state._background_tasks.add(refresh_task)
+        refresh_task.add_done_callback(state._background_tasks.discard)
+
+
+def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: bool) -> None:
+    """Emit the user-message → first-visible-token latency histogram.
+
+    Best-effort, one point per top-level user prompt. ``first_turn`` splits the
+    cold-path population eager spawn targets (the slot's first message) from
+    steady-state turns, and ``resumed`` separates ``session/load`` costs — the
+    same attribution axes as the startup metric, so the two histograms can be
+    read side by side.
+    """
+    try:
+        # circular import: metrics.provider -> config.loader -> ... (same
+        # reason _emit_kiro_startup_metric imports lazily).
+        from kiro_crew.metrics.provider import get_recorder
+
+        get_recorder().histogram(
+            "kirocrew.chat.first_token.duration",
+            (time.monotonic() - t0) * 1000.0,
+            unit="ms",
+            attrs={
+                "channel": telemetry_channel_of(session_key),
+                "first_turn": bool(is_new),
+                "resumed": bool(resumed),
+            },
+        )
+    except Exception:
+        logger.debug("TTFT metric emission failed", exc_info=True)
 
 
 async def _run_chat(
@@ -2478,6 +2690,15 @@ async def _run_chat(
 
     session_key = effective_session_key(slot)
     sessions = getattr(state, "sessions", None)
+
+    # Time-to-first-token clock: starts when the user's message reaches the
+    # runner, stops at the first visible model output (text OR thinking chunk).
+    # This is the end-to-end latency eager spawn / warm pooling exist to cut —
+    # startup.duration only covers the handshake slice, so without this the
+    # user-perceived win is not measurable. Top-level user prompts only:
+    # synthetic payloads and nested prompts are runner-authored, and mixing
+    # them in would skew the distribution the feature is judged by.
+    _ttft_t0 = time.monotonic() if (_prompt_depth == 0 and not _synthetic_payload) else None
 
     # Inherit Slack link: if this dashboard session mirrors a Slack thread,
     # copy the link so every exit path, including an auth failure, can reply on
@@ -2578,9 +2799,8 @@ async def _run_chat(
     # execution turn driven by _stage_loop. Only planning turns detect/arm a
     # plan; stage-execution turns must never re-arm (that corrupted the stage
     # total). `_in_stage_execution` is set by _stage_loop around its _run_chat.
-    _orch_planning = (
-        getattr(slot, "mode", "") == "orchestrator"
-        and not getattr(slot, "_in_stage_execution", False)
+    _orch_planning = getattr(slot, "mode", "") == "orchestrator" and not getattr(
+        slot, "_in_stage_execution", False
     )
     # Rolling-buffer redactor for the live chat_chunk wire stream. Per-chunk
     # redaction misses a credential split across streaming boundaries;
@@ -2662,6 +2882,14 @@ async def _run_chat(
     # backend 5xx is only retried while this is False, so a re-prompt can't
     # double-stream text or re-run a side-effecting tool.
     _turn_emitted = False
+    # Model-activity marker for the poisoned-conversation streak ONLY:
+    # flipped True on thinking chunks. Deliberately separate from
+    # _turn_emitted — thinking is ephemeral/broadcast-only, so retrying
+    # after a thinking-only failure stays safe (see EVENT_THINKING_CHUNK) —
+    # but a backend that streams reasoning IS serving this conversation, so
+    # such a failure is mid-generation, not the poisoned pre-stream
+    # signature, and must not count toward (or survive as) a discard streak.
+    _turn_thought = False
     # Refresh the one-shot post-token recovery allowance at the START of a
     # GENUINE new user turn, so each real user message gets exactly one recovery.
     # A repeated post-token 5xx that happens DURING recovery must NOT recover
@@ -2706,6 +2934,14 @@ async def _run_chat(
     slot._native_subagent_output = _native_card_output
     _native_card_output_len: dict[str, int] = {}
     needs_session_reset = False
+    # Poisoned-conversation escalation: unlike needs_session_reset (which
+    # preserves the resume sid so the next turn session/loads the same native
+    # conversation), discard_conversation CLEARS the sid so the next turn
+    # cold-starts a fresh conversation — while keeping the session-map entry,
+    # whose Slack thread/channel linkage must survive the recovery. Set only
+    # by the consecutive pre-stream-exhaustion branch in the AcpError handler
+    # below.
+    needs_conversation_discard = False
     _auth_required = False
     saw_compaction = False
     _turn_tool_calls = 0  # tool dispatches this turn (refusal diagnostic)
@@ -2889,6 +3125,21 @@ async def _run_chat(
         slot.append("done", "", "done")
         return
 
+    # A new turn supersedes whatever question the previous one ended on, so any
+    # OPTIONS control still live in this session's Slack thread stops being
+    # answerable. Guarded on _prompt_depth so the in-turn re-entry that expands
+    # a /prompts reference does not count as a new turn.
+    #
+    # Placed HERE, below every local-command return and above the turn machinery,
+    # for the same reason the Slack entry points expire here: `/goal`, a
+    # `/prompts` listing or error, and a blocked slash command all return without
+    # starting an agent turn, and spending the control on one of those would
+    # strike a still-valid question through with nothing to answer it. Moved once,
+    # rather than guarded per command, so a new local command inherits the right
+    # behaviour by default.
+    if _prompt_depth == 0:
+        await expire_slack_options(state, session_key)
+
     _acquired = False
     _mirror_stream_ts: str = ""
     _mirror_chan: str | None = ""
@@ -2919,7 +3170,12 @@ async def _run_chat(
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
-            bindings = resolve_agent_bindings(cfg, slot.agent or None)
+            # Warm the project agent index OFF the loop, then resolve inline. Only
+            # the warm is offloaded: resolve_agent_bindings can raise StopIteration
+            # on a malformed config, and StopIteration cannot be delivered through a
+            # Future, so awaiting it would hang instead of surfacing the error.
+            await warm_project_agent_names(slot.project)
+            bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
             kiro_agent = bindings.kiro_agent
             memory_store = bindings.memory_store_name
             agent_model = normalize_agent_model(bindings.model)
@@ -2960,9 +3216,7 @@ async def _run_chat(
         withheld_pin = False
         if not slot.model:
             slot.model = _backfill_canonical_model(client, provider_name) or slot.model
-        elif (is_new or resumed) and _pinned_model_withheld(
-            client, slot.model, provider_name
-        ):
+        elif (is_new or resumed) and _pinned_model_withheld(client, slot.model, provider_name):
             withheld_pin = True
             # The session just advertised what this account can run, and the pin
             # is not on the list — the spawn withheld it, so this session runs on
@@ -3463,9 +3717,11 @@ async def _run_chat(
                 {
                     "slot": slot.key,
                     "kind": "context",
-                    "text": f"Injected {ctx_len:,} chars of context ({_named})"
-                    if _named
-                    else f"Injected {ctx_len:,} chars of context",
+                    "text": (
+                        f"Injected {ctx_len:,} chars of context ({_named})"
+                        if _named
+                        else f"Injected {ctx_len:,} chars of context"
+                    ),
                 },
             )
 
@@ -3548,6 +3804,11 @@ async def _run_chat(
             if time.time() - last_heartbeat > 5:
                 state.broadcast_ws("heartbeat", {"slot": slot.key, "ts": time.time()})
                 last_heartbeat = time.time()
+
+            # First visible model output for this user prompt — emit TTFT once.
+            if _ttft_t0 is not None and event.kind in (EVENT_TEXT_CHUNK, EVENT_THINKING_CHUNK):
+                _emit_ttft_metric(_ttft_t0, session_key, is_new=is_new, resumed=resumed)
+                _ttft_t0 = None
 
             # Security: tool_call_id originates from LLM — redact before any use
             if hasattr(event, "tool_call_id") and event.tool_call_id:
@@ -3634,6 +3895,11 @@ async def _run_chat(
                 # starts being persisted/accumulated, this must become a
                 # turn-emit (set _turn_emitted = True) to avoid a double-emit —
                 # pinned by TestRunChatTransientRetry.test_transient_after_thinking_only_retries.
+                # It IS model activity though: the backend demonstrably serves
+                # this conversation, so it must break the poisoned-discard
+                # streak (a mid-generation death is not the pre-stream
+                # rejection signature).
+                _turn_thought = True
             elif event.kind == EVENT_TOOL_CALL:
                 _turn_tool_calls += 1
                 # Flush pre-tool text silently (no broadcast) so it persists,
@@ -3665,7 +3931,9 @@ async def _run_chat(
                     "tool_call",
                     _tool_payload,
                 )
-                slot.append("tool", f"🔧 {_tool_payload['tool']}", "msg msg-tool", meta=_tool_meta(event))
+                slot.append(
+                    "tool", f"🔧 {_tool_payload['tool']}", "msg msg-tool", meta=_tool_meta(event)
+                )
                 sel().log_tool_invocation(
                     session_key=session_key,
                     agent=slot.agent or "kirocrew",
@@ -4576,8 +4844,9 @@ async def _run_chat(
                 # Mirror the prompt to the linked Slack thread so a user driving
                 # this session from Slack can actually answer it. Without this,
                 # the prompt only renders in the dashboard and a Slack-only user
-                # never sees it — the turn then parks here until the 2h timeout,
-                # holding the slot lock and silently dropping inbound messages.
+                # never sees it — the turn then parks here for the whole approval
+                # window, holding the slot lock and silently dropping inbound
+                # messages.
                 # The Slack click resolves THIS future (via state.resolve_approval);
                 # we remain the sole caller of approve_tool/reject_tool below.
                 _slack_approval_ts: str | None = None
@@ -4598,7 +4867,8 @@ async def _run_chat(
                             event.tool_input or "",
                         )
                         if _slack_approval_ts is None:
-                            # Delivery failed — do not silently park for 2h.
+                            # Delivery failed — do not park for the whole
+                            # approval window.
                             # Resolve the future now (reject) and tell the user
                             # the prompt could not be delivered, so they retry
                             # rather than wait. The dashboard still rendered the
@@ -4622,7 +4892,7 @@ async def _run_chat(
                         # Any failure before the future is resolved (ImportError,
                         # post_linked_approval raising, slot.append/push raising in
                         # the delivery-failure branch) would otherwise fall through
-                        # to the 2h wait_for with an unresolved future — the exact
+                        # to the approval wait_for with an unresolved future — the exact
                         # wedge this fix prevents. Auto-reject so the turn unblocks,
                         # mirroring the _slack_approval_ts is None branch.
                         logger.warning("Error mirroring approval prompt to Slack", exc_info=True)
@@ -4639,11 +4909,39 @@ async def _run_chat(
                 # "rejected" is the correct reading: a cancelled turn never
                 # obtained consent.
                 outcome = "rejected"
+                _approval_window = tool_approval_timeout_secs()
+                _approval_card: str | None = None
                 try:
-                    outcome = await asyncio.wait_for(fut, timeout=7200.0)
+                    if _approval_window <= 0:
+                        # Too little of the turn left to both wait and report.
+                        # Waiting anyway guarantees the ceiling fires first and
+                        # relabels the unanswered approval as a turn timeout.
+                        logger.warning(
+                            "Declining approval for %r without waiting: no turn budget left",
+                            event.title,
+                        )
+                        _approval_card = format_approval_no_budget_card()
+                    else:
+                        outcome = await asyncio.wait_for(fut, timeout=_approval_window)
                 except asyncio.TimeoutError:
                     outcome = "rejected"
+                    # Name the real cause. An unanswered prompt used to be
+                    # indistinguishable from a generic turn timeout, because the
+                    # window outlived the turn ceiling and the turn always died
+                    # first — so an unattended run burned the full ceiling and
+                    # the user was never told an approval was waiting.
+                    logger.warning(
+                        "Tool approval for %r went unanswered for %.0fs; declining",
+                        event.title,
+                        _approval_window,
+                    )
+                    _approval_card = format_approval_timeout_card(_approval_window)
                 finally:
+                    if _approval_card is not None:
+                        try:
+                            slot.append("error", _approval_card, "msg msg-err")
+                        except Exception:
+                            logger.debug("Failed to render approval card", exc_info=True)
                     slot._approval_futures.pop(str(event.request_id), None)
                     # Backstop: the future is now gone, so the permission
                     # message MUST NOT be left reading pending — the UI would
@@ -4652,8 +4950,8 @@ async def _run_chat(
                     # resolvers (HTTP slot-approve, Slack click) already mark it
                     # and record richer decisions like "trust"/"yolo", so only
                     # write when still pending. This is the sole marker for the
-                    # paths that resolve the future in-process: the 2h timeout
-                    # above and the Slack-delivery auto-reject branches.
+                    # paths that resolve the future in-process: the approval
+                    # timeout above and the Slack-delivery auto-reject branches.
                     _approved = outcome in ("approved", "approved_trust_reads")
                     if _mark_permission_resolved(
                         slot.messages,
@@ -4946,7 +5244,10 @@ async def _run_chat(
                         _record_model,
                         event,
                         provider=_provider_name,
-                        surface="dashboard",
+                        # The row stays keyed by its dashboard slot for title and
+                        # navigation joins; source follows the session the turn
+                        # actually ran on, including linked channel sessions.
+                        surface=telemetry_channel_of(session_key),
                         # Resolved agent, not the slot alias: resolve_agent_bindings
                         # maps e.g. "default" to "kirocrew" before dispatch, so the
                         # alias would credit an agent that never ran.
@@ -5149,7 +5450,7 @@ async def _run_chat(
                 )
                 # kiro-cli fires compaction asynchronously after EVENT_COMPLETE —
                 # just wait for the result without sending another prompt.
-                compaction_result = await client.wait_for_compaction(timeout=120.0)
+                compaction_result = await client.wait_for_compaction()
                 logger.info("Deferred compaction result: %s", compaction_result)
                 if compaction_result["type"] == "completed":
                     summary, _ = redact_credentials(compaction_result.get("summary", ""))
@@ -5176,9 +5477,7 @@ async def _run_chat(
                 # frontend drops its stale counts and the meter self-corrects on
                 # the next turn. On failure/timeout `used` is unchanged and still
                 # valid, so the same call re-sends the real counts as-is.
-                state.broadcast_context_usage(
-                    slot.key, _context_usage_payload(slot.key, client)
-                )
+                state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))
 
         if assistant_text:
             # ── Plan format validation (planning turn only) ─────
@@ -5385,6 +5684,19 @@ async def _run_chat(
             slot._stale_recovery_retries = 0
             slot._tool_stall_retries = 0
             slot._transient_5xx_retries = 0
+            # NOTE: the poisoned-conversation streak/one-shot
+            # (_prestream_exhausted_cycles / _poisoned_reset_used) are NOT
+            # unconditionally reset here: this block also runs for CANCELLED
+            # turns, and a user's Stop press by itself proves nothing about
+            # the conversation's health. The activity-based streak break
+            # (assistant tokens, a tool call — _turn_emitted — or streamed
+            # thinking — _turn_thought — is positive evidence the backend
+            # accepts this conversation, even if the user then cancelled it)
+            # lives in the FINALLY block so it also covers the recovery paths
+            # that `return` before this point. The one-shot
+            # itself still re-arms only on a LANDED turn (the record_success
+            # block below): breaking the streak is cheap to be generous
+            # with, re-arming a spent discard is not.
             # NOTE: slot._posttoken_retry_used is intentionally NOT reset here.
             # The one-shot post-token recovery allowance is refreshed at the
             # START of a GENUINE new user turn (see the gated reset near
@@ -5401,6 +5713,14 @@ async def _run_chat(
         state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))
         if _stop_reason != STOP_REASON_CANCELLED and not _retrying_empty:
             state.sessions.record_success(session_key)
+            # A LANDED turn breaks the pre-stream-exhaustion streak and
+            # re-arms the poisoned-conversation one-shot: only a prompt that
+            # actually reached the model and completed proves the (possibly
+            # fresh) conversation works. Deliberately NOT in the cancel-
+            # inclusive budget block above — a Stop press during the recovery
+            # turn must not re-arm a second discard without that evidence.
+            slot._prestream_exhausted_cycles = 0
+            slot._poisoned_reset_used = False
             # This turn landed: the prompt (including any re-injected skills
             # index) reached the model, so the `finally` must NOT restore the
             # one-shot flag.
@@ -5471,12 +5791,51 @@ async def _run_chat(
                 for _part in render_for_slack(_mirror_body):
                     await state.slack_client.post_message(_mirror_chan, _part, _mirror_thread)
                 if _mirror_options:
-                    await state.slack_client.post_blocks(
+                    # Keep the ts this posts: the control has to be spendable
+                    # later, and discarding the ts is what leaves a superseded
+                    # question clickable forever. build_options_blocks already
+                    # redacts each choice through redact_for_display, so nothing
+                    # extra is needed here.
+                    _mirror_blocks = build_options_blocks(_mirror_options)
+                    # The thread's owner BEFORE the post. A relink landing while
+                    # post_blocks is in flight moves the conversation to another
+                    # session, and a control recorded under the key this turn
+                    # started with would be filed where that session's expiry
+                    # never looks -- and clickable into a conversation it does not
+                    # belong to. Same treatment the other two posting paths get.
+                    _pre_owner = (
+                        state.sessions.get_session_for_thread(_mirror_thread) or session_key
+                        if getattr(state, "sessions", None)
+                        else session_key
+                    )
+                    _mirror_ts = await state.slack_client.post_blocks(
                         _mirror_chan,
-                        build_options_blocks(_mirror_options),
+                        _mirror_blocks,
                         "Options",
                         _mirror_thread,
                     )
+                    if _mirror_ts:
+                        _owner = (
+                            state.sessions.get_session_for_thread(_mirror_thread) or session_key
+                            if getattr(state, "sessions", None)
+                            else session_key
+                        )
+                        remember_slack_options(
+                            state,
+                            _owner,
+                            PostedOptions(
+                                channel=_mirror_chan,
+                                ts=_mirror_ts,
+                                choices=tuple(_mirror_options),
+                                blocks=tuple(_mirror_blocks),
+                            ),
+                        )
+                        if _owner != _pre_owner:
+                            # An owner change IS supersession: the question we just
+                            # posted would be answered into a conversation that has
+                            # moved on. Narrowed to OUR ts so a control the new
+                            # owner recorded meanwhile survives.
+                            await expire_slack_options(state, _owner, ts=_mirror_ts)
             except Exception:
                 logger.debug("Failed to mirror response to Slack", exc_info=True)
 
@@ -5680,9 +6039,7 @@ async def _run_chat(
                     # which of the two happened, so the continuation must
                     # agree with it rather than pick one.
                     cause=(
-                        ResetCause.CONNECTION_LOST
-                        if _is_pipe_death
-                        else ResetCause.SESSION_BUSY
+                        ResetCause.CONNECTION_LOST if _is_pipe_death else ResetCause.SESSION_BUSY
                     ),
                     message_is_synthetic=_is_synthetic,
                 )
@@ -5720,7 +6077,9 @@ async def _run_chat(
             # errors are excluded by the classifier and fall through to the bare
             # error below (fail-fast). On budget exhaustion this elif goes false
             # and the bare-error else surfaces a clean ❌ on a still-resumable
-            # session.
+            # session — unless CONSECUTIVE cycles exhaust this way, in which
+            # case the else escalates to a session destroy (poisoned
+            # persisted conversation; see the escalation block there).
             slot._transient_5xx_retries += 1
             _delay = transient_retry_delay(slot._transient_5xx_retries)
             logger.info(
@@ -5850,28 +6209,192 @@ async def _run_chat(
                 _safe, _ = redact_credentials(_safe)
                 slot.messages = [m for m in slot.messages if m.get("role") != "chunk"]
                 slot.append("assistant", _safe, "msg msg-a")
-            _err_text, _ = redact_exfiltration_urls(str(exc))
-            _err_text, _ = redact_credentials(_err_text)
-            slot.append(
-                "error",
-                f"⏱️ {_err_text}" if "timed out" in _msg else f"❌ {_err_text}",
-                "msg msg-err",
+            # ── Poisoned-conversation escalation ────────────────────────────
+            # A transient-classified error that reaches this terminal branch
+            # with ZERO output means a full retry ladder was exhausted
+            # pre-stream (the transient elif above only goes false on budget
+            # exhaustion). ONE such cycle is plausibly a momentary outage; the
+            # SECOND CONSECUTIVE one — ladder exhausted, the user pressed
+            # Continue (or sent a new message), fresh ladder exhausted again —
+            # is the signature of a POISONED persisted conversation: the
+            # backend deterministically rejects this session's native history
+            # while brand-new sessions on the same gateway+model work fine
+            # (observed live: a session/load'ed conversation failing pre-stream
+            # identically 11 hours apart, across separate kiro-cli processes,
+            # while a new session answered instantly). Retrying into that
+            # conversation can never succeed and the ❌ message's own advice
+            # ("retry in a moment") sends the user in circles — the only thing
+            # that recovers is what a manual "start a new chat" does: a fresh
+            # native conversation. So escalate exactly that, in place:
+            # DISCARD the native conversation — sessions.discard_conversation()
+            # clears the resume sid (sessions.reset() would session/load the
+            # same poisoned conversation right back) while KEEPING the
+            # session-map entry, whose Slack thread/channel linkage must
+            # survive — and re-queue the message once. The successor turn
+            # cold-starts a fresh conversation with the slot transcript
+            # re-injected as context, preserving the dashboard session.
+            # ONE-SHOT per landed turn (_poisoned_reset_used): if even the
+            # fresh conversation fails (genuine prolonged outage), the streak
+            # keeps counting but no further discard fires until some turn
+            # actually lands — a discard loop is impossible.
+            # A transient-classified error with ZERO model activity (no
+            # tokens, no tool call, no thinking) that reaches this terminal
+            # branch means a full retry ladder was exhausted pre-stream. A
+            # turn that streamed even reasoning died MID-generation — the
+            # backend was serving this conversation — so it is not the
+            # poisoned signature and resets the streak below. The signature
+            # is deliberately classifier-only (no error-text
+            # matching — the ACP classifier contract forbids branching on
+            # formatted message wording); disambiguation between "poisoned
+            # conversation" and "backend-wide outage/throttle" is done by the
+            # CANARY PROBE below, not by classifying the error.
+            _prestream_exhausted = (
+                not _turn_emitted and not _turn_thought and acp_error_is_transient(exc)
             )
-            # This branch ENDS the retry cycle: the error is terminal and
-            # nothing is re-queued. Refresh the transient-5xx budget now so the
-            # NEXT cycle — the Continue press this very error message invites
-            # ("retry in a moment"), or a new user message — gets the designed
-            # TRANSIENT_RETRIES fresh attempts. Without this, the budget
-            # consumed by a failed cycle leaks into every later cycle (the
-            # happy-path reset only runs when a cycle COMPLETES), so after one
-            # exhaustion ❌ a single further 5xx fails instantly with zero
-            # retries until some turn happens to finish cleanly. Loop safety is
-            # unchanged: the reset happens only on a NO-REQUEUE exit, so a new
-            # budget always requires a new user- or system-initiated cycle —
-            # automatic retry chains within a cycle stay bounded at
-            # TRANSIENT_RETRIES. (_posttoken_retry_used needs no counterpart
-            # here: it is already refreshed at genuine-turn start.)
-            slot._transient_5xx_retries = 0
+            if _prestream_exhausted:
+                slot._prestream_exhausted_cycles += 1
+            else:
+                # A different terminal error (or one with streamed output)
+                # breaks the streak — consecutive means consecutive.
+                slot._prestream_exhausted_cycles = 0
+            if (
+                _prestream_exhausted
+                and slot._prestream_exhausted_cycles >= POISONED_SESSION_CYCLES
+                and not slot._poisoned_reset_used
+                and _prompt_depth == 0
+                and not _should_suppress_requeue(slot)
+            ):
+                # ── Canary probe: conversation-specific evidence, or bust ──
+                # Two exhausted ladders alone cannot distinguish a poisoned
+                # persisted conversation from a sustained backend-wide outage
+                # or throttle, and discarding a healthy conversation is a
+                # one-way door for its native state. So reproduce the actual
+                # incident signature before acting: run ONE tool-free prompt
+                # through an ephemeral FRESH background session. Only "the
+                # fresh conversation answers while this one has failed
+                # 2×(TRANSIENT_RETRIES+1) consecutive prompts" justifies the
+                # discard. A canary that fails or times out means the backend
+                # itself is unhealthy: no discard, the one-shot stays
+                # UNconsumed, and the streak stays accrued so the next
+                # user-initiated exhausted cycle re-probes — when the outage
+                # ends but this conversation still fails, the discard fires
+                # then, with evidence.
+                _canary_ok = False
+                # Snapshot the stop generation BEFORE the (up to 30s) probe: a
+                # Stop pressed while the canary runs must veto the discard and
+                # the re-queue — the user just cancelled this work, and
+                # re-executing it as a synthetic recovery turn would run
+                # cancelled tools. Re-reading _stop_state afterwards is NOT
+                # enough (teardown can drive it back to "idle" concurrently —
+                # the race documented in chat_handlers._make_stop_resolver);
+                # the generation only ever counts up on initiations.
+                _stop_gen_before_canary = slot._stop_generation
+                # The canary must run on the SAME served model as the failing
+                # session — a success on any other model (the cheap background
+                # default, or a rejected-model fallback) says nothing about
+                # whether THIS conversation is rejected, and would discard a
+                # healthy conversation during a model-specific outage. Read it
+                # via the provider's PUBLIC served_model accessor (never the
+                # private _client internals — those are free to move);
+                # strict_model makes it a hard requirement (set_model failure
+                # or rejection raises instead of degrading). No readable
+                # model ⇒ the probe cannot be trusted ⇒ inconclusive ⇒ no
+                # discard.
+                _session_model = str(getattr(client, "served_model", "") or "").strip()
+                if _session_model:
+                    try:
+                        _canary_text = await run_bg_oneliner(
+                            state.sessions,
+                            _POISON_CANARY_PROMPT,
+                            model=_session_model,
+                            strict_model=True,
+                            sel_source="poisoned_canary",
+                            sel_session_key="_poison_canary",
+                            timeout=_POISON_CANARY_TIMEOUT_SECS,
+                        )
+                        # Require actual output: an empty completion is not
+                        # positive evidence that fresh conversations work.
+                        _canary_ok = bool(_canary_text.strip())
+                    except Exception as _canary_exc:
+                        logger.info(
+                            "Poisoned-conversation canary failed for slot %s on "
+                            "model %s (%s) — backend/model-wide failure, not "
+                            "conversation-specific; no discard this cycle",
+                            slot.key,
+                            _session_model,
+                            _canary_exc,
+                        )
+                else:
+                    logger.info(
+                        "Poisoned-conversation canary skipped for slot %s — "
+                        "session model unreadable, probe would be meaningless; "
+                        "no discard this cycle",
+                        slot.key,
+                    )
+            else:
+                _canary_ok = False
+            if _canary_ok and slot._stop_generation != _stop_gen_before_canary:
+                # A Stop was initiated while the canary ran (even if it already
+                # resolved and _stop_state is back to "idle"): the user
+                # cancelled this work mid-probe, so a positive canary must not
+                # discard the conversation or re-queue the cancelled message.
+                # Nothing is consumed — the one-shot stays armed and the streak
+                # stays accrued for a later user-INITIATED cycle.
+                _canary_ok = False
+                logger.info(
+                    "Poisoned-conversation canary succeeded for slot %s but a "
+                    "stop was initiated during the probe — vetoing discard/requeue",
+                    slot.key,
+                )
+            if _canary_ok:
+                logger.warning(
+                    "Pre-stream transient exhaustion on %d consecutive cycles in "
+                    "slot %s while a fresh canary conversation succeeded — the "
+                    "backend is rejecting THIS conversation specifically: "
+                    "discarding conversation for %s and re-queueing once on a "
+                    "fresh one",
+                    slot._prestream_exhausted_cycles,
+                    slot.key,
+                    session_key,
+                )
+                # Consume the one-shot HERE, where the recovery is actually
+                # enqueued (mirrors _posttoken_retry_used accounting).
+                slot._poisoned_reset_used = True
+                needs_conversation_discard = True  # checked in finally block
+                slot.append(
+                    "error",
+                    "⟳ The backend keeps rejecting this conversation — "
+                    "restarting the model session and retrying (this chat's "
+                    "messages are kept; the model rebuilds its working "
+                    "context from them)…",
+                    "msg msg-err",
+                )
+                slot.queue_insert(0, message, kind=SYNTHETIC_RECOVERY_KIND)
+                # Fresh conversation ⇒ fresh ladder for the recovery cycle.
+                slot._transient_5xx_retries = 0
+            else:
+                _err_text, _ = redact_exfiltration_urls(str(exc))
+                _err_text, _ = redact_credentials(_err_text)
+                slot.append(
+                    "error",
+                    f"⏱️ {_err_text}" if "timed out" in _msg else f"❌ {_err_text}",
+                    "msg msg-err",
+                )
+                # This branch ENDS the retry cycle: the error is terminal and
+                # nothing is re-queued. Refresh the transient-5xx budget now so the
+                # NEXT cycle — the Continue press this very error message invites
+                # ("retry in a moment"), or a new user message — gets the designed
+                # TRANSIENT_RETRIES fresh attempts. Without this, the budget
+                # consumed by a failed cycle leaks into every later cycle (the
+                # happy-path reset only runs when a cycle COMPLETES), so after one
+                # exhaustion ❌ a single further 5xx fails instantly with zero
+                # retries until some turn happens to finish cleanly. Loop safety is
+                # unchanged: the reset happens only on a NO-REQUEUE exit, so a new
+                # budget always requires a new user- or system-initiated cycle —
+                # automatic retry chains within a cycle stay bounded at
+                # TRANSIENT_RETRIES. (_posttoken_retry_used needs no counterpart
+                # here: it is already refreshed at genuine-turn start.)
+                slot._transient_5xx_retries = 0
     except Exception as exc:
         logger.exception("Dashboard chat error in slot %s", slot.key)
         _err_text, _ = redact_exfiltration_urls(str(exc))
@@ -5879,6 +6402,17 @@ async def _run_chat(
         slot.append("error", _err_text, "msg msg-err")
         await state.sessions.record_failure(session_key)
     finally:
+        # Poisoned-conversation streak break — in the FINALLY on purpose (fork
+        # GPT review): several recovery paths (stale-turn, tool-stall,
+        # pipe-death) `return` before the main completion block, and a turn
+        # with model activity that exits through them must STILL break the
+        # exhaustion streak — the backend demonstrably served this
+        # conversation. Safe against the terminal AcpError handler's streak
+        # increment: incrementing requires ZERO activity, so the two are
+        # mutually exclusive by construction and this can never clobber a
+        # legitimate increment. One-shot re-arm stays landed-turn-only.
+        if _turn_emitted or _turn_thought:
+            slot._prestream_exhausted_cycles = 0
         # Completion can be bypassed by cancellation, provider errors, or timeouts.
         # Close cards idempotently and retain only bounded terminal records for
         # reconnect replay until the next turn installs a fresh tracker.
@@ -5958,9 +6492,18 @@ async def _run_chat(
                     await state.slack_client.stop_stream(_mirror_chan, _mirror_stream_ts)
                 except Exception:
                     logger.debug("Stream cleanup failed", exc_info=True)
-            if _acquired and needs_session_reset:
+            if _acquired and (needs_session_reset or needs_conversation_discard):
                 try:
-                    await state.sessions.reset(session_key)
+                    if needs_conversation_discard:
+                        # Poisoned-conversation escalation: clear ONLY the
+                        # resume sid (keeping the session-map entry with its
+                        # Slack thread/channel linkage), so the re-queued
+                        # recovery turn cold-starts a fresh native
+                        # conversation instead of session/load-ing the same
+                        # rejected one (which reset() would do).
+                        await state.sessions.discard_conversation(session_key)
+                    else:
+                        await state.sessions.reset(session_key)
                 except Exception:
                     logger.warning("Failed to reset session %s after agent switch", session_key)
         finally:
@@ -5976,7 +6519,14 @@ async def _run_chat(
         # here would skip the steer requeue and queue drain below, silently
         # stranding queued work at the end of an otherwise successful turn.
         try:
+            _had_pending_reset = bool(slot._pending_reset_history_key)
             await _consume_pending_reset(state, slot)
+            # The consume tore down the session for a mid-turn project change;
+            # without a respawn the NEXT message pays the full cold start the
+            # eager path exists to hide. Only when a reset was actually
+            # consumed — an ordinary turn end must not spawn anything.
+            if _had_pending_reset:
+                schedule_eager_spawn(state, slot)
         except Exception:
             logger.debug("_consume_pending_reset failed", exc_info=True)
         # ── Requeue unconsumed steers ──

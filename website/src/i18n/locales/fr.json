@@ -227,6 +227,10 @@
         "cycles_2": "cycles",
         "definition_of_done_optional": "Définition de « terminé » (facultatif)",
         "delete": "Supprimer",
+        "delete_campaign": "Supprimer la campagne ?",
+        "deleting": "Suppression…",
+        "delete_campaign_button": "Supprimer la campagne",
+        "delete_failed": "Échec de la suppression. Veuillez réessayer.",
         "delete_this_campaign_and_its_report_this_cannot": "Supprimer cette campagne et son rapport ? Cette action est irréversible.",
         "done_when": "Terminé quand :",
         "dynamic_workflow": "Flux de travail dynamique",
@@ -442,12 +446,18 @@
           "this_review_failed": "Cette revue a échoué"
         },
         "findingCard": {
+          "consequence": "Conséquence",
+          "evidence": "Preuve",
+          "observation": "Observation",
           "post_finding": "Publier ce constat sur la pull request",
           "post_finding_on": "Publier ce constat sur {{target}}",
           "post_this_comment": "Publier ce commentaire",
           "posted_to_the_pull_request": "Publié sur la pull request",
           "posting": "Publication…",
+          "select_to_draft_together": "Sélectionner pour le brouillon groupé",
           "select_to_post": "Sélectionner {{label}} pour publier",
+          "severity_must_fix": "Obligatoire",
+          "severity_should_fix": "Recommandé",
           "suggestion": "Suggestion",
           "this_finding": "ce constat"
         },
@@ -4456,6 +4466,8 @@
       "search_everywhere": "Rechercher partout",
       "search_for_anything": "Rechercher n’importe quoi",
       "search_scope": "Rechercher dans {{scope}}…",
+      "retry": "Réessayer",
+      "search_failed": "Échec de la recherche",
       "searching": "Recherche…",
       "tab": "tab"
     },
@@ -4685,10 +4697,13 @@
       "this_document_is_tracked_as_a_session_artifact_n": "Ce document est suivi comme un artefact de session, pas comme une modification de fichier source"
     },
     "filePickerMenu": {
+      "folder": "Dossier",
+      "folder_kind": "dossier",
       "no_matches": "Aucun résultat",
       "open_in_viewer": "Ouvrir dans la visionneuse",
+      "remove_folder": "Retirer le dossier",
       "searching": "Recherche…",
-      "type_2_chars_to_search_files": "Saisissez 2 caractères ou plus pour rechercher des fichiers…"
+      "type_2_chars_to_search_files": "Saisissez 2 caractères ou plus pour rechercher des fichiers et dossiers…"
     },
     "fileRenderers": {
       "empty_file": "Fichier vide",
@@ -4872,7 +4887,9 @@
       "this_issue_is_locked": "Cette issue est verrouillée",
       "unknown_author": "Auteur inconnu",
       "untitled": "Sans titre",
-      "updated_time": "mis à jour {{time}}"
+      "updated_time": "mis à jour {{time}}",
+      "jira_open_in_browser": "Jira issue — open in browser to view details.",
+      "open_in_jira": "Open in Jira"
     },
     "jobForm": {
       "a_short_label_for_this_job": "Un libellé court pour cette tâche",
@@ -5486,6 +5503,8 @@
       "edit_queued_message": "Modifier le message en file d'attente",
       "interrupt_current_turn_and_send_this_now": "Interrompre le tour en cours et envoyer maintenant",
       "queued": "en file d'attente",
+      "run_later": "Exécuter plus tard",
+      "run_sooner": "Exécuter plus tôt",
       "ready_processing_after_the_current_turn": "prêt — traitement après le tour en cours",
       "save": "Enregistrer",
       "save_edit": "Enregistrer la modification",
@@ -5640,6 +5659,13 @@
       "undo": "Annuler",
       "undo_remove": "Annuler la suppression",
       "will_be_removed_on_save": "Sera supprimé à l'enregistrement."
+    },
+    "sendToInstanceSubmenu": {
+      "failed": "Échec",
+      "not_connected": "non connecté",
+      "send_a_copy_to": "Envoyer une copie à",
+      "sent": "Envoyé",
+      "unknown_error": "Erreur inconnue"
     },
     "sessionActionsMenu": {
       "bring_back_to_main": "Ramener dans la fenêtre principale",
@@ -6085,7 +6111,7 @@
       "suggestion_pipeline_status": "Vérifier l'état de mon pipeline",
       "suggestion_review_cr": "Examiner mon dernier CR",
       "suggestion_search_code": "Rechercher des exemples d'utilisation dans le code",
-      "suggestion_summarize_slack": "Résumer l'activité Slack de cette semaine",
+      "suggestion_summarize_chat": "Résumer l'activité de messagerie de cette semaine",
       "suggestion_triage_tickets": "Trier mes tickets d'astreinte",
       "suggestion_write_design_doc": "M'aider à rédiger un document de conception",
       "switch_back_to_default_mode": "Revenir au mode par défaut",
@@ -6123,6 +6149,18 @@
       "select": "Sélectionner",
       "workspace_name": "Nom de l'espace de travail",
       "workspace_name_2": "workspace-name"
+    },
+    "settingRef": {
+      "envVarAriaLabel": "Variable d'environnement {{key}}",
+      "envVarDescription": "Définissez cette variable d'environnement avant de démarrer Kiro Crew.",
+      "envVarUnsetDescription": "Supprimez cette variable d'environnement avant de démarrer Kiro Crew.",
+      "fileOnlyDescription": "Définissez cette valeur avec la commande CLI ci-dessous.",
+      "copied": "Copié !",
+      "copyFailed": "Échec de la copie",
+      "copyCommand": "Copier la commande",
+      "orEditConfigJson": "Alternativement, modifiez directement ~/.kiro/crew/config.json.",
+      "openSettingsAriaLabel": "Ouvrir {{key}} dans Paramètres → {{tab}}",
+      "fileSettingAriaLabel": "Paramètre fichier uniquement {{key}}"
     }
   },
   "hooks": {
@@ -6262,9 +6300,7 @@
   },
   "pages": {
     "agentsPage": {
-      "active_sessions_and_subagent_tasks": "Sessions actives et tâches des sous-agents",
       "agent_templates": "Modèles d'agent",
-      "agent_templates_grouped_by_package_update_and_un": "Modèles d’agents regroupés par paquet. Mise à jour et désinstallation au niveau du paquet. Les agents individuels peuvent être supprimés (supprime le fichier de configuration).",
       "auto_approved": "Approuvé automatiquement",
       "awaiting_first_prompt": "en attente du premier prompt",
       "clear_completed": "Effacer les tâches terminées",
@@ -6274,8 +6310,6 @@
       "could_not_load_this_agent_s_configuration_skills": "Impossible de charger la configuration de cet agent — les compétences sont masquées pour éviter\n                        de les écraser. Sélectionnez à nouveau l'agent pour réessayer.",
       "critical": "Critique",
       "default": "Par défaut",
-      "default_for_new_sessions": "Par défaut pour les nouvelles sessions",
-      "delete_agent": "Supprimer {{name}}",
       "delete_subagent": "Supprimer le sous-agent {{id}}",
       "denied_commands": "Commandes refusées",
       "done": "Terminé",
@@ -6292,19 +6326,14 @@
       "no_active_sessions": "Aucune session active",
       "no_subagents": "Aucun sous-agent",
       "overage_credits": "Crédits de dépassement :",
-      "patterns_blocked": "motifs bloqués",
       "plan_credits": "Crédits du forfait",
       "prompt_many": "{{count}} prompts",
       "prompt_one": "{{count}} prompt",
       "prompt_other": "{{count}} prompts",
-      "remove_default_agent": "Retirer l’agent par défaut",
       "req": "/req",
       "resets": "réinitialisation",
       "running": "En cours",
       "select_an_agent_to_view_details": "Sélectionnez un agent pour voir les détails",
-      "sessions": "Sessions",
-      "set_as_default": "Définir par défaut",
-      "set_as_default_agent": "Définir comme agent par défaut",
       "skills": "Compétences",
       "spawn_tasks_from_chat_or_cli": "Lancez des tâches depuis le chat ou la CLI",
       "subagents": "Sous-agents",
@@ -6312,7 +6341,41 @@
       "tools": "Outils",
       "tools_2": "outils",
       "type_to_filter": "Saisissez pour filtrer…",
-      "usage": "Utilisation"
+      "usage": "Utilisation",
+      "at_a_glance": "En bref",
+      "cancel": "Annuler",
+      "cli_chat_chat_channel_threads_and_warm_pool_sessio": "Le chat CLI, les fils des canaux de chat et les sessions du warm pool retombent sur celui-ci ; les crews indiquent le leur",
+      "comes_with_the_template_read_only_here": "Fourni avec le modèle : ici, en lecture seule",
+      "config_file": "Fichier de configuration",
+      "delete_template": "Supprimer le modèle",
+      "delete_the_template_named_confirm": "Supprimer le modèle {{name}} ? Son fichier de configuration est supprimé et c’est irréversible.",
+      "editing_this_template_changes_how_they_behave_in_": "Modifier ce modèle change leur comportement à la prochaine session",
+      "filter_templates": "Filtrer les modèles",
+      "from_package": "Du paquet",
+      "guardrails": "Garde-fous",
+      "id": "ID",
+      "model": "Modèle",
+      "no_agent_templates_yet": "Pas encore de modèle d’agent",
+      "no_crews_use_this_template_yet": "Aucun crew n’utilise encore ce modèle",
+      "no_default_template": "Aucun modèle par défaut",
+      "no_model_pinned_here_a_crew_set_to_inherit_falls_": "Aucun modèle épinglé ici : un crew réglé sur hérité retombe sur la valeur par défaut globale",
+      "no_templates_match_your_filter": "Aucun modèle ne correspond au filtre",
+      "not_set_for_this_template": "Pas défini pour ce modèle",
+      "overview": "Vue d'ensemble",
+      "package": "Package",
+      "pinned_here_a_crew_set_to_inherit_uses_this_model": "Épinglé ici : un crew réglé sur hérité utilise ce modèle",
+      "source": "Source",
+      "status": "Statut",
+      "task": "Tâche",
+      "templates_come_with_kirocrew_or_with_an_app_you_i": "Les modèles arrivent avec Kiro Crew ou avec une app que tu installes",
+      "this_is_the_fallback_template_point_the_picker_a": "Le modèle de secours ne peut pas être supprimé : pointe d’abord le sélecteur ci-dessus sur un autre",
+      "tools_and_mcp": "Outils et MCP",
+      "used_by": "Utilisé par",
+      "used_by_crews_repoint_them_on_the_crews_tab_firs": "Utilisé par {{crews}} : repointe-les dans l’onglet Crews avant de le supprimer",
+      "what_a_crew_starts_from_its_model_skills_tools_mc": "Ce dont part un crew : son modèle, ses skills, ses outils, ses serveurs MCP et ses garde-fous",
+      "when_nothing_names_a_template_use": "Quand rien n’indique de modèle, utiliser",
+      "where_it_comes_from": "D’où il vient",
+      "yes_delete_it": "Oui, supprimer"
     },
     "aidlc": {
       "dagView": {
@@ -6895,7 +6958,7 @@
       "skills_label": "Compétences",
       "steering_description": "Conventions markdown toujours actives depuis ~/.kiro/steering et le .kiro/steering de votre projet",
       "steering_label": "Directives",
-      "templates_description": "Configurations et paquets d'agent installés",
+      "templates_description": "Ce dont part un crew : son modèle, ses skills, ses outils, ses serveurs MCP et ses garde-fous",
       "templates_label": "Modèles d'agent"
     },
     "channelPage": {
@@ -7199,8 +7262,14 @@
         "context_from": "Contexte de",
         "copied": "Copié !",
         "copy": "Copier",
+        "queue_cancel_failed": "Impossible d'annuler cette question en file d'attente",
+        "queue_edit_failed": "Impossible de modifier cette question en file d'attente",
         "refresh_context": "Actualiser le contexte",
+        "refresh_blocked_queued": "Finish or cancel the queued questions first — refreshing would discard them",
+        "refresh_blocked_busy": "Wait for the current answer to finish — refreshing now would discard the pending question",
         "send": "Envoyer",
+        "steer_demoted_to_queue": "Le tour s'est terminé — mis en file d'attente à la place",
+        "steered": "Réorienté",
         "thinking": "Réflexion…",
         "turn_many": "{{count}} tours",
         "turn_one": "{{count}} tour",
@@ -7393,6 +7462,7 @@
       "no_tools": "Aucun outil",
       "open_activity_panel": "Ouvrir le panneau d’activité",
       "open_file": "Ouvrir le fichier {{path}}",
+      "open_folder": "Ouvrir le dossier {{path}}",
       "plan_from_here_failed_error": "Échec de la planification à partir d’ici : {{error}}",
       "pop_out_session_to_its_own_window": "Détacher la session dans sa propre fenêtre",
       "pop_out_to_window": "Détacher dans une fenêtre",
@@ -7526,7 +7596,6 @@
       "incognito_no_memory_writes": "Incognito — aucune écriture en mémoire",
       "last_30_days": "30 derniers jours",
       "last_7_days": "7 derniers jours",
-      "linked_to_slack": "Lié à Slack",
       "load_more": "Charger plus…",
       "loop": "Boucle {{count}}/{{total}}",
       "loop_2": "Boucle · {{count}}",
@@ -7907,6 +7976,15 @@
       "worktrees_count": "Worktrees ({{count}})",
       "worktrees_created_under_a_previous_repository_na": "Worktrees créés sous un ancien nom de dépôt. Masqués par défaut ; toujours pris en compte par Élaguer les fusionnés."
     },
+    "developer": {
+      "previewSurfacesCard": {
+        "inbound_webhook_tokens_registered_contexts_and_r": "Jetons de webhooks entrants, contextes enregistrés et historique des exécutions. L'API fonctionne, mais la page n'est pas terminée.",
+        "open_webhooks": "Ouvrir Webhooks",
+        "preview_surfaces": "Pages en avant-première",
+        "unreleased_pages_hidden_from_the_sidebar_and_fro": "Pages non publiées, masquées dans la barre latérale et dans Rechercher partout jusqu'à ce que vous les activiez ici. Valable pour cet appareil uniquement, et inachevées à dessein.",
+        "webhooks": "Webhooks"
+      }
+    },
     "developerPage": {
       "developer": "Développeur",
       "tabs": {
@@ -7915,7 +7993,7 @@
           "label": "Archives"
         },
         "config": {
-          "description": "Visualiseurs de la configuration de Kiro Crew et des agents (lecture seule)",
+          "description": "Activation des pages en avant-première, ainsi que les visualiseurs de configuration de Kiro Crew et de l'agent (lecture seule)",
           "label": "Configuration"
         },
         "logs": {
@@ -8438,7 +8516,8 @@
         "reembedding": "Recalcul des embeddings…",
         "subtitle": "Fonctionne localement. Le changer relance le calcul des embeddings des mémoires en arrière-plan.",
         "title": "Modèle d'embeddings",
-        "will_revert": "Vide : retour au modèle intégré."
+        "will_revert": "Vide : retour au modèle intégré.",
+        "err_env_override_with_ref": "<settingRef/> est définie et remplace ce paramètre. Supprimez-la pour changer le modèle ici."
       },
       "kiroCrewCfgTab": {
         "agent_for_pool_processes_empty_uses_default_agen": "Agent pour les processus du pool. Vide = agent par défaut. Redémarrage requis.",
@@ -8730,7 +8809,9 @@
         "this_skill_changed_after_this_update_was_written": "Ce skill a changé après l’écriture de cette mise à jour, donc l’appliquer maintenant annulerait ces changements plus récents. L’approbation est bloquée — écarte ce candidat et une nouvelle mise à jour sera proposée sur la version actuelle.",
         "update": "Mettre à jour",
         "version_range": "(v{{from}} → v{{to}})",
-        "workspace": "espace de travail"
+        "workspace": "espace de travail",
+        "auto_create_hint": "Kiro Crew peut également ébaucher des compétences à partir de sessions terminées automatiquement — désactivé par défaut, contrôlé par <settingRef/>.",
+        "approval_required_hint": "Les candidats attendent ici jusqu'à votre approbation — requis par <settingRef/>."
       },
       "steeringTab": {
         "always_on_markdown_conventions_injected_into_eve": "Conventions Markdown toujours actives, injectées dans chaque session. Les fichiers globaux se trouvent dans ~/.kiro/steering et s’appliquent partout ; les fichiers d’espace de travail se trouvent dans <project>/.kiro/steering et s’appliquent uniquement à ce projet.",
@@ -9250,56 +9331,49 @@
     "sessionArchive": {
       "fuzzy_filter_substring_match": "Filtre approximatif (correspondance de sous-chaîne)",
       "loading": "Chargement…",
-      "no_archives_archives_are_created_when_session_fi": "Aucune archive. Les archives sont créées lorsque les fichiers de session sont rotés (>2MB) ou compactés.",
       "no_matches_for_query": "Aucun résultat pour \"{{query}}\".",
       "reload": "Recharger",
       "select_an_archive_to_view_its_contents": "Sélectionnez une archive pour afficher son contenu.",
-      "truncated_showing_first_200kb": "… tronqué (affichage des premiers 200KB) …"
+      "truncated_showing_first_200kb": "… tronqué (affichage des premiers 200KB) …",
+      "no_archives_with_compaction_hint": "Aucune archive. Les archives sont créées lorsque les fichiers de session sont rotés (>2MB) ou compactés. La compaction automatique est contrôlée par <settingRef/>."
     },
     "sessionStorage": {
       "back_to_disk": "Système · Performances › Disque",
-      "batch_detail": "{{sessions}} sessions · {{size}} · déplacées par {{reason}}",
-      "bucket_30_90d": "30 – 90 jours",
-      "bucket_30_90d_hint": "Souvent la tranche la plus grosse, et la raison pour laquelle 90 jours récupère bien moins que 30",
-      "bucket_7_30d": "7 – 30 jours",
-      "bucket_7_30d_hint": "Récupéré par le seuil de 7 jours, conservé par celui de 30 jours",
-      "bucket_over_90d": "Plus de 90 jours",
-      "bucket_over_90d_hint": "Récupéré par tous les seuils",
-      "bucket_under_7d": "Moins de 7 jours",
-      "bucket_under_7d_hint": "Inclut tout ce qui est dans le plancher de 1 jour, qu’aucun seuil ne peut récupérer",
+      "background_group": "Agents en arrière-plan ({{count}})",
+      "bulk_selected": "{{count}} sélectionnés",
       "cancel": "Annuler",
-      "col_last_active": "Dernière activité",
-      "col_sessions": "Sessions",
-      "col_size": "Taille",
+      "cannot_delete_resumable": "Cette session peut encore être reprise, elle est donc conservée. La libérer n'est pas encore proposé.",
+      "cannot_delete_running": "Un tour est en cours dans cette session, elle ne peut donc pas être déplacée vers la corbeille.",
+      "clear_selection": "Effacer",
       "confirm_delete_forever": "Supprimer définitivement",
       "delete_forever": "Supprimer définitivement",
-      "fact_active": "Sessions actives",
-      "fact_active_value": "jamais proposées",
-      "fact_floor": "Ancienneté minimale",
-      "fact_floor_value": "1 jour",
-      "fact_instant": "Mise à la corbeille",
-      "fact_instant_copy": "copie — système de fichiers différent",
-      "fact_instant_rename": "instantanée — un renommage sur le même système de fichiers",
-      "fact_total": "Total sur le disque",
-      "headline_detail": "récupérables · {{reclaimable}} sessions retirées · {{active}} actif n’est jamais proposé",
-      "move_to_trash": "Mettre {{size}} à la corbeille",
-      "note_active_excluded": "Les sessions actives sont exclues par construction : une conversation que vous pouvez encore ouvrir n’est jamais candidate.",
-      "note_copy": "La corbeille est sur un autre système de fichiers : il y a copie et non renommage, donc une durée proportionnelle à la taille.",
-      "note_instant": "Mettre à la corbeille est un renommage sur le même système de fichiers : c’est instantané et chaque session peut être remise.",
-      "note_only_irreversible": "Vider la corbeille est la seule étape irréversible.",
-      "nothing_to_move": "Rien à déplacer",
-      "preview_days": "{{days}} j",
+      "detail_images": "Images",
+      "detail_last_used": "Dernière utilisation",
+      "detail_size": "Taille",
+      "detail_turns": "Tours",
+      "heading": "Stockage des sessions",
+      "in_use": "en cours",
+      "move_to_trash_bulk": "Déplacer vers la corbeille",
+      "move_to_trash_single": "Déplacer vers la corbeille",
+      "refused_heading": "{{count}} sessions n'ont pas pu être déplacées",
+      "refused_in_use": "la session est en cours d'utilisation",
+      "refused_resumable": "encore reprenable",
+      "refused_too_fresh": "la session est trop récente",
+      "refused_unknown": "session introuvable",
       "restore": "Restaurer",
-      "retire_older_than": "Retirer les sessions plus anciennes que",
-      "threshold_30d": "30 jours",
-      "threshold_7d": "7 jours",
-      "threshold_90d": "90 jours",
-      "threshold_never": "Jamais",
+      "resumable": "Reprenable",
+      "search_placeholder": "Rechercher des sessions",
+      "sort_largest": "Plus grandes d'abord",
+      "sort_name": "Nom",
+      "sort_oldest": "Plus anciennes d'abord",
+      "subheading": "{{sessions}} sessions · {{total}} sur le disque · {{reclaimable}} récupérables",
       "trash": "Corbeille",
+      "trash_batch_label": "{{sessions}} sessions · {{size}}",
+      "trash_batch_reason": "Déplacé par {{reason}}",
       "trash_empty": "vide",
-      "trash_holds": "{{size}} sont dans la corbeille et occupent toujours le disque",
-      "trash_never_expires": "Conservé jusqu’à ce que vous la vidiez — rien n’expire tout seul",
-      "trash_still_on_disk": "L’espace libre ne change pas avant le vidage de la corbeille. C’est le principe : les octets restent récupérables."
+      "trash_note": "Occupe encore de l'espace disque jusqu'au vidage. Rien ici n'est supprimé automatiquement.",
+      "trash_summary": "{{sessions}} sessions · {{size}}",
+      "unknown_session": "une session non répertoriée"
     },
     "sessionsTab": {
       "agent": "Agent",
@@ -9373,20 +9447,17 @@
         "copy_command": "Copier la commande",
         "couldn_t_check_for_updates": "Impossible de rechercher des mises à jour",
         "couldn_t_check_for_updates_2": "Impossible de rechercher des mises à jour.",
-        "couldn_t_load_the_changelog": "Impossible de charger le journal des modifications.",
         "download_failed": "Échec du téléchargement",
         "download_install": "Télécharger et installer",
         "download_the_latest_version": "télécharger la dernière version",
         "downloaded_and_verified_the_app_restarts_to_fini": "Téléchargée et vérifiée. L'application redémarre pour terminer l'installation ; vous pouvez aussi quitter plus tard et elle s'installera à la fermeture.",
         "downloading": "Téléchargement...",
-        "hide_full_changelog": "▾ Masquer le journal complet des modifications",
         "insider": "Insider",
         "install_failed": "Impossible d'installer la mise à jour",
         "installing_quiet_note": "Installation — Kiro Crew va rester silencieux une minute ou deux, puis redémarrer de lui-même.",
         "is_available": "est disponible.",
         "loading_changelog": "Chargement du journal des modifications…",
         "manual_install_fallback": "Si la mise à jour ne fonctionne pas, vous pouvez {{link}} et réinstaller par-dessus cette copie. Vos paramètres, conversations et fichiers sont conservés.",
-        "no_changelog_available": "Aucun journal des modifications disponible.",
         "not_checked_yet": "Pas encore vérifié",
         "notify_when_an_update_is_available": "Me prévenir quand une mise à jour est disponible",
         "open_source_under_the_apache_2_0_license": "Open source sous licence Apache 2.0",
@@ -9427,7 +9498,7 @@
         "updating_gateway_restarting": "Mise à jour — redémarrage de la passerelle…",
         "updating_restarts_the_gateway_active_sessions_wi": "La mise à jour redémarre la passerelle — les sessions actives seront brièvement déconnectées.",
         "v": "v",
-        "view_full_changelog": "▸ Voir le journal complet des modifications",
+        "view_all_releases": "Voir toutes les versions",
         "view_this_commit_on_github": "Voir ce commit sur GitHub",
         "what_s_new": "Nouveautés",
         "you_are_on_the_latest_version": "Vous utilisez la dernière version.",
@@ -9586,7 +9657,7 @@
         "how_long_models_think_before_answering_by_defaul": "Durée de réflexion des modèles avant de répondre, par défaut. Plus élevé = plus lent et plus coûteux. Disponible uniquement sur les modèles capables de raisonnement (Opus, Sonnet, Fable, GPT-5.x).",
         "how_long_to_wait_for_the_agent_to_honor_a_stop_p": "Combien de temps attendre que l'agent respecte un appui sur Arrêter avant de tuer la session de force. Des budgets plus longs préservent plus souvent l'état de la session, mais rendent les arrêts moins réactifs quand les agents sont bloqués dans de longs appels d'outils.",
         "how_much_an_automatically_registered_source_may_i": "Ce qu’une source enregistrée automatiquement peut absorber en une passe. Chaque fragment de document coûte un appel d’extraction : c’est donc ce qui borne le coût. Les documents les plus récents arrivent d’abord, le reste suit lors des passes suivantes. 0 supprime la limite. Valeur par défaut : {{count}}.",
-        "how_terse_the_agent_s_prose_is_ultra_concise_cap": "Concision de la prose de l'agent. « Ultra-concis » écrit pour un lecteur TDAH : la réponse tient dans une introduction de trois phrases au maximum, et les détails qui suivent doivent être des puces faciles à parcourir plutôt que de la prose. Le code, les commandes et les messages d'erreur restent littéraux ; les avertissements de sécurité et les instructions en plusieurs étapes conservent tous leurs détails à tous les niveaux.",
+        "how_terse_the_agent_s_prose_is_ultra_concise_cap": "Concision de la prose de l'agent. « Ultra-concis » garde toute la réponse courte : le résultat d'abord, des puces plutôt que de la prose, sans remplissage. Le code, les commandes et les messages d'erreur restent littéraux à tous les niveaux, et les avertissements de sécurité et les instructions en plusieurs étapes conservent tous leurs détails.",
         "i_write_code": "J’écris du code",
         "immediate": "Immédiat",
         "immediate_mode_shows_raw_chunks_as_they_arrive_s": "Le mode immédiat affiche les fragments bruts dès leur arrivée. Le mode fluide les met en tampon et fait apparaître le texte à un rythme régulier.",
@@ -9664,7 +9735,7 @@
         "technical_comfort": "Aisance technique",
         "text_streaming_style": "Style de streaming du texte",
         "time_window_for_session_restoration": "Fenêtre temporelle pour la restauration des sessions",
-        "ultra_concise_3_sentences": "Ultra-concis — réponse en 3 phrases, puis détails faciles à parcourir",
+        "ultra_concise_3_sentences": "Ultra-concis — réponse d'abord, prose minimale",
         "ux_designer": "Designer UX",
         "when_enabled_inline_tool_pills_show_simplified_t": "Lorsque cette option est activée, les pastilles d'outils en ligne indiquent l'objectif simplifié de l'outil au lieu de la commande exacte exécutée",
         "which_model_new_sessions_start_with_pick_a_model": "Le modèle avec lequel démarrent les nouvelles sessions quand leur agent n’en fixe aucun. Définis un modèle pour chaque crew dans Capacités de l’agent → Crews, ou choisis-en un dans une session pour le remplacer localement.",
@@ -9819,7 +9890,6 @@
         "enabled": "activée",
         "enabled_but_not_active_yet_restart_the_gateway": "Activée, mais pas encore active. Redémarrez la passerelle (",
         "enabling": "Activation…",
-        "equivalent_cli": "CLI équivalente :",
         "failed_to_add_remote_crew": "Échec de l’ajout de la crew distante",
         "failed_to_load_remote_crews": "Échec du chargement des crews distantes",
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew  —  laisser vide pour les installations standard",
@@ -9828,8 +9898,6 @@
         "is_already_used_by_another_instance_choose_a_dif": "est déjà utilisé par une autre crew distante — choisissez-en un autre\n              (et configurez ce port sur l'hôte distant).",
         "is_installed_somewhere_non_standard_on_the_remot": "est installé à un\n            emplacement non standard sur l'hôte distant. Laissez vide pour une installation pip normale dans le PATH. Pour le\n            trouver, exécutez sur l'hôte distant :",
         "kirocrew": "kirocrew",
-        "kirocrew_config_set_instances_enabled_true": "kirocrew config set instances.enabled true",
-        "kirocrew_config_set_instances_warm_set_cap_n": "kirocrew config set instances.warm_set_cap N",
         "kirocrew_restart": "kirocrew restart",
         "loading": "Chargement…",
         "local_bin_kirocrew": "~/.local/bin/kirocrew",
@@ -9857,7 +9925,6 @@
         "ssm_target_instance_id": "Cible SSM (id d'instance)",
         "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "La passerelle ouvre un tunnel (SSH ou AWS SSM) et émet un token de courte durée à la connexion.\n        Le port de transfert local reflète le port distant : chaque crew distante connectée\n        doit donc utiliser un port distant distinct.",
         "the_user_the_remote_gateway_runs_as_sudo_u_for_s": "L'utilisateur sous lequel tourne la passerelle distante — les commandes SSM passent par sudo -u. Utilisez ubuntu sur les AMI Ubuntu.",
-        "then": "puis",
         "to_fully_tear_down_any_tunnels_still_running_fro": "pour démanteler complètement les tunnels encore actifs depuis avant.",
         "to_start_the_ssh_tunnel_manager_and_activate_ins": "pour démarrer le gestionnaire de tunnels et activer le basculement entre crews distantes.",
         "token_left": "· jeton valide encore {{time}}",
@@ -9867,7 +9934,8 @@
         "unknown_error": "erreur inconnue",
         "up_to": "Jusqu'à",
         "update_setting_failed": "Échec de la mise à jour du paramètre : {{error}}",
-        "use_an_absolute_path_no": ").\n            Utilisez un chemin absolu (pas de"
+        "use_an_absolute_path_no": ").\n            Utilisez un chemin absolu (pas de",
+        "enable_via_setting": "Alternativement, définissez <settingRef/>, puis exécutez <restartCmd/>."
       },
       "mcpPoolableServers": {
         "blocked": "bloqué",
@@ -9932,6 +10000,22 @@
         "show": "Afficher",
         "unavailable": "indisponible"
       },
+      "releases": {
+        "badge_unreleased": "Non publiée",
+        "detail_no_date": "Date inconnue",
+        "detail_on_prerelease": "Tu utilises la préversion {{version}}",
+        "detail_unreleased": "Pas encore publiée",
+        "empty_in_progress": "Les notes de version de cette version n'ont pas encore été rédigées.",
+        "empty_released": "Cette version est sortie sans notes de version.",
+        "list_label": "Versions",
+        "load_failed": "Impossible de charger les notes de version.",
+        "loading": "Chargement des versions…",
+        "row_current_no_notes": "Ta version · aucune note rédigée",
+        "row_no_notes": "Aucune note rédigée",
+        "stale_note": "Cette liste provient de ton build ({{version}}) et peut ne pas inclure les entrées plus récentes.",
+        "unavailable": "Aucune note de version n'est disponible dans ce build.",
+        "view_commits": "Voir les commits sur GitHub"
+      },
       "reportProblemCard": {
         "blurb": "Quelque chose ne fonctionne pas ? Envoyez-nous un rapport de diagnostic — les secrets sont d’abord masqués dans les journaux.",
         "report_a_problem": "Signaler un problème",
@@ -9952,6 +10036,7 @@
         "click_any_control_to_see_exactly_what_it_covers": "Cliquez sur un contrôle pour voir exactement ce qu'il couvre.",
         "collapse_all": "Tout replier",
         "collapse_category_rules": "Replier les règles de {{category}}",
+        "custom_deny_note": "Note de refus personnalisée",
         "custom_deny_pattern": "Motif de refus personnalisé",
         "custom_patterns_counted_separately": "Vos motifs personnalisés sont comptés séparément dans Commandes refusées.",
         "custom_patterns_hidden_by_filter": "Le filtre actuel masque vos motifs personnalisés.",
@@ -10045,7 +10130,9 @@
         "not_restricted": "Non restreint",
         "nothing_allowed": "Rien autorisé",
         "off": "désactivé",
+        "optional_why_shown_to_the_agent_when_this_rule_fir": "Facultatif : motif. Affiché à l'agent lorsque cette règle s'applique",
         "other_surfaces_have_their_own_profiles": "Une surface avec son propre profil peut autoriser ce que l'hôte ne peut pas : {{surfaces}}.",
+        "enforced_by_floor": "Imposé par une protection toujours active intégrée à Kiro Crew",
         "pinned_by_policy": "Imposé par la politique de sécurité de ton organisation",
         "pinned_for_the_host_surface": "Défini par le profil de la surface hôte. C'est le plafond des actions hôte en cours de processus uniquement — les autres surfaces ont leurs propres profils et peuvent l'autoriser.",
         "policy": "politique",
@@ -10158,6 +10245,18 @@
         "enabling_shared_mcp_gateway": "Activation de la passerelle MCP partagée",
         "gateway_stuck_retry": "La passerelle n'a pas atteint l'état attendu. Réessaie.",
         "gateway_stuck_roll_back": "La passerelle n'a pas atteint l'état attendu. Reviens à l’état sûr (désactivé), ou réessaie.",
+        "mcp_apps": "Applications MCP",
+        "mcp_apps_applies_to_new": "Enregistré. S'applique aux nouvelles connexions MCP ; celles en cours le prendront en compte à leur recyclage.",
+        "mcp_apps_gateway_started": "Passerelle MCP partagée démarrée. Les sessions actives ont été redémarrées avec les apps MCP activées.",
+        "mcp_apps_no_poolable_servers": "Aucun serveur MCP n'est encore regroupable, donc rien ne s'affichera. Activez-en au moins un dans Serveurs MCP regroupables ci-dessous.",
+        "mcp_apps_saved_unsupported": "Enregistré. Les apps MCP nécessitent la passerelle MCP partagée, qui n'est pas disponible sur cette plateforme.",
+        "mcp_apps_retry_gateway": "Réessayer de démarrer la passerelle",
+        "mcp_apps_capability": "Afficher les interfaces interactives des serveurs MCP dans le chat.",
+        "mcp_apps_failed": "Impossible d'appliquer. Le paramètre n'a pas été modifié.",
+        "mcp_apps_needs_gateway": "S'applique dès que la passerelle MCP partagée ci-dessus est activée.",
+        "mcp_apps_will_start_gateway": "Activer cette option démarre aussi la passerelle MCP partagée, ce qui redémarre les sessions actives.",
+        "mcp_apps_starting_gateway": "Démarrage de la passerelle MCP partagée — les sessions actives vont redémarrer…",
+        "mcp_apps_gateway_follow_failed": "Les apps MCP sont enregistrées, mais la passerelle MCP partagée n'a pas démarré. Désactivez puis réactivez la passerelle MCP partagée ci-dessus pour réessayer.",
         "not_available_on_windows": "Non disponible sous Windows — la passerelle partagée nécessite des sockets de domaine Unix. Prise en charge sous macOS et Linux.",
         "roll_back_disable": "Revenir en arrière (désactiver)",
         "shared_mcp_gateway": "Passerelle MCP partagée",
@@ -10543,7 +10642,6 @@
       "daily_trend_point": "{{date}} · à froid {{cold}} · à chaud {{warm}} · {{count}} démarrages",
       "days": "derniers jours.",
       "distribution_col": "Distribution",
-      "enable_with": "Activez avec",
       "fault_rate": "Taux d'erreurs",
       "group_by": "Grouper par",
       "growth_col": "Croissance",
@@ -10555,7 +10653,6 @@
       "mean_col": "Moyenne",
       "mean_credits_by_occupancy": "Crédits moyens par tour, regroupés par contexte utilisé",
       "measured_from_token_records": "Mesuré localement à partir des sessions listées ici sur les {{days}} derniers jours — conservé indépendamment du commutateur de télémétrie",
-      "metrics_stay_local": ". Les métriques restent locales (",
       "min_col": "min",
       "min_max": "min {{min}} · max {{max}}",
       "model_col": "Modèle",
@@ -10565,7 +10662,6 @@
       "no_startups_recorded": "Aucun démarrage enregistré sur cette fenêtre",
       "no_telemetry_recorded_yet_in_the_last": "Aucune télémétrie enregistrée au cours des",
       "no_turns_yet": "Aucun tour",
-      "nothing_leaves_this_machine": ") — rien ne quitte cette machine.",
       "occupancy_p50": "Occupation (p50)",
       "occupancy_p90": "Occupation (p90)",
       "otel_has_no_per_conversation_split": "Les histogrammes OTEL ne portent pas d'identifiant de session ; il s'agit donc de chiffres globaux — la latence par tour ne peut pas être attribuée à une seule conversation.",
@@ -10600,7 +10696,6 @@
       "tab_latency": "Latence",
       "tab_spend": "Dépenses",
       "tab_startup": "Démarrage",
-      "telemetry_enabled_true": "telemetry.enabled = true",
       "telemetry_is_off": "La télémétrie est désactivée",
       "throughput": "Débit",
       "to_compaction_col": "Avant 90 %",
@@ -10621,7 +10716,8 @@
       "warm_start_p50": "Démarrage à chaud (p50)",
       "was_value": "avant {{value}}",
       "window_last": "Sections OTEL · fenêtre : derniers",
-      "window_tokens_col": "Fenêtre (tokens)"
+      "window_tokens_col": "Fenêtre (tokens)",
+      "off_body": "Activer avec <settingRef/>. Les métriques restent locales (<metricsDir/>) — rien ne quitte cette machine."
     },
     "terminalPopoutFrame": {
       "return": "Revenir au dock",
@@ -10882,7 +10978,8 @@
     "worldsPopout": {
       "hide_controls": "Masquer les commandes",
       "show_controls": "Afficher les commandes"
-    }
+    },
+    "sessionMemoryCard": {}
   },
   "privacyDisclosure": {
     "anonymousHeartbeatBody": "Au maximum un par jour. Il identifie une copie installée, pas une personne.",
@@ -10891,7 +10988,6 @@
     "controlsTitle": "Contrôles de télémétrie",
     "dataNeverSentBody": "Requêtes, réponses, fichiers, identifiants, noms d’hôte, noms d’utilisateur, ni ton système d’exploitation. Ton IP n’est pas conservée.",
     "dataNeverSentTitle": "Jamais envoyé",
-    "envOverrideNote": "Le signal est désactivé car {{envVar}} est définie dans cet environnement. Supprime cette variable pour gérer la télémétrie ici.",
     "governanceOverrideNote": "La politique de sécurité de ton administrateur le désactive. Impossible de le modifier ici.",
     "installReceiptBody": "Après une installation ou mise à jour réussie depuis le catalogue officiel de Kiro Crew, un reçu anonyme est envoyé. Les registres externes, apps locales et apps auto-enregistrées ne sont jamais signalés.",
     "installReceiptFields": "slug de l’app officielle · jeton anonyme par app (non corrélable entre apps) · nouvelle installation/mise à jour · version de Kiro Crew",
@@ -10914,7 +11010,8 @@
     "shellWindowsCmdLabel": "Invite de commandes Windows",
     "toggleDescription": "Enregistré pour les lancements suivants.",
     "toggleLabel": "Envoyer le signal d'utilisation anonyme",
-    "toggleSaveFailed": "Impossible d’enregistrer ton choix de télémétrie. Réessaie."
+    "toggleSaveFailed": "Impossible d’enregistrer ton choix de télémétrie. Réessaie.",
+    "envOverrideWithSettingRef": "Le heartbeat est désactivé car <settingRef/> est définie dans cet environnement. Supprimez-la pour gérer la télémétrie ici."
   },
   "settings": {
     "display": {
@@ -10973,6 +11070,10 @@
       "overview": {
         "description": "État du système, activité, utilisation et mémoire en un coup d'œil",
         "label": "Vue d'ensemble"
+      },
+      "releases": {
+        "description": "Notes de version pour chaque version",
+        "label": "Versions"
       },
       "security": {
         "description": "Posture de sécurité, couches de défense, certifications et classification des données",

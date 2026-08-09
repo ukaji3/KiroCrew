@@ -3737,6 +3737,64 @@ class TestConfigDirOverride:
         assert "xapp-test" in content
 
 
+class TestSetupChannelGating:
+    """`kirocrew setup` runs the Slack steps only with --slack.
+
+    Messaging channels are optional: the default wizard must configure none and
+    instead print the pointer to connect channels later, while `--slack` opts
+    into the guided Slack credential + slash-command steps.
+    """
+
+    def _run_setup(self, monkeypatch, tmp_path, **kwargs):
+        import kiro_crew.cli_setup as cs
+
+        calls: list[str] = []
+        monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+        # Imported inside _setup_impl — patch at their source modules.
+        monkeypatch.setattr(
+            "kiro_crew.agent.install_agent", lambda clean=False: tmp_path / "agent.json"
+        )
+        monkeypatch.setattr("kiro_crew.agent.ensure_kirocrew_on_path", lambda: None)
+        monkeypatch.setattr("kiro_crew.mcp_cleanup.clean_stale_managed_mcp", lambda: [])
+        # Neutralize every unrelated wizard step so only the gating is under test.
+        for name in (
+            "_ensure_prerequisites",
+            "_setup_workspace_dir",
+            "_setup_sandbox_consent",
+            "_setup_timezone",
+            "_maybe_setup_dashboard_url",
+            "_maybe_setup_custom_domain",
+            "_maybe_setup_cloud",
+            "_ensure_default_agent_in_config",
+        ):
+            monkeypatch.setattr(cs, name, lambda *a, **k: None)
+        monkeypatch.setattr(cs, "_setup_slack_tokens", lambda: calls.append("slack_tokens"))
+        monkeypatch.setattr(cs, "_setup_slash_command", lambda: calls.append("slash_command"))
+        monkeypatch.setattr(cs, "browser_mode_enabled", lambda: False)
+        # Conductor-skill step catches Exception and continues.
+        monkeypatch.setattr(
+            cs, "KiroCrewConfig", MagicMock(load=MagicMock(side_effect=RuntimeError("no config")))
+        )
+        # Keep the macOS-only desktop-app input() prompt off the path.
+        monkeypatch.setattr(cs.platform, "system", lambda: "Linux")
+
+        cs._setup_impl(**kwargs)
+        return calls
+
+    def test_default_setup_skips_slack_steps(self, tmp_path, monkeypatch, capsys):
+        """Default wizard: no Slack prompts, prints the channels pointer instead."""
+        calls = self._run_setup(monkeypatch, tmp_path)
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "Messaging Channels" in out
+        assert "setup --slack" in out
+
+    def test_slack_flag_opts_into_slack_steps(self, tmp_path, monkeypatch):
+        """--slack runs the guided Slack credential + slash-command steps in order."""
+        calls = self._run_setup(monkeypatch, tmp_path, slack=True)
+        assert calls == ["slack_tokens", "slash_command"]
+
+
 class TestSpawnCliAuth:
     """``kirocrew spawn`` attaches X-Internal-Secret on every gateway call.
 
@@ -4015,6 +4073,13 @@ class TestDoctorEmbeddings:
     def _hermetic_config(self, monkeypatch):
         """Pin config to a pristine default (see ``_pin_default_config``)."""
         _pin_default_config(monkeypatch)
+        # LLAMA_CPP_LIB_PATH selects between two mutually exclusive diagnoses: name the
+        # missing bundled libs, or blame the operator's override directory. Which branch a
+        # test exercises is therefore part of its scenario, not an ambient property of the
+        # host — and the variable is easy to inherit, because the real loader sets it to its
+        # own bundled libs dir the first time embeddings load. Cleared per test; the tests
+        # that exercise the override branch set it themselves.
+        monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
 
     @staticmethod
     def _run_doctor(tmp_path, monkeypatch, *, runtime_ok: bool, model_present: bool, platform_supported: bool = True, missing_libs: dict | None = None, loader_setdefaults: str = "", lib_path_override: str | None = None):
@@ -4051,7 +4116,12 @@ class TestDoctorEmbeddings:
 
         def _load():
             if loader_setdefaults:
-                os.environ.setdefault("LLAMA_CPP_LIB_PATH", loader_setdefaults)
+                # Through monkeypatch, not a bare os.environ write: the real loader's
+                # setdefault is a process-wide mutation, and reproducing it literally leaked
+                # the variable into every later test in the same worker, flipping them onto
+                # the override branch depending on distribution order.
+                if "LLAMA_CPP_LIB_PATH" not in os.environ:
+                    monkeypatch.setenv("LLAMA_CPP_LIB_PATH", loader_setdefaults)
             return object if runtime_ok else None
 
         monkeypatch.setattr(doc, "_load_llama_class", _load)
@@ -4097,6 +4167,18 @@ class TestDoctorEmbeddings:
         after the CPU arch instead of the packaging rule that dropped the file
         on every arch.
         """
+        # This test asserts the NO-override branch, so the var must be absent.
+        # It is not, reliably: the doctor branches on LLAMA_CPP_LIB_PATH and the
+        # value can arrive from outside this test -- a dev shell that exports it,
+        # or the sibling override test, whose helper sets it via a raw
+        # os.environ.setdefault that escapes pytest teardown. Either way the
+        # doctor takes the "libs load from the override dir" path and this
+        # assertion can never match. Clearing it here (mirroring the sibling,
+        # which explicitly setenv-s) makes the expectation independent of both
+        # the ambient environment and test order -- pytest-split reshuffles
+        # shards whenever the suite test count changes, so the leak surfaced on
+        # an unrelated PR that merely added tests elsewhere.
+        monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
         self._run_doctor(
             tmp_path,
             monkeypatch,

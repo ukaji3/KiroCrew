@@ -105,6 +105,15 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Session storage inventory",
+        "dashboard/handlers/session_storage.py",
+        "A session's title and its first message, served by "
+        "`GET /api/system/session-storage/sessions` and its per-row detail. Both are "
+        "conversation content read straight off a transcript, so either can carry a "
+        "key someone pasted into a chat — the same output-boundary reason as the "
+        "session-memory titles below.",
+    ),
+    (
         "Skill context budget",
         "dashboard/handlers/skill_budget.py",
         "Skill display names served by `GET /api/skills/-/budget`. An auto-skill's "
@@ -128,6 +137,17 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "the browser via the `mochi:notify` broadcast and the chat push; `redact_tree` "
         "scrubs credentials and exfiltration URLs before publish, the same "
         "output-boundary reason as the app plan/activity-log sinks.",
+    ),
+    (
+        "Session transfer bundle",
+        "dashboard/session_transfer.py",
+        "Transcript content copied to another Kiro Crew instance over an Instances "
+        "tunnel. The bundle LEAVES this host, so it is an output boundary: a "
+        "transcript written before the redactors existed (or carried in from a "
+        "channel) can still hold a raw credential on disk, and relying on the "
+        "receiving instance to scrub it would send the secret across the boundary "
+        "first. The importer redacts again — idempotent, and it must not assume a "
+        "well-behaved sender.",
     ),
     (
         "Profile artifact",
@@ -666,6 +686,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # message with and without redaction, so a raw comparison would keep both
         # copies — nothing redacted here is ever written or shown.
         "channel_transcript_migration.py",
+        # Comparison-only, same shape: the steer settler redacts BOTH the pending
+        # text and the backend's echo purely to compute a match identity. The ACP
+        # layer already redacted the echo on the way in, so comparing it against
+        # raw pending text never matched and the consumed steer got requeued and
+        # run twice. Nothing redacted here is written or shown — the ledger and
+        # the transcript keep the original text.
+        "dashboard/steer_settle.py",
         # DETECTOR, not a redactor: the pre-push content scan calls both scanners only
         # to COUNT findings and then refuses the push. It deliberately discards the
         # cleaned text — rewriting a code diff would corrupt the very fix the gate

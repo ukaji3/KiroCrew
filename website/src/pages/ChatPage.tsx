@@ -14,7 +14,7 @@ import { useConnected } from '../hooks/useConnected'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import {
   switchSlot, createSlot, deleteSlot, fetchHistory,
-  appendMessage, resumeFromHistory, forkSlot,
+  appendMessage, appendSlotMessage, resumeFromHistory, forkSlot,
   setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, resolveByApprovalId, clearPendingPermissions, cancelQueuedMessage, editQueuedMessage,
   selectComposerBusy,
   selectContinuable,
@@ -23,7 +23,8 @@ import {
   toggleActivity, openActivityPanel, openActivityToTab,
   selectSubagent,
   setActiveSlot, truncateAfterIndex, replaceMessages,
-  requestStop, pendingQuestionFor, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion,
+  requestStop, pendingQuestionFor, captureStatelessCard, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion,
+  retireStatelessQuestion,
   mcpAppKey,
 } from '../store/chatSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
@@ -53,7 +54,7 @@ import { deriveLoadedMcpTools } from '../lib/mcpLoadedTools'
 import type { McpServer } from '../types'
 import { useScrollManager } from './chat/useScrollManager'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
-import { parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, findUnreferencedAttachments } from '../utils/fileTokens'
+import { parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment } from '../utils/fileTokens'
 import { type PasteBlock, expandAll as expandPasteTokens, findTokenRanges, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste, recollapsePastes } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
 /** Delay (ms) before scrolling to bottom after a state update, giving React time to commit. */
@@ -108,6 +109,7 @@ import VoiceDisabledModal from '../components/VoiceDisabledModal'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
 import type { TurnStats } from './chat/AssistantMessage'
 import MarkdownRenderer from '../components/MarkdownRenderer'
+import { JiraHostsCtx } from '../lib/jiraHosts'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import TypewriterText from '../components/TypewriterText'
 import { useChatNavigation } from '../hooks/useChatNavigation'
@@ -152,7 +154,7 @@ import { focusComposerAfter } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
 import { useKnowledgeFetch, extractKnowledgeQuery, expandKnowledgeBlock } from './chat/useKnowledgeFetch'
 import { KnowledgePicker } from './chat/KnowledgePicker'
-import { BookOpen, EyeOff, Loader, Pen, ChevronDown, ChevronRight, Plug, ArrowDown, MessageSquare, MessageSquareDot, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, Paperclip } from 'lucide-react'
+import { BookOpen, EyeOff, Loader, Pen, ChevronDown, ChevronRight, Plug, ArrowDown, MessageSquare, MessageSquareDot, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, Paperclip, Folder } from 'lucide-react'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
 import InfoTip from '../components/InfoTip'
@@ -372,7 +374,7 @@ function KnowledgeBubbleChip({ knowledge }: { knowledge: { items: number; tokens
   )
 }
 
-export function renderUserContent(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void) {
+export function renderUserContent(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, onFolderOpen?: (path: string) => void) {
   // Per-message containment (defense-in-depth): a render crash in a
   // user/inject bubble must degrade to a per-message fallback, not unwind to
   // the root boundary and blank the whole dashboard.
@@ -383,20 +385,31 @@ export function renderUserContent(content: string, meta: Record<string, unknown>
   // context export.)
   return (
     <MessageErrorBoundary rawContent={content}>
-      {renderUserContentInner(content, meta, onFileOpen)}
+      {renderUserContentInner(content, meta, onFileOpen, onFolderOpen)}
     </MessageErrorBoundary>
   )
 }
 
-function renderUserContentInner(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void) {
+function renderUserContentInner(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, onFolderOpen?: (path: string) => void) {
   const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
   const knowledge = meta?.knowledge as { items: number; tokens: number; titles: string[]; content?: { title: string; text: string }[] } | undefined
+
+  // Folder references resolve FIRST, on the whole message: `[attached_dir N]
+  // /path` markers (history replay / steer echo) rewrite to `@label/` display
+  // tokens, and fresh `@rel/` tokens map to their meta.dirs path. One pass
+  // here — before the paste split — so every segment renderer below sees the
+  // token form and one shared label->path map. Dir markers never appear
+  // inside paste blocks (they serialize from the typed text only), so the
+  // rewrite cannot break paste-token ranges recomputed on the result.
+  const { display: dirResolved, dirMentionMap } = resolveDirSegment(content, parseDirs(content, meta))
+  content = dirResolved
 
   const knowledgeBadge = knowledge ? (
     <KnowledgeBubbleChip knowledge={knowledge} />
   ) : null
 
-  if (!pastes.length) return <>{knowledgeBadge}{renderFileSegment(content, meta, onFileOpen, 'seg')}</>
+  if (!pastes.length) return <>{knowledgeBadge}{renderFileSegment(content, meta, onFileOpen, 'seg', dirMentionMap, onFolderOpen)}</>
+
 
   // History load re-serves the fully-EXPANDED content (what the LLM saw), so a
   // message whose bubble was a `[ Paste #N ]` chip when sent comes back as the
@@ -416,7 +429,7 @@ function renderUserContentInner(content: string, meta: Record<string, unknown> |
       ranges = findTokenRanges(text, pastes)
     }
   }
-  if (!ranges.length) return <>{knowledgeBadge}{renderFileSegment(text, meta, onFileOpen, 'seg')}</>
+  if (!ranges.length) return <>{knowledgeBadge}{renderFileSegment(text, meta, onFileOpen, 'seg', dirMentionMap, onFolderOpen)}</>
 
   // Paste chips are inline by nature, so to keep them flowing with the
   // surrounding text (e.g. "hey [chip] thanks"), render each text segment
@@ -435,14 +448,14 @@ function renderUserContentInner(content: string, meta: Record<string, unknown> |
     const trimEnd = text[r.end] === '\n' ? r.end + 1 : r.end
     if (trimStart > lastIdx) {
       const seg = text.slice(lastIdx, trimStart)
-      if (seg) out.push(renderInlineSegment(seg, meta, onFileOpen, `t${i}`))
+      if (seg) out.push(renderInlineSegment(seg, meta, onFileOpen, `t${i}`, dirMentionMap, onFolderOpen))
     }
     out.push(<PastedChip key={`p${i}-${r.block.id}`} block={r.block} />)
     lastIdx = trimEnd
   })
   if (lastIdx < text.length) {
     const seg = text.slice(lastIdx)
-    if (seg) out.push(renderInlineSegment(seg, meta, onFileOpen, 'tend'))
+    if (seg) out.push(renderInlineSegment(seg, meta, onFileOpen, 'tend', dirMentionMap, onFolderOpen))
   }
 
   // Attachments never referenced by any segment (e.g. an upload with no inline
@@ -467,12 +480,56 @@ function renderUserContentInner(content: string, meta: Record<string, unknown> |
   return knowledgeBadge ? <>{knowledgeBadge}{out}</> : out
 }
 
+/** Boundary-checked presence of an `@token` in a text segment — the same rule
+ *  the split regex uses, so a key is only offered to a segment that can
+ *  actually match it. */
+function tokenPresent(text: string, token: string): boolean {
+  const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|\\s)@${esc}(?=\\s|$)`).test(text)
+}
+
+/** Inline chip for a folder reference in a sent message. Clicking opens the
+ *  directory in the side panel's file tree — the SAME handler assistant-message
+ *  directory chips use (handleFolderOpen -> tabsCtl.openFolder), so a folder is
+ *  equally actionable whichever side of the conversation names it. Shift-click
+ *  reveals in the OS file manager, mirroring MarkdownRenderer's activatePath.
+ *  Without a handler (export used outside ChatPage) it degrades to an inert
+ *  span with the path in the tooltip. */
+function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string; onOpen?: (path: string) => void }) {
+  const body = (
+    <>
+      <Folder size={11} aria-hidden="true" className="shrink-0 lucide-inline" />@{label}
+    </>
+  )
+  if (!onOpen) {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
+        {body}
+      </span>
+    )
+  }
+  return (
+    <Clickable
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono cursor-pointer hover:bg-accent/25 transition-colors"
+      title={fullPath}
+      aria-label={i18nT('pages.chatPage.open_folder', { path: fullPath })}
+      onClick={e => {
+        if (e && 'shiftKey' in e && e.shiftKey) { api.revealPath(fullPath); return }
+        onOpen(fullPath)
+      }}
+    >
+      {body}
+    </Clickable>
+  )
+}
+
 /** Inline-flow renderer for a text segment adjacent to a paste chip.
  *  Handles @-file tokens as inline chips; other text is rendered as a
  *  whitespace-preserving span (no markdown). */
-function renderInlineSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string) {
+function renderInlineSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string, dirMap?: Map<string, string>, onFolderOpen?: (path: string) => void) {
   const parsedFiles = parseFiles(content, meta)
-  if (!parsedFiles.length) {
+  const dirKeys = dirMap ? [...dirMap.keys()].filter(k => tokenPresent(content, k)).slice(0, 20) : []
+  if (!parsedFiles.length && !dirKeys.length) {
     return <span key={keyBase} style={{ whiteSpace: 'pre-wrap' }}>{content}</span>
   }
   // Inline-flow variant (adjacent to a paste chip): keep everything inline.
@@ -482,11 +539,13 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
   // inline flow). Never-referenced attachments are handled once at message
   // level. Pass the ORIGINAL ordered list so token indices line up.
   const { display, mentionMap, cardPaths, labels } = resolveFileSegment(content, parsedFiles)
-  if (!mentionMap.size && !cardPaths.length) {
+  if (!mentionMap.size && !cardPaths.length && !dirKeys.length) {
     return <span key={keyBase} style={{ whiteSpace: 'pre-wrap' }}>{display}</span>
   }
 
-  const keys = [...mentionMap.keys()].slice(0, 20)
+  // Folder tokens join the same split as file mentions. A dir key always ends
+  // in `/` and a file key never does, so classification below is unambiguous.
+  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys]
   const tokPattern = keys.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
   const parts = tokPattern
     ? display.split(new RegExp(`(@(?:${tokPattern}))(?=\\s|$)`, 'g'))
@@ -496,6 +555,10 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
     <span key={keyBase} style={{ whiteSpace: 'pre-wrap' }}>
       {parts.map((part, i) => {
         const tok = part.match(/^@(.+)$/)?.[1]
+        const dirPath = tok && dirMap?.get(tok)
+        if (dirPath) {
+          return <DirChip key={`${keyBase}-d${i}`} label={tok} fullPath={dirPath} onOpen={onFolderOpen} />
+        }
         const fullPath = tok && mentionMap.get(tok)
         if (fullPath) {
           return (
@@ -540,13 +603,22 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
  *  server stores the token form in `content` AND keeps `meta.files` at once.
  *  Files referenced inline stay inline chips; the rest become block cards.
  *  Images keep their inline `![image](path)` markdown and are excluded here. */
-function renderFileSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string) {
+function renderFileSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string, dirMap?: Map<string, string>, onFolderOpen?: (path: string) => void) {
   const parsedFiles = parseFiles(content, meta)
+  const dirKeys = dirMap ? [...dirMap.keys()].filter(k => tokenPresent(content, k)).slice(0, 20) : []
 
   // No attachments — plain markdown (bold, code, links, etc.).
   // softBreaks: preserve Shift+Enter line breaks as <br> (see MarkdownRenderer).
   // compactImages: this is user-message content, so attached images render small.
-  if (!parsedFiles.length) {
+  //
+  // A folder token routes the message into the inline chip-split body below,
+  // which renders surrounding text as plain whitespace-preserving spans — so
+  // markdown in a folder-referencing message shows literally. This is the
+  // same trade-off inline file mentions already make, accepted here because
+  // the chip must sit inline in the sentence and MarkdownRenderer has no
+  // inline-widget seam; a folder-referencing prompt with block markdown is
+  // the uncommon combination.
+  if (!parsedFiles.length && !dirKeys.length) {
     return <MarkdownRenderer content={content} softBreaks compactImages />
   }
 
@@ -560,6 +632,8 @@ function renderFileSegment(content: string, meta: Record<string, unknown> | unde
   // empty-caption bubble whose content carries no token yet). The
   // never-referenced set is computed by the shared findUnreferencedAttachments
   // (same original-list indexing), deduped against tokens already carded here.
+  // Folder references never card: a folder is a path reference, not an upload,
+  // and its token is by construction present in the text.
   const carded = new Set(cardPaths)
   const allCardPaths = [
     ...cardPaths,
@@ -574,8 +648,9 @@ function renderFileSegment(content: string, meta: Record<string, unknown> | unde
     </div>
   ) : null
 
-  // No inline @-mentions: caption (if any) is plain markdown, then the cards.
-  if (!mentionMap.size) {
+  // No inline @-mentions of either kind: caption (if any) is plain markdown,
+  // then the cards.
+  if (!mentionMap.size && !dirKeys.length) {
     const caption = display.trim()
     return <>{caption ? <MarkdownRenderer key={`${keyBase}-cap`} content={caption} softBreaks compactImages /> : null}{cards}</>
   }
@@ -586,14 +661,20 @@ function renderFileSegment(content: string, meta: Record<string, unknown> | unde
   // around the chip) and each @token as an inline chip. Block markdown (bold,
   // lists) inside a caption that also carries an inline mention renders as
   // literal text — a rare combination, same trade-off as renderInlineSegment.
-  // Cap tokens to prevent ReDoS from many alternations.
-  const keys = [...mentionMap.keys()].slice(0, 20)
+  // Cap tokens to prevent ReDoS from many alternations. Folder tokens join
+  // the same split; a dir key always ends in `/` and a file key never does,
+  // so classification below is unambiguous.
+  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys]
   const tokPattern = keys.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
   const parts = display.split(new RegExp(`(@(?:${tokPattern}))(?=\\s|$)`, 'g'))
   const body = (
     <span key={`${keyBase}-body`} style={{ whiteSpace: 'pre-wrap' }}>
       {parts.map((part, i) => {
         const tok = part.match(/^@(.+)$/)?.[1]
+        const dirPath = tok && dirMap?.get(tok)
+        if (dirPath) {
+          return <DirChip key={`${keyBase}-d${i}`} label={tok} fullPath={dirPath} onOpen={onFolderOpen} />
+        }
         const fullPath = tok && mentionMap.get(tok)
         if (fullPath) {
           return (
@@ -1307,6 +1388,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // Restore the incoming slot's staged file attachments (copy so the
     // live state array and the stored draft don't share a reference).
     setPendingFiles(activeSlot ? (fileDrafts.current[activeSlot] ?? []).slice() : [])
+    // Staged folder references need no restore of their own: the chips derive
+    // from `@rel/` tokens in the composer text, and the text draft restored
+    // above is per-slot. A folder staged in slot A therefore reappears with
+    // slot A's draft and never bleeds into slot B.
     // Restore the incoming slot's collapsed-paste blocks (deep copy so the live
     // state and the stored draft don't share references). Without this the
     // token text rehydrates from the text draft but its backing block is gone,
@@ -1368,6 +1453,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
+  // Staged folder chips DERIVE from the composer text: an `@rel/` token is the
+  // only form of a folder reference the agent receives, so token presence is
+  // the single source of truth. There is no parallel state to leak across
+  // slots, clear on send, or sync against hand-edits — inserting the token
+  // stages the chip, deleting the token (by any means) unstages it, and the
+  // per-slot text draft persists the reference across slot switches for free.
+  const pendingDirs = useMemo(() => parseDirTokens(input).map(t => t.rel), [input])
+  // Exact `@rel` composer token recorded per PICKER-PICKED file, so the file
+  // chip's remove control can strip precisely the token the pick inserted —
+  // the same remove contract folder chips have. Uploaded/dropped files never
+  // get an entry (they have no token), so their remove stays state-only. A
+  // ref, not state: it never drives rendering. Entries die with their chip.
+  const pickedFileTokens = useRef<Record<string, string>>({})
   const [snipFrame, setSnipFrame] = useState<HTMLCanvasElement | null>(null)
   // The slot that INITIATED the current snip. getDisplayMedia + cropping is
   // async and the user may switch slots meanwhile, so the cropped image must
@@ -1816,20 +1914,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[] }>({
+  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
     queryKey: ['dashboardConfig'],
     queryFn: () => api.dashboardConfig(),
     staleTime: 30_000,
   })
   const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
-  // Read through a ref by callbacks that must stay identity-stable (they are
+  const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
+  // Read through refs by callbacks that must stay identity-stable (they are
   // handed to the sidebar, which re-renders every session row).
   const sourceHostsRef = useRef(sourceHosts)
   sourceHostsRef.current = sourceHosts
+  const jiraSourceHostsRef = useRef(jiraSourceHosts)
+  jiraSourceHostsRef.current = jiraSourceHosts
   const indexedSourceLinks = sourceLinkIndex.current.update(
     activeSlot,
     messages,
     sourceHosts,
+    jiraSourceHosts,
   )
   // One scan, one dedup map, two panels: the extractor returns pull requests and
   // issues together (they share the per-role cap), and the two side-panel tabs
@@ -3137,7 +3239,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const planActionMutationRef = useRef(planActionMutation)
   planActionMutationRef.current = planActionMutation
 
-  const send = useCallback(async (optionText?: string, targetSlot?: string) => {
+  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean) => {
     // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
     // the keyboard Enter shortcut on `connected`, but a future caller (a
     // programmatic dispatch from a hotkey, a follow-up option click, an
@@ -3183,6 +3285,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // clear, and (below) the send target.
     const uiSlot = activeSlotRef.current
 
+    // Capture the stateless card pending at ENTRY — before the first await
+    // below. This send consumes the answer channel of the card the user saw
+    // when they hit send; captured after an await, the card-submit flow can
+    // clear the card (or a newer one can land) in the gap, and the capture
+    // would compare against the wrong baseline (fork GPT review, 995718f).
+    const entrySendSlot = targetSlot ?? uiSlot
+    const cardAtSend = captureStatelessCard(store.getState().chat.pendingQuestions, entrySendSlot)
+
     // Slash command interception (e.g. /side): runs before knowledge so a
     // bare prefix like /side returns immediately without touching input parse.
     // Gate on the RAW composer text first — a pasted block whose content
@@ -3227,6 +3337,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // the PR into pre-existing attachment behaviour.
     const sentSessionRefs = optionText ? [] : pendingSessionsRef.current.slice()
     const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = prepareSendPayload(raw, pendingFilesRef.current)
+    // Folder references serialize like files but from the text alone: each
+    // `@rel/` token becomes `[attached_dir N] /abs/path` in the LLM-facing
+    // text (absolute, so the reference survives a cwd/project mismatch and
+    // history replay), while the display text keeps the `@rel/` token for the
+    // bubble chip — the same fresh-vs-wire split files use. Runs AFTER the
+    // file pass: file tokens never end in `/`, so the two rewrites are
+    // disjoint. `dirPaths` rides `meta.dirs`, ordered so marker N indexes
+    // dirPaths[N-1] losslessly.
+    const { llm: typedTxtDirs, dirPaths } = serializeDirTokens(typedTxt, currentProjectRef.current || '')
     // Staged session references become plain markdown links appended to the
     // message — deliberately a POINTER, not the referenced transcript. Inlining
     // another session's content would spend a large share of THIS session's
@@ -3242,7 +3361,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // is no collapsed form to preserve in the bubble, so what the user sees is
     // exactly what was sent. Appending (never splicing) also means paste-token
     // ranges found earlier in the string are untouched.
-    const txt = appendSessionRefLinks(typedTxt, sentSessionRefs)
+    const txt = appendSessionRefLinks(typedTxtDirs, sentSessionRefs)
     const displayTxt = appendSessionRefLinks(typedDisplayTxt, sentSessionRefs)
     // Expand paste tokens for the LLM; UI-facing displayTxt keeps the tokens
     // intact so the user bubble can render them as clickable chips.
@@ -3260,7 +3379,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
     setPrefillHint(false)
     if (!optionText) {
-      setInput(''); setPendingFiles([]); setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
+      setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
       // The challenge-handoff prompt is seeded into PREFILL_STORAGE_KEY and the
       // slot-restore effect re-applies it on slot changes. Once that prompt is
       // sent, clear the seed so a later slot-restore can't re-fill the (now
@@ -3455,13 +3574,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // Build meta for persistence (knowledge, files, pastes)
     const meta: Record<string, unknown> = {}
     if (filePaths.length) meta.files = filePaths
+    if (dirPaths.length) meta.dirs = dirPaths
     if (bubblePastes.length) meta.pastes = bubblePastes
     if (knowledgeBlock) meta.knowledge = { items: knowledgeBlock.items.length, tokens: knowledgeBlock.totalTokens, titles: knowledgeBlock.items.map(i => i.title), content: knowledgeBlock.items.map(i => ({ title: i.title, text: i.content.slice(0, 2000) })) }
     if (widgetOrigin) meta.origin = 'widget'
     const metaPayload = Object.keys(meta).length ? meta : undefined
     // Skip optimistic user bubble when the slot is busy (shared rule:
     // chatSlice.selectComposerBusy) — the backend sends a "queued" role
-    // message instead, avoiding a duplicate.
+    // message instead, avoiding a duplicate. A steer-flagged send usually
+    // bypasses the queue and starts a turn, so nothing would represent it; its
+    // bubble is appended from the response instead (see below), because only
+    // the server knows whether this particular send got queued after all.
     const _busy = selectComposerBusy(store.getState(), slot ?? null)
     if (!_busy || forceNew) {
       dispatch(appendMessage({ role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload }))
@@ -3539,7 +3662,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       }
     }
     try {
-      const r = await api.sendChat(llmTxt, slot ?? undefined, colorThemeRef.current, controller.signal, metaPayload)
+      const r = await api.sendChat(llmTxt, slot ?? undefined, colorThemeRef.current, controller.signal, metaPayload, steerNow)
       clearTimeout(timeout)
       const body = await r.json().catch(() => ({}))
       if (!body.queued && !body.ok) {
@@ -3548,6 +3671,39 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         // The server explicitly accepted neither (`ok` nor `queued`), so nothing
         // was sent — recovering the composer cannot duplicate a delivered turn.
         restoreComposerAfterFailedSend()
+      } else if (steerNow && _busy && !body.queued && !body.steered) {
+        // A steer-flagged send the server neither queued nor injected: it
+        // started a turn, so no `queue_push` or `steer_push` echo is coming and
+        // the busy rule above left the text with nothing to represent it.
+        // Append only once the answer rules out both echoes — a mid-plan send
+        // is queued, and a child turn that started while this POST was in
+        // flight is injected mid-turn, each of which brings its own bubble.
+        // Addressed to the SENDING slot, not the active one: the user can
+        // switch sessions while the POST is in flight, and this text belongs to
+        // the transcript it was typed into (same reason `steer_push` uses this).
+        if (slot) {
+          dispatch(appendSlotMessage({
+            slot,
+            message: { role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload },
+          }))
+        }
+      }
+      if (body.ok && !body.queued && cardAtSend && slot === entrySendSlot) {
+        // Immediate dispatch confirmed (`ok`): the message consumed the slot's
+        // next-turn channel, so the card captured at entry is now stale. An
+        // independent check, not part of the else-if chain above — the
+        // steer-echo branch also implies `ok && !queued`, and the card must
+        // retire regardless of which transcript-echo rule applied. A QUEUED
+        // acceptance deliberately does NOT retire here — the queued message is
+        // still cancellable, and cancelling must keep the card; it retires at
+        // its queue_pop instead (removeQueuedMessage). The slot-identity guard
+        // covers forceNew rerouting the send into a freshly created session —
+        // that send answers nothing in the entry slot, whose card must stay.
+        // Deliberately NOT done on the optimistic append (a failed send must
+        // keep the card) nor on the abort-timeout path below (delivery
+        // unconfirmed — a wrongly kept card is dismissible, a wrongly deleted
+        // one is not recoverable).
+        dispatch(retireStatelessQuestion({ slot, expected: cardAtSend }))
       }
     } catch (e: unknown) {
       clearTimeout(timeout)
@@ -4284,8 +4440,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }), [search.term, search.caseSensitive, search.currentMessageIdx, search.currentOccurrenceIdx])
 
   const renderUserContentCb = useCallback(
-    (c: string, mt: Record<string, unknown> | undefined) => renderUserContent(c, mt, handleFileOpen),
-    [handleFileOpen]
+    (c: string, mt: Record<string, unknown> | undefined) => renderUserContent(c, mt, handleFileOpen, handleFolderOpen),
+    [handleFileOpen, handleFolderOpen]
   )
 
   const cancelTitleRef = useRef(false)
@@ -4560,6 +4716,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // ChatInput) so text and attachments clear atomically.
   const steer = useCallback(() => {
     if (!activeSlot) return
+    // Nothing to inject into: the composer is busy purely because background
+    // sub-agents are still running for this slot (spawn_run is fire-and-forget,
+    // so the parent turn already ended). The intent is the same — act on this
+    // text now, don't park it — so start a real turn through the normal send
+    // path, which carries `ws=1` and so streams, and flag it to skip the
+    // server-side hold that keeps a user message behind running sub-agents.
+    // Delegating here, BEFORE the composer is read and cleared below, leaves
+    // send() owning the draft, attachment and optimistic-bubble bookkeeping.
+    // A multi-stage autopilot plan also reads busy-but-not-running. There the
+    // server keeps `_in_stage_execution` set for the WHOLE plan, so the flag
+    // finds no live session to inject into and the message queues — the right
+    // answer between stages, and unconditional across the plan rather than a
+    // race with the gaps.
+    if (!slotRunning) { void send(undefined, undefined, true); return }
     const raw = inputRef.current.trim()
     const files = pendingFilesRef.current
     if (!raw && !files.length) return
@@ -4610,6 +4780,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       return
     }
     const { txt } = prepareSendPayload(raw, files)
+    // Folder tokens deliberately stay in their `@rel/` form on steer: the
+    // steer transport is TEXT-ONLY (no meta), so a `[attached_dir N] /abs
+    // path` marker would have no meta.dirs index to replay against and the
+    // whitespace-bounded fallback truncates a path containing spaces — the
+    // chip would then open the wrong directory. The raw token is what the
+    // agent resolved before serialization existed, and it stays correct
+    // under replay. Serialize on steer only if that transport ever carries
+    // attachment metadata.
     const activePastes = pasteBlocksRef.current
     const llmTxt = activePastes.length ? expandPasteTokens(txt, activePastes) : txt
     // Optimistically show the steered text immediately. Steer is the default
@@ -4628,10 +4806,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // would lose a reference the user cannot recover except by dragging again.
     // Leaving them staged is lossless and predictable: the chip stays in the
     // composer and rides the next real send, which does have a restore path.
-    setInput(''); setPendingFiles([]); setPasteBlocks([])
+    setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([])
     delete drafts.current[activeSlot]; delete fileDrafts.current[activeSlot]; delete pasteDrafts.current[activeSlot]
     saveDrafts()
-  }, [activeSlot, steerMutation, saveDrafts, dispatch])
+  }, [activeSlot, slotRunning, send, steerMutation, saveDrafts, dispatch])
 
   const handleCancelQueued = useCallback((queueId: string) => {
     if (!activeSlot) return
@@ -4655,6 +4833,32 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     dispatch(editQueuedMessage({ slot: activeSlot, queue_id: queueId, content: trimmed }))
     api.editQueuedMessage(activeSlot, queueId, trimmed).catch(() => {})
   }, [activeSlot, dispatch])
+
+  const handleReorderQueued = useCallback((queueId: string, direction: 'next' | 'later') => {
+    if (!activeSlot) return
+    const slot = activeSlot
+    // Build the order from ALL queued messages (allQueuedMessages includes
+    // hidden system deliveries and recovery continuations), not just the
+    // interactive cards: submitting only visible ids would let the backend
+    // append the omitted ones at the tail, silently demoting automation. The
+    // swap is between adjacent VISIBLE cards, expressed inside the full order.
+    const fullIds = allQueuedMessages.map(m => m.meta?.queueId as string).filter(Boolean)
+    const visibleIds = queuedMessages.map(m => m.meta?.queueId as string).filter(Boolean)
+    const vFrom = visibleIds.indexOf(queueId)
+    const vTo = direction === 'next' ? vFrom - 1 : vFrom + 1
+    if (vFrom < 0 || vTo < 0 || vTo >= visibleIds.length) return
+    const a = fullIds.indexOf(visibleIds[vFrom])
+    const b = fullIds.indexOf(visibleIds[vTo])
+    if (a < 0 || b < 0) return
+    const next = [...fullIds]
+    ;[next[a], next[b]] = [next[b], next[a]]
+    // No optimistic dispatch: the server commits and broadcasts queue_reorder
+    // to every client including this one, and that WS event is the
+    // authoritative store update. A local dispatch with rollback-on-failure
+    // could restore a stale order when the server committed but the HTTP
+    // response was lost, leaving this client in conflict with execution order.
+    api.reorderQueuedMessages(slot, next).catch(() => undefined)
+  }, [activeSlot, allQueuedMessages, queuedMessages])
 
 
   // Search: map message index → displayItems index for scroll-to-match
@@ -5031,7 +5235,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
    *  empty if it fails), so every self-hosted chip parses to null in that window
    *  even though the backend scan accepted it. */
   const revealSourceLink = useCallback((slot: string, chip: { url: string; kind: SourceLinkKind }): boolean => {
-    const link = parseSourceLinkUrl(chip.url, sourceHostsRef.current)
+    const link = parseSourceLinkUrl(chip.url, sourceHostsRef.current, jiraSourceHostsRef.current)
     if (!link) return false
     const view = link.kind === 'issue' ? 'issues' : 'changes'
     // Durable BEFORE the state update, and one key at a time. Writing inside the
@@ -5160,6 +5364,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   return (
     <RowDisclosureProvider resetKey={activeSlot}>
     <TagPopoverProvider>
+    {/* Self-hosted Jira allowlist for every markdown anchor in the page --
+        message bodies, previews, and panels alike -- so a pasted Jira URL
+        chips identically wherever it renders. Cloud URLs need no provider. */}
+    <JiraHostsCtx.Provider value={jiraSourceHosts}>
     <div ref={chatContainerRef} className="flex flex-1 min-h-0 h-full overflow-hidden relative">
       <AnimatePresence>
         {isMobile && mobileSessions && (
@@ -5673,7 +5881,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {!(activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'subagents') && <SubagentProgressBar slot={activeSlot} />}
               {!(activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'workflows') && <WorkflowProgressBar slot={activeSlot} />}
               <SubagentDeliveryProgress count={systemDeliveryCount} />
-              <QueueStack messages={queuedMessages} onCancel={handleCancelQueued} onInterrupt={handleInterruptQueued} onEdit={handleEditQueued} fuseBelow={followUpOptions.length === 0 && !knowledgeFetch.pendingKnowledge} />
+              <QueueStack messages={queuedMessages} onCancel={handleCancelQueued} onInterrupt={handleInterruptQueued} onEdit={handleEditQueued} onReorder={handleReorderQueued} fuseBelow={followUpOptions.length === 0 && !knowledgeFetch.pendingKnowledge} />
               {flyingQuote && <FlyingQuote text={flyingQuote.text} from={flyingQuote.from} targetRef={inputAreaRef} onComplete={() => setFlyingQuote(null)} />}
               <div ref={inputAreaRef} className="relative z-10">
               {showHistorySuggestions && (
@@ -5787,7 +5995,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               value={input}
               onChange={setInput}
               onSend={() => send()}
-              canSteer={slotRunning}
+              canSteer={composerBusy}
               onSteer={steer}
               onFollowUpSend={(text?: string) => send(text)}
               disabled={
@@ -5804,11 +6012,47 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onUploadFiles={uploadFiles}
               uploading={uploading}
               pendingFiles={pendingFiles}
+              pendingDirs={pendingDirs}
               resizedInfo={resizedInfo}
-              onRemoveFile={p => setPendingFiles(prev => prev.filter(x => x !== p))}
+              onRemoveFile={p => {
+                setPendingFiles(prev => prev.filter(x => x !== p))
+                // A picker-picked file also inserted an `@rel` token into the
+                // composer, so its remove strips that token too — the same
+                // contract folder chips have, so the two chip kinds cannot
+                // disagree about what "remove" means. The exact token is
+                // recorded at pick time, but the ref is in-memory only: a
+                // restored draft or a failed-send restore re-stages the file
+                // without it. Fall back to deriving the token from the path —
+                // the shortest boundary-checked `@suffix` present in the text
+                // (the same walk buildRelMap uses), which is exactly the form
+                // the picker inserts. Uploaded/dropped files have no token in
+                // the text, so the derivation finds nothing and their remove
+                // stays state-only. On no match the text is left alone —
+                // visible and editable is the safe fallback.
+                const token = pickedFileTokens.current[p] ?? [...buildRelMap([p], inputRef.current).keys()].map(s => `@${s}`)[0]
+                delete pickedFileTokens.current[p]
+                if (!token) return
+                const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
+              }}
+              onRemoveDir={rel => {
+                // The chip derives from the `@rel/` token, so removing the
+                // reference IS removing the token. Boundary-checked so
+                // "@src/pages/" never eats a longer "@src/pages/sub/" token.
+                const esc = `@${rel}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
+              }}
               pendingSessions={pendingSessions}
               onRemoveSessionRef={unstageSessionRef}
-              onFileSelect={path => setPendingFiles(prev => prev.includes(path) ? prev : [...prev, path])}
+              // A folder pick is complete once ChatInput inserts its `@rel/`
+              // token — the chip derives from the text, so there is no state
+              // to stage here. Files stay list-backed (uploads have no token)
+              // and additionally record their inserted token for remove.
+              onFileSelect={(path, kind, token) => {
+                if (kind === 'dir') return
+                if (token) pickedFileTokens.current[path] = token
+                setPendingFiles(prev => prev.includes(path) ? prev : [...prev, path])
+              }}
               onFileOpen={handleFileOpen}
               project={currentSlot?.project || ''}
               projectBranch={projectBranch}
@@ -5823,6 +6067,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               voiceError={voice.error}
               voiceLevel={voiceOwned ? voice.level : 0}
               voiceDeviceLabel={voiceOwned ? voice.deviceLabel : ''}
+              voiceDeviceId={voiceOwned ? voice.deviceId : ''}
               onSelectVoiceDevice={voice.switchDevice}
               voiceDeviceSwitchIsLive={voiceOwned && voice.deviceSwitchIsLive}
               onClearVoiceError={voice.clearError}
@@ -6133,6 +6378,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         activitySlot
       )}
     </div>
+    </JiraHostsCtx.Provider>
     </TagPopoverProvider>
     </RowDisclosureProvider>
   )

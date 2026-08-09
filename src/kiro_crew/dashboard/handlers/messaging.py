@@ -14,6 +14,7 @@ from typing import Any, Callable
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.browser.auth import ensure as browser_auth_ensure
 from kiro_crew.browser.command_bus import (
     DEFAULT_COMMAND_TIMEOUT_MS,
@@ -38,9 +39,15 @@ from kiro_crew.browser.setup import (
     set_browser_engine,
     set_browser_mode_enabled,
 )
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.cron import CronStoreBusy
 from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
-from kiro_crew.dashboard.chat_utils import _remove_queued_by_id, dashboard_slot_key
+from kiro_crew.dashboard.chat_utils import (
+    _remove_queued_by_id,
+    dashboard_slot_key,
+    remember_slack_options,
+    slack_options_owner_key,
+)
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.origin import is_direct_local_request, is_loopback
 from kiro_crew.dashboard.state import (
@@ -48,6 +55,7 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     DashboardState,
 )
+from kiro_crew.executors import discovery_executor
 from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
@@ -55,6 +63,8 @@ from kiro_crew.notifications.bus import (
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid_sig import verify_session_pid
 from kiro_crew.slack.format import build_options_blocks, extract_options
+from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
+from kiro_crew.subagent import validate_cwd
 from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
@@ -76,6 +86,45 @@ def _sel():
 
 
 # ── Subagents ──
+
+
+async def _warm_project_agents_for_spawn(state: Any, cwd: str) -> None:
+    """Warm the project agent-name cache for a spawn-shaped request, safely.
+
+    ``_validate_agent`` runs on the loop and therefore reads ONLY
+    ``cached_project_agent_names()``; without this warm, a spawn that names a
+    project agent is refused ("not found") until some unrelated session happens
+    to warm that project's cache. Best-effort and never raises.
+
+    A caller-supplied cwd MUST pass the same ``validate_cwd()`` gate ``spawn()``
+    itself applies BEFORE any discovery read touches it — warming first would
+    read ``<cwd>/.kiro`` from a path the allowlist rejects. That applies to a
+    STORED cwd on retry as much as a fresh one: the allowlist can have changed
+    since the original spawn (a removed root must not stay warm-able forever),
+    so the check is against the CURRENT config on every call. On rejection the
+    cwd is simply not warmed and ``spawn()`` refuses it with the real error.
+    The pool cwd is Kiro Crew's own default project dir and needs no allowlist.
+    Config load + ``validate_cwd`` (realpath/isdir) are blocking filesystem
+    work, so the whole check runs on the discovery pool.
+    """
+    warm_dir = ""
+    if cwd:
+
+        def _validated_warm_dir() -> str:
+            try:
+                allowed_roots = KiroCrewConfig.load().agent.subagent_cwd_allowed_roots
+            except Exception:
+                allowed_roots = []  # fail closed, mirroring spawn()
+            resolved, _err = validate_cwd(cwd, allowed_roots)
+            return resolved
+
+        warm_dir = await asyncio.get_running_loop().run_in_executor(
+            discovery_executor(), _validated_warm_dir
+        )
+    else:
+        warm_dir = str(getattr(state.sessions, "_pool_cwd", "") or "")
+    if warm_dir:
+        await warm_project_agent_names(warm_dir)
 
 
 async def api_spawn(request: web.Request) -> web.Response:
@@ -147,6 +196,10 @@ async def api_spawn(request: web.Request) -> web.Response:
         batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
     except (TypeError, ValueError):
         batch_total = 0
+    # The async moment preceding the synchronous spawn(): warm here so the
+    # on-loop, cache-only agent validation inside spawn() is a hit.
+    if agent:
+        await _warm_project_agents_for_spawn(state, cwd)
     info = state.subagents.spawn(
         task,
         parent_session_key=parent_session,
@@ -613,6 +666,12 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
             {"error": f"only failed agents can be retried (outcome={old.outcome})"},
             status=409,
         )
+    # Same validated warm as the primary spawn handler. old.cwd was validated
+    # at the ORIGINAL spawn, but the allowlist may have changed since (and a
+    # gateway restart leaves the cache cold), so it is re-checked against the
+    # current config before any discovery read.
+    if old.agent:
+        await _warm_project_agents_for_spawn(state, old.cwd or "")
     info = state.subagents.spawn(
         old._raw_task or old.task,
         parent_session_key=old.parent_session_key,
@@ -1175,7 +1234,11 @@ async def api_send_message(request: web.Request) -> web.Response:
             resources=f"target_user={target_user}",
         )
         return web.json_response(
-            {"error": "user not in allowlist — configure allowed_users in config.json"}, status=403
+            {
+                "error": "user not in allowlist — configure allowed_users in config.json",
+                "code": "user_not_in_allowlist",
+            },
+            status=403,
         )
 
     sent_slack = False
@@ -1332,12 +1395,41 @@ async def api_send_message(request: web.Request) -> web.Response:
                             )
                             if options:
                                 try:
-                                    await state.slack_client.post_blocks(
+                                    option_blocks = build_options_blocks(options)
+                                    # Fallback text is the SAFE stub, not the
+                                    # message body. Slack parses entities in a
+                                    # message's top-level `text` -- which is what
+                                    # notifications render -- so an agent-authored
+                                    # body containing `<!channel>` would ping the
+                                    # whole channel, and the expiry would ping it
+                                    # AGAIN every time it replays this text on its
+                                    # edit. Nothing is lost: the body was already
+                                    # posted as its own message just above, so here
+                                    # it was pure duplication. This is the same stub
+                                    # the other three posting paths use.
+                                    option_ts = await state.slack_client.post_blocks(
                                         channel,
-                                        build_options_blocks(options),
-                                        text,
+                                        option_blocks,
+                                        OPTIONS_FALLBACK_TEXT,
                                         thread_ts=thread_ts,
                                     )
+                                    # A thread IS a conversation, so bind the
+                                    # control to whichever session owns that
+                                    # thread — a dashboard session mirroring into
+                                    # it, or the Slack-born one. Without a thread
+                                    # there is no conversation to supersede it, so
+                                    # nothing is recorded.
+                                    if thread_ts and option_ts:
+                                        remember_slack_options(
+                                            state,
+                                            slack_options_owner_key(state, str(thread_ts)),
+                                            PostedOptions(
+                                                channel=channel,
+                                                ts=option_ts,
+                                                choices=tuple(options),
+                                                blocks=tuple(option_blocks),
+                                            ),
+                                        )
                                 except Exception:
                                     logger.debug(
                                         "send_message: failed to post OPTIONS blocks",
