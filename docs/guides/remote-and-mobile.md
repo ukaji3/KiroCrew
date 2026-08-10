@@ -25,7 +25,7 @@ Four parts, in the order you will need them:
   with launchd instead of systemd.
 - **Python**: 3.10 or newer (`setup.cfg` sets `python_requires = >=3.10`).
 - **Node.js**: needed to build the dashboard bundle. `website/package.json`
-  declares `"node": "20 || >=22"`; `kirocrew doctor` warns below Node 16.
+  declares `"node": ">=22"`; `kirocrew doctor` warns below Node 22.
 - **RAM**: there is no single published floor, because the footprint scales with
   concurrent sessions, spawned subagents, and MCP servers. Two figures from the
   code give you the shape of it: `acp/runtime.py` recycles a long-lived
@@ -292,6 +292,38 @@ the same and the difference is the whole security story:
   Tailscale is absent, stopped, or MagicDNS is off it contributes nothing and the
   dashboard starts exactly as before. It does not widen the network bind and does
   not change authentication — every request still needs a dashboard session.
+
+  Optionally, opt in to **identity-pinned sessions** so the session pin binds to
+  your device's daemon-verified tailnet identity instead of the tunnel's shared
+  loopback address (and the audit trail names your login instead of
+  `127.0.0.1`):
+  ```json
+  {
+    "dashboard": {
+      "tailscale": {
+        "enabled": true,
+        "trust_identity": true,
+        "allowed_logins": ["you@example.com"],
+        "pin_scope": "node"
+      }
+    }
+  }
+  ```
+  `allowed_logins` is mandatory — `trust_identity` with an empty list is refused
+  at startup, and a verified peer whose login is not listed is denied. The
+  identity is resolved from the local `tailscale whois` daemon, never from a
+  header. When identity cannot be resolved (daemon stopped, Tailscale absent,
+  Windows — where resolution is not yet verified), a NEW login falls back to
+  the ordinary token path, while a session already pinned to a tailnet
+  identity is refused ("tailnet identity unverified") until the daemon
+  answers again — an unverified proxied request can never satisfy an
+  identity pin. `pin_scope: "node"` (the default) means a leaked session cookie is
+  usable only from the original device; `"login"` relaxes that to any device
+  carrying your Tailscale identity. An ACL-tagged node is always pinned at node
+  scope regardless of `pin_scope`, because every tagged device shares the
+  literal `tagged-devices` login. Identity trust does **not** unlock the
+  config-write or secret-reveal surfaces: a tailnet request is still a proxied
+  request and those stay read-only.
 - [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) does the opposite: it
   puts the service **on the public internet**, like cloudflared and ngrok. Use it
   only if you actually want public ingress.
@@ -332,7 +364,10 @@ service installer such as `cloudflared service install`).
 > indefinitely if the browser keeps rotating its refresh cookie. For the same
 > reason the audit trail records the caller as `127.0.0.1` rather than a client
 > address. Security Posture → Dashboard token auth reports which of the two states
-> you are actually in.
+> you are actually in. The one exception is `tailscale serve` **with
+> `trust_identity` configured** (see above): there the pin binds to the
+> daemon-verified peer identity and is per-client again. For cloudflared, ngrok,
+> and Funnel the pin is always shared.
 >
 > So the real control for a tunnelled dashboard is the provider's own auth layer
 > (Cloudflare Access, or `tailscale serve`, which keeps the service inside your
@@ -342,15 +377,16 @@ service installer such as `cloudflared service install`).
 > tunnelled browser that keeps rotating stays authenticated for as long as it
 > keeps being used.
 >
-> **`kirocrew logout` does not end that.** It revokes access sessions, but it does
-> not revoke refresh chains, so a browser still holding a valid refresh cookie can
-> obtain a fresh access cookie afterwards. Restarting the gateway does not end them
-> either: a refresh cookie is self-contained and signed with the persistent
-> `token_signing.key`. Only the dashboard's own sign-out
-> (`POST /api/auth/logout`) revokes a chain, and only the chain belonging to the
-> browser that calls it. **To cut off remote access, revoke at the provider's auth
-> layer or tear the tunnel down.** This is a known gap rather than intended
-> behaviour, so check the current release notes before relying on it.
+> **`kirocrew logout` ends those sessions.** It bumps a persisted revocation
+> generation that both access and refresh tokens embed, so established access
+> cookies and refresh chains alike are rejected on their next request. The
+> dashboard's own sign-out (`POST /api/auth/logout`) is the narrower control:
+> it revokes only the chain belonging to the browser that calls it. Restarting
+> the gateway ends nothing: cookies are self-contained, signed with the
+> persistent `token_signing.key`, and the revocation generation is reloaded
+> unchanged. **To cut off remote access entirely, also revoke at the provider's
+> auth layer or tear the tunnel down** — logout ends Kiro Crew's sessions, not
+> the tunnel itself.
 > Note also that config-write and secret-reveal endpoints refuse tunnelled requests:
 > `is_direct_local_request()` treats any request carrying `Forwarded` /
 > `X-Forwarded-*` / `X-Real-IP` as remote, and every standard tunnel and reverse
@@ -405,13 +441,15 @@ an error. `kirocrew token` defaults straight to `20h`. The 5-minute click window
 is not the session length: it only means a link left sitting in a DM overnight is
 dead and you need a fresh one.
 
-**When you do need a fresh link.** Three things end a refresh chain:
+**When you do need a fresh link.** Four things end a refresh chain:
 
 - **30 days idle** — nothing opened the dashboard inside the window.
 - **Signing out in the dashboard** (`POST /api/auth/logout`) — revokes that
-  browser's chain and denylists its access cookie. `kirocrew logout` is **not**
-  equivalent: it ends access sessions globally but leaves refresh chains live, so
-  a browser still holding one mints a fresh access cookie on its next refresh.
+  browser's chain and denylists its access cookie, leaving other browsers'
+  sessions alive.
+- **`kirocrew logout`** — ends **all** sessions globally, refresh chains
+  included: it bumps a persisted revocation generation that every access and
+  refresh token embeds, so tokens minted before the logout are rejected.
 - **Reuse detection** — a consumed refresh token replayed outside a 60-second
   same-IP grace window (`REFRESH_GRACE_SECS`) auto-revokes the entire chain
   (RFC 6819 §5.2.2.3). The frontend reports `refresh_chain_revoked` and stops

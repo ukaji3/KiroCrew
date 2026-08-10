@@ -171,8 +171,10 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # version into versions.txt. The binary name is a module constant; a
         # resource ceiling / sandbox adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
-        # Tailnet origin derivation (RFC: rfc-tailnet-dashboard-access): one
-        # fixed argv, ``["<tailscale>", "status", "--json"]``, with a 3s timeout,
+        # Tailnet origin derivation + forwarded-peer whois (RFC:
+        # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
+        # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
+        # <validated tailnet address>]`` — with a 3s timeout,
         # no shell and no cwd. The binary is resolved from a vetted absolute
         # allowlist (``_CLI_CANDIDATE_PATHS``) and NOT from ``PATH`` — a ``PATH``
         # lookup made the executable itself agent-selectable even though the
@@ -184,7 +186,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # is that *nothing raises* so the gateway still boots on a host with no
         # Tailscale. Routing it would make dashboard startup depend on sandbox
         # availability, which is exactly the failure that property rules out.
-        "dashboard/tailnet.py::_run_json",
+        "dashboard/tailnet.py::_run_json_detail",
         "apps/backend.py::_proc_start_time",
         "apps/backend.py::_resolve_nvm_path",
         "apps/backend.py::stop_app_backend",
@@ -196,11 +198,23 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # scrubbed that capability would break the feature it is guarding. Gated
         # behind KIROCREW_DEBUG and reachable only from the CLI.
         "cli_perf.py::_sample_out_of_process",
-        # gh-CLI open-PR enumeration: fixed `gh api` list-argv (no shell=True);
-        # owner/repo are validated to ^[A-Za-z0-9._-]+$ by adapters.parse_repo_url
-        # and only fill the API path (bounded to api.github.com). NOT sandboxed
-        # because gh needs the host's own authenticated credentials.
-        "apps/builtins/code_review_sage/sage_lib/pipeline.py::list_open_prs",
+        # The SINGLE shared gh spawn chokepoint (github_runner.run_gh), serving
+        # Issue Radar (`_gh_run`), Code Review Sage (`run_gh_json`,
+        # `current_login`, `pipeline.list_open_prs`), and any future gh caller.
+        # A fixed `gh api`-style LIST argv (never shell=True): owner/repo
+        # segments are charset-validated (^[A-Za-z0-9._-]+$) plus a github.com
+        # host allowlist by parse_github_repo_url / adapters.parse_repo_ref
+        # before they ever reach the argv; issue numbers are int()-coerced;
+        # write bodies travel as JSON stdin (--input -), never argv; jq filters
+        # are hardcoded module constants. NOT sandbox-routed because gh needs
+        # the host's OWN authenticated session (~/.config/gh + the keychain),
+        # which the sandbox would hide, breaking auth. As defense-in-depth
+        # WITHIN this benign classification, run_gh refuses a non-absolute
+        # argv[0] (binding callers to the validated resolve_gh path, never a
+        # shim on the agent-writable front of PATH), passes a MINIMAL env
+        # (safe-key base + gh's own auth/network/TLS vars — no AWS/Slack/SSH
+        # secrets), and emits an SEL audit event on success/failure/timeout.
+        "github_runner.py::run_gh",
         # TEST-ONLY: spawns `sys.executable -c <literal>` to prove the candidate
         # read-modify-write lock holds across PROCESSES, which is what review
         # workers actually are. A single-process test cannot observe the loss it
@@ -415,47 +429,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/tests/test_profile_capture.py::_git",
         "apps/builtins/auto_improvement/tests/test_runner.py::_git",
         "apps/builtins/auto_improvement/tests/test_runner.py::_tiny_repo",
-        # Code Review Sage repo discovery — same rationale as list_open_prs above
-        # and as Issue Radar's _gh_run: fixed `gh api` list-argv (never
-        # shell=True), bounded to api.github.com, and NOT sandbox-routed because
-        # gh must reach the host's OWN authenticated credentials (~/.config/gh +
-        # the keychain), which the sandbox would hide.
-        #   • run_gh_json — the single `gh api` chokepoint. The only non-constant
-        #     input is the API path, and every caller in this module builds it
-        #     from a module constant plus a URL-encoded login (see below); the jq
-        #     filters are hardcoded module constants.
-        #   • current_login — a wholly FIXED argv (`gh api user --jq .login`) with
-        #     no interpolation at all. It is a separate spawn site only because
-        #     `--jq .login` emits a bare string, which the JSONL dict parser in
-        #     run_gh_json cannot represent.
-        # The login that reaches the events path is what gh itself reported for
-        # the authenticated user (not agent input) and is quoted with
-        # urllib.parse.quote(safe="") before interpolation. The `gh` binary is
-        # resolved through discovery.gh_bin(), which reuses source_providers'
-        # validated resolution, so a shim on the agent-writable front of PATH is
-        # refused rather than executed.
-        "apps/builtins/code_review_sage/sage_lib/discovery.py::current_login",
-        "apps/builtins/code_review_sage/sage_lib/discovery.py::run_gh_json",
-        # Issue Radar GitHub access — same rationale as list_open_prs above.
-        # ALL gh calls funnel through ONE chokepoint, _gh_run: a fixed `gh api`
-        # list-argv (never shell=True). gh supplies the host's OWN authenticated
-        # token, so it CANNOT be sandbox-routed (the sandbox would hide
-        # ~/.config/gh + the keychain, breaking auth). As defense-in-depth WITHIN
-        # this benign classification, _gh_run resolves a trusted canonical `gh`
-        # (never a shim on the agent-writable front of PATH) and passes a MINIMAL
-        # env (PATH/HOME/XDG + gh's own auth/network vars), so unrelated secrets
-        # (AWS/Slack/SSH) never reach the child. The only agent-reachable inputs:
-        #   • owner/repo — validated to ^[A-Za-z0-9._-]+$ + a github.com host
-        #     allowlist by github_client.parse_github_repo_url at /connect, and
-        #     read routes additionally gate on store.is_repo_connected, so only
-        #     an already-validated pair ever reaches the argv;
-        #   • the issue number — coerced via int() before it reaches the path;
-        #   • write bodies (label names / state reasons) — sent as a JSON stdin
-        #     body (--input -), never argv; the DELETE label name is URL-encoded
-        #     into the path.
-        # The jq filters are hardcoded module constants, and `gh api` is bounded
-        # to api.github.com, so no binary/cwd/host is agent-selected.
-        "apps/builtins/issue_radar/backend/github_client.py::_gh_run",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``). This is a TEST helper that drives one
         # in-process aiohttp handler coroutine to completion so the PR-action routes
@@ -802,6 +775,105 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "voice_reply.py::stitch_mp3s",
     }
 )
+
+
+# First-party fixed-argv spawn sites: every call site in ``src/kiro_crew`` that
+# passes the ``first_party_fixed_argv`` keyword into the sandbox chokepoint
+# (``sandboxed_spawn_argv`` / ``wrap_argv``). The flag buys an UNCONFINED spawn
+# on a backend-less host (issue #1563 carve-out), so "first-party" must be a
+# reviewed property, not a copy-pasteable kwarg: a new site must be added here
+# WITH a justification proving the full argv is derived inside this package
+# with zero agent/repo/user-config influence. Keyed by
+# ``<relpath>::<enclosing function>``, same discipline as ``BENIGN_SPAWNS``.
+FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
+    {
+        # The managed-server probe. The flag value is COMPUTED, not literal:
+        # ``_is_first_party_managed_argv`` requires the spec's command+args+env
+        # to EQUAL what this package derives for the managed server
+        # (``agent._kirocrew_mcp_invocation`` + ``agent._managed_mcp_env``, the
+        # single sources of truth the specs are force-re-resolved from) — never
+        # user-config text. Env is compared because the probe merges the spec's
+        # env into the child environment and ``LD_PRELOAD`` changes what code
+        # runs for the same argv. Third-party servers and any customized
+        # managed command/args/env compare unequal, pass False, and keep the
+        # full fail-close + opt-in behavior.
+        "mcp_discovery.py::probe_server",
+    }
+)
+
+_FIRST_PARTY_KWARG = "first_party_fixed_argv"
+
+
+@functools.lru_cache(maxsize=1)
+def _collect_first_party_flag_sites() -> frozenset[str]:
+    """``<relpath>::<func>`` for every call passing the first-party kwarg.
+
+    AST-based rather than a substring scan: it matches any ``ast.Call``
+    carrying a keyword named ``first_party_fixed_argv`` REGARDLESS of the value
+    expression — a site passing a computed bool must be reviewed exactly like
+    one passing a literal ``True`` (the computation is part of the claim).
+    Like the sibling scans in this file, ``**kwargs`` indirection is out of
+    scope (an aliased spawn already hid from the spawn detector once); the
+    PR-review gates cover deliberately obfuscated passes.
+    ``sandbox.py`` is excluded by design: it OWNS the parameter (``wrap_argv``
+    defines it; ``sandboxed_spawn_argv`` threads it through), so its internal
+    forwarding is the mechanism under audit, not a spawn site.
+    """
+    out: set[str] = set()
+    for path in _SRC_ROOT.rglob("*.py"):
+        rel = path.relative_to(_SRC_ROOT).as_posix()
+        if rel == "sandbox.py" or "builtin_skills" in path.relative_to(_SRC_ROOT).parts:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, str(path))
+        funcs = [
+            n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(kw.arg == _FIRST_PARTY_KWARG for kw in node.keywords):
+                continue
+            enc = "<module>"
+            best = -1
+            for f in funcs:
+                if f.lineno <= node.lineno <= (f.end_lineno or f.lineno) and f.lineno > best:
+                    best = f.lineno
+                    enc = f.name
+            out.add(f"{rel}::{enc}")
+    return frozenset(out)
+
+
+def test_every_first_party_spawn_is_allowlisted():
+    """A new site passing ``first_party_fixed_argv`` must be reviewed here.
+
+    The flag buys an unconfined spawn on a backend-less host, so passing it
+    from an unreviewed site is a sandbox bypass. Add the ``file::function`` key
+    to ``FIRST_PARTY_SPAWNS`` ONLY after confirming the full argv is derived
+    inside this package with zero agent/repo/user-config influence, and record
+    that reasoning in the allowlist comment.
+    """
+    unexpected = _collect_first_party_flag_sites() - FIRST_PARTY_SPAWNS
+    assert not unexpected, (
+        "New site(s) passing first_party_fixed_argv into the sandbox "
+        "chokepoint:\n  "
+        + "\n  ".join(sorted(unexpected))
+        + "\n\nThis flag permits an UNCONFINED spawn on a host with no sandbox "
+        "backend (issue #1563 carve-out). Confirm the full argv is derived "
+        "inside this package with zero agent/repo/user-config influence, then "
+        "add the file::function key to FIRST_PARTY_SPAWNS with a justification."
+    )
+
+
+def test_first_party_allowlist_has_no_stale_entries():
+    """Every FIRST_PARTY_SPAWNS entry must still name a real flag-passing site,
+    so the allowlist cannot silently accumulate dead exemptions that would mask
+    a future regression at the same key."""
+    stale = FIRST_PARTY_SPAWNS - _collect_first_party_flag_sites()
+    assert not stale, (
+        "Stale FIRST_PARTY_SPAWNS entries (no longer a first-party flag site — "
+        "remove them):\n  " + "\n  ".join(sorted(stale))
+    )
 
 
 @functools.lru_cache(maxsize=1)

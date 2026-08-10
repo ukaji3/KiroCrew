@@ -480,6 +480,26 @@ def computer_use_state_path() -> Path:
     return config_dir() / "computer_use.json"
 
 
+def oauth_endpoints_path() -> Path:
+    """Return path to oauth_endpoints.json — the operator OAuth-endpoint extension.
+
+    Same KEYSTONE reasoning as :func:`denied_commands_path` and
+    :func:`computer_use_state_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: each listed endpoint
+    widens the banner-only OAuth entropy carve-out (``security.py``'s
+    ``_OAUTH_AUTHORIZATION_ENDPOINTS``), so an agent that could write this file
+    could exempt an attacker-controlled host from the exfiltration heuristics —
+    it is a trust boundary, not a preference. ``is_sensitive_path`` blocks the
+    tool path and ``is_sensitive_bash_command`` blocks the shell forms.
+
+    Holds ``{"additional_authorization_endpoints": [{"host": …, "path": …}]}``;
+    every read fails soft to an EMPTY extension set (see
+    ``security._load_operator_oauth_endpoints``). There is no dashboard writer:
+    the operator hand-edits the file out-of-band. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "oauth_endpoints.json"
+
+
 def read_local_secret() -> str:
     """Read ``<config_dir>/.local_secret`` (the gateway IPC secret), or ``""``.
 
@@ -1527,14 +1547,16 @@ class KnowledgeConfig:
     """
 
     auto_ingest_artifacts: bool = field(
-        default=True,
+        default=False,
         metadata=_meta(
             "Auto-Ingest Artifacts",
             "Automatically ingest content-bearing local artifacts (markdown/text "
             "documents you save and iterate) into the Knowledge Library so they "
             "become searchable, keep them in sync as the artifact changes, and "
             "remove them from the Library when the artifact is deleted. They "
-            "appear as a single aggregate 'Artifacts' source. On by default.",
+            "appear as a single aggregate 'Artifacts' source. Off by default: "
+            "every ingested chunk costs an LLM extraction call, so a library "
+            "grows and spends only once you ask for it.",
         ),
     )
     auto_ingest_artifact_kinds: list[str] = field(
@@ -1587,7 +1609,7 @@ class KnowledgeConfig:
         ),
     )
     auto_add_documents: bool = field(
-        default=True,
+        default=False,
         metadata=_meta(
             "Auto-Add Documents",
             "Let the agent add documents it comes across during normal work to the "
@@ -1595,12 +1617,13 @@ class KnowledgeConfig:
             "document with its own tools, under your approval, and hands over the "
             "text -- Kiro Crew fetches nothing itself, so the doc-ingest host "
             "allowlist below does not apply. Added documents appear in a single "
-            "aggregate 'Auto-added' source you can remove in one click. On by "
-            "default. Renamed from auto_ingest_doc_links, which is still accepted.",
+            "aggregate 'Auto-added' source you can remove in one click. Off by "
+            "default: the Library should only hold what you asked it to hold. "
+            "Renamed from auto_ingest_doc_links, which is still accepted.",
         ),
     )
     auto_register_project_docs: bool = field(
-        default=True,
+        default=False,
         metadata=_meta(
             "Auto-Register Project Documents",
             "Register the documents of each project you work in as a Knowledge "
@@ -1608,9 +1631,11 @@ class KnowledgeConfig:
             "become searchable without adding the folder by hand. Only documents "
             "are taken (.md/.pdf/.docx/.org above a small size floor, excluding "
             "agent instructions, generated files and repository boilerplate) -- "
-            "never source code. No confirmation step: the document filter and the "
-            "per-sweep chunk budget below bound the cost, and deleting the source "
-            "keeps it deleted. On by default.",
+            "never source code. There is no confirmation step once enabled: the "
+            "document filter and the per-sweep chunk budget below bound the cost, "
+            "and deleting the source keeps it deleted. Off by default, because "
+            "registering a repository is a decision to spend extraction calls on "
+            "it -- turning this on opts in every project you open.",
         ),
     )
     auto_ingest_chunk_budget: int = field(
@@ -1664,6 +1689,57 @@ class KnowledgeConfig:
             "reads on.",
         ),
     )
+    sweep_chunk_budget: int = field(
+        default=500,
+        metadata=_meta(
+            "Global Sweep Chunk Budget",
+            "Maximum chunks ingested across ALL sources in a single watcher "
+            "sweep. Each chunk costs one LLM extraction call, so this is the "
+            "primary global cost control. Once reached, remaining sources are "
+            "deferred to the next sweep. "
+            "0 removes the bound.",
+        ),
+    )
+    max_sources: int = field(
+        default=50,
+        metadata=_meta(
+            "Max Sources",
+            "Maximum number of Knowledge sources that may be registered. "
+            "Prevents unbounded auto-discovery from registering hundreds of "
+            "sources when many projects are open. Registration attempts past "
+            "the cap are skipped (auto) or rejected (manual). 0 removes the "
+            "bound.",
+        ),
+    )
+    embed_rate_limit: int = field(
+        default=120,
+        metadata=_meta(
+            "Embedding Rate Limit (items/min)",
+            "Maximum embedding generations per minute across all sources. "
+            "Back-pressures the ingestion pipeline when a large backlog builds "
+            "up, preventing memory/CPU saturation from parallel embed batches. "
+            "0 removes the bound.",
+        ),
+    )
+    extraction_model: str = field(
+        default="",
+        metadata=_meta(
+            "Extraction Model",
+            "LLM model used for document extraction and summarization. Empty "
+            "uses the default model (agent.model). Set to a specific model id "
+            "(e.g. 'claude-haiku-4.5') to use a cheaper model for extraction "
+            "without changing your chat default.",
+        ),
+    )
+    extraction_pool_size: int = field(
+        default=3,
+        metadata=_meta(
+            "Extraction Pool Size",
+            "Number of concurrent LLM workers for document extraction. More "
+            "workers = faster ingestion but higher peak cost. Each worker holds "
+            "a long-lived session. Requires restart to take effect.",
+        ),
+    )
     auto_discover_folder: bool = field(
         default=False,
         metadata=_meta(
@@ -1697,11 +1773,14 @@ def _read_auto_add_documents(knowledge_data: dict) -> bool:
     value carries over instead of silently reverting to the default on upgrade.
     Canonical spelling is ``auto_add_documents``, which is what ``save()`` writes,
     so a save/load round-trip settles on it.
+
+    Absent both keys the feature is OFF: auto-ingest is opt-in, so a config that
+    never mentioned it must not start adding documents.
     """
     for key in ("auto_add_documents", "auto_ingest_doc_links"):
         if key in knowledge_data:
             return bool(knowledge_data.get(key))
-    return True
+    return False
 
 
 @dataclass
@@ -1870,6 +1949,86 @@ class TailscaleConfig:
             "still needs a dashboard session.",
         ),
     )
+    trust_identity: bool = field(
+        default=False,
+        metadata=_meta(
+            "Trust Tailnet Identity",
+            "Pin dashboard sessions arriving via `tailscale serve` to the "
+            "daemon-verified tailnet peer instead of the tunnel's shared "
+            "loopback address, and record that identity in the audit trail. "
+            "Explicit opt-in, never inferred, and requires a non-empty "
+            "allowed_logins — enabling it with an empty allowlist is refused at "
+            "load. Every failure to verify a peer falls back to the ordinary "
+            "token path. POSIX only. Takes effect on the next gateway "
+            "start (the trust settings are read once at startup).",
+        ),
+    )
+    allowed_logins: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Tailnet Logins",
+            "Tailscale logins permitted when trust_identity is on. Mandatory: "
+            "a shared tailnet can have hundreds of members, so identity trust "
+            "without an allowlist would hand each of them the dashboard. A "
+            "verified peer whose login is not listed is denied.",
+        ),
+    )
+    pin_scope: str = field(
+        default="node",
+        metadata=_meta(
+            "Pin Scope",
+            "What an identity-pinned session binds to: 'node' (default — a "
+            "leaked cookie is usable only from the original device) or 'login' "
+            "(usable from any device carrying that Tailscale identity). An "
+            "unrecognised value falls back to 'node'. An ACL-tagged node is "
+            "always pinned at node scope regardless of this setting. Takes "
+            "effect on the next gateway start.",
+        ),
+    )
+
+
+def _tailscale_config_from(raw: object) -> TailscaleConfig:
+    """Build the validated :class:`TailscaleConfig` (RFC §3/§3.1 load rules).
+
+    Two rules, both narrowing-only so a typo can never widen access:
+
+    * ``trust_identity: true`` with an empty ``allowed_logins`` is a
+      configuration error — refused with a logged reason, identity trust stays
+      OFF. Never a silently-permissive default: "any tailnet member" on a
+      shared corporate tailnet would hand the dashboard to all of them.
+    * An unrecognised ``pin_scope`` falls back to ``"node"`` (the narrower
+      scope) with a logged warning — never to ``"login"``.
+    """
+    data = _safe_dict(raw)
+    enabled = _safe_bool(data.get("enabled"), False)
+    trust_identity = _safe_bool(data.get("trust_identity"), False)
+    raw_logins = data.get("allowed_logins")
+    allowed_logins = [
+        entry.strip()
+        for entry in (raw_logins if isinstance(raw_logins, list) else [])
+        if isinstance(entry, str) and entry.strip()
+    ]
+    pin_scope = str(data.get("pin_scope") or "node").strip().lower()
+    if pin_scope not in ("node", "login"):
+        logger.warning(
+            "dashboard.tailscale.pin_scope %r is not recognised; falling back to "
+            "'node' (the narrower scope)",
+            pin_scope,
+        )
+        pin_scope = "node"
+    if trust_identity and not allowed_logins:
+        logger.error(
+            "dashboard.tailscale.trust_identity is on but allowed_logins is "
+            "empty — identity trust requires an explicit login allowlist and "
+            "stays OFF. Add the Tailscale logins you want to admit."
+        )
+        trust_identity = False
+    return TailscaleConfig(
+        enabled=enabled,
+        trust_identity=trust_identity,
+        allowed_logins=allowed_logins,
+        pin_scope=pin_scope,
+    )
 
 
 @dataclass
@@ -1952,6 +2111,18 @@ class DashboardConfig:
             "liveness probe kills at roughly 20s independently, so a value "
             "above that only takes effect for a headless gateway — the desktop "
             "probe wins first and the stack dump is lost.",
+        ),
+    )
+    cautious_boot: bool = field(
+        default=True,
+        metadata=_meta(
+            "Cautious Boot After Crash",
+            "When the gateway starts and finds a recent loop-stall crash dump "
+            "(under 30 minutes old) from the previous instance, stagger the "
+            "startup burst — MCP servers, cron scheduler, app backends, "
+            "session restores — with short pauses instead of launching "
+            "everything at once, so a host still under memory pressure is "
+            "not pushed straight back into the same collapse.",
         ),
     )
     widget_density: str = field(
@@ -2293,9 +2464,11 @@ class KiroCrewAgentConfig:
         default="",
         metadata=_meta(
             "Telegram Account",
-            "Bind this agent to a named Telegram account from "
-            "telegram.accounts. Messages received by that bot are routed to "
-            "this agent. Empty means no binding (uses default agent routing).",
+            "Deprecated and inert: a binding to a named telegram.accounts entry "
+            "no longer routes anything, because named accounts no longer start a "
+            "bot. Preserved on load and save so an existing config is not "
+            "rewritten out from under the operator.",
+            deprecated=True,
         ),
     )
 
@@ -3829,11 +4002,14 @@ _GITLAB_HOST_NAME_RE = _re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
 
 
 def _parse_telegram_accounts(raw: object) -> dict[str, "TelegramAccountConfig"]:
-    """Parse the ``telegram.accounts`` map from raw config JSON.
+    """Parse the deprecated ``telegram.accounts`` map from raw config JSON.
 
-    Each value is a dict with optional keys matching :class:`TelegramAccountConfig`.
-    Invalid entries (non-dict values, missing bot_token) are skipped so a
-    hand-edited config never crashes gateway startup.
+    Parsing is retained so a config written by an earlier release round-trips
+    through :meth:`KiroCrewConfig.save` with its tokens and allow-lists intact;
+    no bot is started from the result. Each value is a dict with optional keys
+    matching :class:`TelegramAccountConfig`. Invalid entries (non-dict values,
+    missing bot_token) are skipped so a hand-edited config never crashes
+    gateway startup.
     """
     if not isinstance(raw, dict):
         return {}
@@ -3841,9 +4017,9 @@ def _parse_telegram_accounts(raw: object) -> dict[str, "TelegramAccountConfig"]:
     for account_id, acct_data in raw.items():
         if not isinstance(account_id, str) or not isinstance(acct_data, dict):
             continue
-        # Account IDs become part of the session-key channel namespace
-        # (e.g. "telegram.finance"). Reject any that contain characters the
-        # session-key format reserves (colon, whitespace, dots) or are empty.
+        # Account IDs are held to the same shape they were accepted under, so a
+        # config that round-trips here is byte-comparable to what an earlier
+        # release wrote: alphanumeric plus dash and underscore, never empty.
         if not account_id or not account_id.replace("-", "").replace("_", "").isalnum():
             continue
         token = str(acct_data.get("bot_token", "")).strip()
@@ -3969,11 +4145,13 @@ def _coerce_int(raw: object, default: int) -> int:
 
 @dataclass
 class TelegramAccountConfig:
-    """A single named Telegram bot account within a multi-account gateway.
+    """A single named Telegram bot account, retained only to preserve config.
 
-    Each account has its own bot token and allow-list, enabling one gateway
-    process to serve multiple Telegram bots simultaneously. The account binds
-    to an agent via the agents map (``telegram_account`` field).
+    Deprecated and inert: nothing starts a bot from this entry. It stays
+    parseable and serializable so that loading and saving a config written by an
+    earlier release round-trips the operator's tokens and allow-lists instead of
+    erasing them. To serve one of these bots, move its token to
+    ``telegram.bot_token``.
     """
 
     bot_token: str = field(
@@ -4080,36 +4258,18 @@ class TelegramConfig:
         default_factory=dict,
         metadata=_meta(
             "Accounts",
-            "Named Telegram bot accounts for multi-bot operation. Each key is an "
-            "account ID (e.g. 'main', 'finance') mapping to its own bot_token and "
-            "allow-list. When present, takes precedence over the top-level "
-            "bot_token/allowed_user_ids. When absent, the top-level fields are "
-            "treated as a single 'default' account (backward compatible).",
+            "Deprecated and inert: named Telegram bot accounts no longer start a "
+            "bot. Multi-bot operation is withdrawn until a bot is a governable "
+            "unit (its own enable switch, its own posture ceiling, and honest "
+            "audit attribution) rather than a second inbound door that only the "
+            "global telegram.enabled can close. The map is still parsed and "
+            "written back so an existing config keeps its tokens and allow-lists, "
+            "but nothing reads it: move the token you want served to "
+            "telegram.bot_token.",
             tags=["telegram"],
+            deprecated=True,
         ),
     )
-
-    def resolved_accounts(self) -> dict[str, "TelegramAccountConfig"]:
-        """Return the effective account map.
-
-        If ``accounts`` is populated, return it directly. Otherwise synthesize a
-        single ``"default"`` account from the legacy top-level fields. This
-        provides full backward compatibility: existing single-token configs work
-        unchanged.
-        """
-        if self.accounts:
-            return self.accounts
-        if not self.bot_token:
-            return {}
-        return {
-            "default": TelegramAccountConfig(
-                bot_token=self.bot_token,
-                allowed_user_ids=list(self.allowed_user_ids),
-                allow_forum=self.allow_forum,
-                allowed_forum_chat_ids=list(self.allowed_forum_chat_ids),
-                soft_threshold_pct=self.soft_threshold_pct,
-            )
-        }
 
 
 @dataclass
@@ -5039,7 +5199,7 @@ class KiroCrewConfig:
                 migrated=memory_data.get("migrated", False),
             ),
             knowledge=KnowledgeConfig(
-                auto_ingest_artifacts=bool(knowledge_data.get("auto_ingest_artifacts", True)),
+                auto_ingest_artifacts=bool(knowledge_data.get("auto_ingest_artifacts", False)),
                 auto_ingest_artifact_kinds=[
                     k
                     for k in knowledge_data.get(
@@ -5068,7 +5228,7 @@ class KiroCrewConfig:
                 ),
                 auto_add_documents=_read_auto_add_documents(knowledge_data),
                 auto_register_project_docs=bool(
-                    knowledge_data.get("auto_register_project_docs", True)),
+                    knowledge_data.get("auto_register_project_docs", False)),
                 auto_ingest_chunk_budget=_safe_nonnegative_int(
                     knowledge_data.get("auto_ingest_chunk_budget", 150), 150),
                 folder_ingest_chunk_budget=_safe_nonnegative_int(
@@ -5084,6 +5244,16 @@ class KiroCrewConfig:
                 auto_discover_dirname=str(
                     knowledge_data.get("auto_discover_dirname", "knowledge-docs")
                 ).strip()[:128],
+                sweep_chunk_budget=_safe_nonnegative_int(
+                    knowledge_data.get("sweep_chunk_budget", 500), 500),
+                max_sources=_safe_nonnegative_int(
+                    knowledge_data.get("max_sources", 50), 50),
+                embed_rate_limit=_safe_nonnegative_int(
+                    knowledge_data.get("embed_rate_limit", 120), 120),
+                extraction_model=str(
+                    knowledge_data.get("extraction_model", "")).strip(),
+                extraction_pool_size=max(1, min(10, _safe_nonnegative_int(
+                    knowledge_data.get("extraction_pool_size", 3), 3))),
             ),
             telegram=TelegramConfig(
                 enabled=bool(telegram_data.get("enabled", False)),
@@ -5208,11 +5378,7 @@ class KiroCrewConfig:
             ),
             dashboard=DashboardConfig(
                 url=dashboard_data.get("url", ""),
-                tailscale=TailscaleConfig(
-                    enabled=_safe_bool(
-                        _safe_dict(dashboard_data.get("tailscale")).get("enabled"), False
-                    ),
-                ),
+                tailscale=_tailscale_config_from(dashboard_data.get("tailscale")),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
                 restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
                 surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
@@ -5228,6 +5394,7 @@ class KiroCrewConfig:
                     LOOP_STALL_EXIT_AFTER_MIN,
                     LOOP_STALL_EXIT_AFTER_MAX,
                 ),
+                cautious_boot=_safe_bool(dashboard_data.get("cautious_boot"), True),
                 auto_open_browser=dashboard_data.get("auto_open_browser", True),
                 prevent_sleep=_safe_bool(dashboard_data.get("prevent_sleep"), False),
                 quick_send=dashboard_data.get("quick_send", False),

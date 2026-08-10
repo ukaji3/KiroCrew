@@ -48,9 +48,9 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
 )
 from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS, summarize_result
-from kiro_crew.dashboard.origin import parse_dashboard_url
+from kiro_crew.dashboard.origin import dashboard_socket_path, parse_dashboard_url
 from kiro_crew.history import _SEARCH_SCAN_WINDOW as SEARCH_SCAN_WINDOW
-from kiro_crew.history import INCOGNITO_MEMORY_MODES, ConversationLog
+from kiro_crew.history import INCOGNITO_MEMORY_MODES, ConversationLog, search_query_tokens
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.embedder import create_embedder_from_config
@@ -145,6 +145,50 @@ def _resolve_api_base() -> str:
 
 
 _API = _resolve_api_base()
+
+
+def _resolve_api_unix_socket() -> str:
+    """Path of the gateway's internal-API unix socket (may not exist yet).
+
+    Preferred transport for every ``_API`` request: connecting through it lets
+    the gateway kernel-verify (``SO_PEERCRED`` + /proc ancestry) that this
+    process actually belongs to the session its ``X-Session-Key`` header
+    declares, instead of taking the header on faith. ``loopback_urlopen``
+    checks existence per call and falls back to TCP when the file is absent
+    (Windows, older gateway, bind failure) or nobody answers on it, so
+    resolving the path once at import — mirroring ``_API`` — is safe.
+    """
+    try:
+        cfg = KiroCrewConfig.load()
+        _host, port = parse_dashboard_url(cfg.dashboard.url)
+        return str(dashboard_socket_path(port))
+    except Exception:
+        return ""
+
+
+_API_UNIX_SOCKET = _resolve_api_unix_socket()
+
+
+def _api_urlopen(req: urllib.request.Request | str, timeout: float):
+    """``loopback_urlopen`` against ``_API`` with the unix-socket preference."""
+    return loopback_urlopen(req, timeout=timeout, unix_socket_path=_API_UNIX_SOCKET or None)
+
+
+# How often a sleeping `wait` polls /api/session-keepalive.
+#
+# Two jobs in one round-trip: keeping the session's activity clock warm (the
+# staleness watchdog alone would be satisfied by 60s) and collecting an
+# early-end request from the dashboard. The second job sets the value -- it is
+# the upper bound on how long the "End wait" button appears to do nothing, so
+# it is deliberately tightened to the loop's own sleep granularity. The handler
+# it calls only touches two timestamps, so a 30-minute wait costs ~360 loopback
+# POSTs and no meaningful work.
+WAIT_PING_SECS = 5.0
+
+# Ping cadence for a sleep that cannot publish (identity not authoritative, so no
+# countdown and no button). Only the staleness watchdog cares at that point, and
+# 60s satisfies it -- the same interval spawn_sub_agents' blocking poll uses.
+WAIT_STALENESS_PING_SECS = 60.0
 
 # Context cap for one `skill_fetch` body. The gateway's preview endpoint
 # already caps at 64 KiB for the dashboard's detail panel; a tool result is
@@ -2953,7 +2997,7 @@ def _post(path: str, body: dict | None = None, *, timeout: float = 30) -> dict:
     )
     try:
         # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_API from dashboard.url config) + a fixed internal path; never user-controlled  # noqa: E501
-        with loopback_urlopen(req, timeout=timeout) as resp:
+        with _api_urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         # urlopen raises HTTPError on 4xx/5xx; str(e) is only "HTTP Error 400:
@@ -3028,7 +3072,7 @@ def _get(path: str) -> dict:
         headers=headers,
     )
     try:
-        with loopback_urlopen(req, timeout=10) as resp:
+        with _api_urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return _http_error_body(e)
@@ -3054,7 +3098,7 @@ def _patch(path: str, body: dict | None = None) -> dict:
     try:
         # _API is the hardcoded loopback dashboard base and `path` is a code
         # literal — never attacker-controlled, so no file:// scheme risk.
-        with loopback_urlopen(req, timeout=30) as resp:  # nosemgrep  # noqa: E501
+        with _api_urlopen(req, timeout=30) as resp:  # nosemgrep  # noqa: E501
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return _http_error_body(e)
@@ -3086,7 +3130,7 @@ def _put(path: str, body: dict | None = None) -> dict:
     try:
         # _API is the hardcoded loopback dashboard base and `path` is a code
         # literal — never attacker-controlled, so no file:// scheme risk.
-        with loopback_urlopen(req, timeout=30) as resp:  # nosemgrep  # noqa: E501
+        with _api_urlopen(req, timeout=30) as resp:  # nosemgrep  # noqa: E501
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return _http_error_body(e)
@@ -3112,7 +3156,7 @@ def _delete(path: str, body: dict | None = None) -> dict:
         method="DELETE",
     )
     try:
-        with loopback_urlopen(req, timeout=10) as resp:
+        with _api_urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return _http_error_body(e)
@@ -3461,7 +3505,14 @@ def _extract_history_snippet(messages: list[dict], needle: str) -> str:
     # is independently callable.
     if not needle.strip():
         return ""
-    needle_cf = needle.casefold()
+    # Same tokenizer as search_sessions: that call decides a session MATCHED on
+    # scattered tokens, so searching only the whole phrase here would return ""
+    # and suppress the row's snippet for exactly the multi-word queries the
+    # token-wise match enables. Bounded + deduplicated for the same reason.
+    tokens, phrase = search_query_tokens(needle)
+    if not tokens:
+        return ""
+    needles_cf = [phrase] if tokens == [phrase] else [phrase, *tokens]
     for m in messages:
         # Only surface user/assistant content (mirror get_chat_session) so the
         # snippet is the human-facing context, not a tool/system trace blob.
@@ -3470,31 +3521,35 @@ def _extract_history_snippet(messages: list[dict], needle: str) -> str:
         content = m.get("content")
         if not isinstance(content, str) or not content:
             continue
-        idx = content.casefold().find(needle_cf)
-        if idx < 0:
-            continue
-        start = max(0, idx - _SNIPPET_RADIUS)
-        end = min(len(content), idx + len(needle) + _SNIPPET_RADIUS)
-        seg = content[start:end]
-        # Redact BEFORE inserting <<<...>>> markers: marker insertion would split
-        # a credential/URL token and defeat the contiguous-match redactors, so a
-        # query that is a substring of a secret in stored content could leak it.
-        seg = _redact_history_output(seg)
-        # Locate the match span in the (possibly redacted) original text using the
-        # SAME full casefolding as the selection above — a case-insensitive regex
-        # does only simple per-char mapping and would miss multi-char folds
-        # (ß→ss), leaving a selected-but-unwrapped snippet with no <<<...>>>.
-        span = _casefold_match_span(seg, needle_cf)
-        if span:
-            s, e = span
-            seg = seg[:s] + "<<<" + seg[s:e] + ">>>" + seg[e:]
-        seg = ("…" if start > 0 else "") + seg + ("…" if end < len(content) else "")
-        result = seg[:_SNIPPET_MAX_LEN]
-        # If the hard cap sliced through the match delimiters (possible with a
-        # long query), re-close so the consumer never sees a dangling "<<<".
-        if "<<<" in result and ">>>" not in result:
-            result = result[: _SNIPPET_MAX_LEN - 3] + ">>>"
-        return result
+        folded = content.casefold()
+        for needle_cf in needles_cf:
+            idx = folded.find(needle_cf)
+            if idx < 0:
+                continue
+            start = max(0, idx - _SNIPPET_RADIUS)
+            end = min(len(content), idx + len(needle_cf) + _SNIPPET_RADIUS)
+            seg = content[start:end]
+            # Redact BEFORE inserting <<<...>>> markers: marker insertion would
+            # split a credential/URL token and defeat the contiguous-match
+            # redactors, so a query that is a substring of a secret in stored
+            # content could leak it.
+            seg = _redact_history_output(seg)
+            # Locate the match span in the (possibly redacted) original text using
+            # the SAME full casefolding as the selection above — a case-insensitive
+            # regex does only simple per-char mapping and would miss multi-char
+            # folds (ß→ss), leaving a selected-but-unwrapped snippet with no
+            # <<<...>>>.
+            span = _casefold_match_span(seg, needle_cf)
+            if span:
+                s, e = span
+                seg = seg[:s] + "<<<" + seg[s:e] + ">>>" + seg[e:]
+            seg = ("…" if start > 0 else "") + seg + ("…" if end < len(content) else "")
+            result = seg[:_SNIPPET_MAX_LEN]
+            # If the hard cap sliced through the match delimiters (possible with a
+            # long query), re-close so the consumer never sees a dangling "<<<".
+            if "<<<" in result and ">>>" not in result:
+                result = result[: _SNIPPET_MAX_LEN - 3] + ">>>"
+            return result
     return ""
 
 
@@ -4507,9 +4562,51 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         reason_safe, _ = redact_exfiltration_urls(reason)
         reason_safe, _ = redact_credentials(reason_safe)
         deadline = time.monotonic() + seconds
-        # Ping session-keepalive every 60s so the gateway's is_responsive()
-        # doesn't flag this session as stale and SIGTERM the ACP subprocess.
+        # Identity for THIS sleep. The dashboard's "end wait now" button echoes
+        # it back through the keepalive response, so a request left over from an
+        # earlier sleep can never terminate the next one in the same session.
+        wait_id = uuid.uuid4().hex
+        # Ping session-keepalive every WAIT_PING_SECS so the gateway's
+        # is_responsive() doesn't flag this session as stale and SIGTERM the ACP
+        # subprocess -- and so the reply can carry an early-end request back.
+        #
+        # This POST is the ONLY inbound channel a sleeping wait has: the MCP
+        # subprocess runs no listener, and the one path that can interrupt it
+        # (notifications/cancelled on stdin) is a session-teardown signal that
+        # suppresses the tool's response entirely, and does not exist at all on
+        # Windows. So the ping interval IS the button's worst-case latency,
+        # which is why it matches the sleep granularity rather than the 60s the
+        # staleness watchdog alone would need.
         _next_ping = time.monotonic()
+        ended_early = False
+        # Publish wait metadata ONLY under an authoritative identity, and refuse
+        # to honour `end_wait` without one.
+        #
+        # `_resolve_session_key()` -- what `_post` puts in the X-Session-Key
+        # header -- ends its ladder with a /proc ancestor walk, which answers per
+        # RUNTIME rather than per ACP session: a subagent's MCP-core child walks
+        # up into its parent slot's process tree and resolves to the PARENT. So on
+        # a default install (gateway off, so no per-call caller context and no
+        # KIROCREW_SESSION_KEY) a subagent's sleep would publish its deadline onto
+        # the parent's slot, and the parent's End-wait button would return the
+        # SUBAGENT's wait. No frontend guard can catch that: with only one wait_id
+        # pinging there is no collision to detect.
+        #
+        # `_resolve_session_key_strict()` is the existing primitive for exactly
+        # this class of session-mutating tool (monitor_start, autonudge_stop,
+        # set_project) -- it drops the walk and accepts only gateway-injected
+        # caller context, KIROCREW_SESSION_KEY, or a HMAC-verified pid sidecar.
+        # When it comes back empty the identity is a guess, so the ping degrades
+        # to the original `{}` touch: the session still cannot be reaped
+        # mid-sleep, and the countdown simply never appears. Tracked in #2347,
+        # which is the work that lets this gate go away.
+        _identified = bool(_resolve_session_key_strict())
+        # The 5s cadence exists ONLY to bound how long the button appears to do
+        # nothing. An unidentified sleep publishes nothing and honours no
+        # end_wait, so it has no button and would be paying a 12x request
+        # multiplier for a latency nobody can observe; it reverts to the 60s the
+        # staleness watchdog actually needs.
+        _ping_secs = WAIT_PING_SECS if _identified else WAIT_STALENESS_PING_SECS
         while True:
             now = time.monotonic()
             remaining = deadline - now
@@ -4520,17 +4617,68 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 raise ToolCancelled(f"wait cancelled after {seconds - remaining:.0f}s")
             if now >= _next_ping:
                 try:
-                    _post("/api/session-keepalive", {})
+                    reply = _post(
+                        "/api/session-keepalive",
+                        {
+                            "wait_id": wait_id,
+                            "seconds": seconds,
+                            "remaining": max(0, int(remaining)),
+                            # Lets the dashboard derive a liveness window for
+                            # this sleep without importing this module's
+                            # constant -- see _service_wait_ping's collision
+                            # guard, which needs to know how stale a ping has to
+                            # be before the sleep behind it is presumed gone.
+                            "interval": _ping_secs,
+                        }
+                        if _identified
+                        else {},
+                    )
                 except Exception:
-                    pass  # keepalive is best-effort
-                _next_ping = now + 60.0
-            time.sleep(min(5, remaining))
+                    reply = {}  # keepalive is best-effort
+                # Only a request naming this wait ends it. `_post` returns
+                # {"error": ...} on a failed round-trip rather than raising, so
+                # the equality check doubles as the error guard. Gated on
+                # `_identified` too: an unidentified sleep sends no wait_id, so a
+                # matching reply could only mean the backend is answering about
+                # somebody else's wait.
+                if (
+                    _identified
+                    and isinstance(reply, dict)
+                    and reply.get("end_wait") == wait_id
+                ):
+                    ended_early = True
+                    break
+                _next_ping = now + _ping_secs
+            time.sleep(min(_ping_secs, remaining))
+        waited = max(0, int(seconds - max(0.0, deadline - time.monotonic())))
         sel().log_tool_invocation(
             session_key=_resolve_session_key(),
             source="mcp",
             tool_name="wait",
             outcome="success",
         )
+        # Retire the countdown card. The tool result travels back through
+        # kiro-cli, which the dashboard cannot correlate to this wait_id, so the
+        # sleep has to announce its own end. Best-effort: a slot whose wait
+        # state is stale also clears at turn end (chat_runner) and renders
+        # nothing once the turn stops running. Skipped entirely when the identity
+        # was never authoritative -- nothing was ever published, so there is
+        # nothing to retire, and sending a wait_id under a guessed key could
+        # blank a countdown belonging to a different session.
+        if _identified:
+            try:
+                _post("/api/session-keepalive", {"wait_id": wait_id, "wait_done": True})
+            except Exception:
+                pass
+        # Deliberately a normal return, NOT ToolCancelled: _run_tool suppresses
+        # the response of a cancelled call, so raising here would leave kiro-cli
+        # waiting on a tool result that never arrives until the 600s stall
+        # watchdog kills the session. Ending a wait early continues the turn.
+        if ended_early:
+            return (
+                f"Wait ended early by the user after {waited}s of {seconds}s. "
+                f"Resuming: {reason_safe}"
+            )
         return f"Waited {seconds}s. Resuming: {reason_safe}"
 
     if name == "select_crew":
@@ -5156,7 +5304,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             f"{_API}/api/artifacts/{slug}", data=data, headers=headers, method="PATCH"
         )
         try:
-            with loopback_urlopen(req, timeout=30) as http_resp:
+            with _api_urlopen(req, timeout=30) as http_resp:
                 d = json.loads(http_resp.read())
         except urllib.error.HTTPError as exc:
             try:
@@ -5218,7 +5366,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             f"{_API}/api/artifacts/{slug}", data=data, headers=headers, method="PATCH"
         )
         try:
-            with loopback_urlopen(req, timeout=30) as http_resp:
+            with _api_urlopen(req, timeout=30) as http_resp:
                 d = json.loads(http_resp.read())
         except urllib.error.HTTPError as exc:
             try:

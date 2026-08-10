@@ -244,9 +244,24 @@ _NATIVE_OPS: dict[str, str] = {
 # failures clear it, so closing the panel restores full Playwright behaviour.
 _native_panel_seen = False
 
-# Error text from the Electron side meaning "no view/panel to drive" rather than
-# "not allowed to drive it". An absent panel is a transport gap; a deny is not.
-_NATIVE_ABSENT_MARKERS = ("no-browser-view", "no native browser panel", "no-native-panel")
+# Error text from the Electron side meaning "fall back to Playwright" rather than
+# "this operation is forbidden".
+#
+# An absent panel is a transport gap; a deny is not, and a deny must stay fatal --
+# falling back would re-run the op on Playwright's page and turn a refusal into an
+# allow by another route (see test_refusal_returns_an_mcp_error_and_does_not_fall_back).
+#
+# Keep this list to genuine ABSENCE. An earlier revision of the native-default work
+# added an authorization-shaped reason here (`agent-act-consent-required`) to cover a
+# per-session consent model that no longer exists; nothing emitted it once that model
+# was removed, leaving a dead branch that pre-authorized a future consent-shaped deny
+# to degrade into a silent mirror fallback. Authorization now lives entirely in
+# Browser Mode, so a deny reaching this proxy is always final.
+_NATIVE_ABSENT_MARKERS = (
+    "no-browser-view",
+    "no native browser panel",
+    "no-native-panel",
+)
 
 
 def _names_absent_panel(detail: str) -> bool:
@@ -809,6 +824,17 @@ def _try_native_tool_call(msg: dict[str, Any]) -> dict[str, Any] | None:
     """
     if msg.get("method") != "tools/call":
         return None
+    # Extension mode is an explicit user choice: the operator turned on
+    # ``extension_mode`` in Settings so Playwright drives their OWN running,
+    # logged-in browser via the Playwright extension + token. Native routing must
+    # NEVER override that deliberate choice -- so we yield here and let the call
+    # fall through to Playwright (which, in extension mode, acts on the user's own
+    # browser). This is WHY the guard lives in the routing path and not only in the
+    # frame-send path: suppressing the dashboard mirror is not enough; if native
+    # routing captured the op the user's browser would be silently hijacked even
+    # though no native op ever reached them.
+    if _EXTENSION_MODE:
+        return None
     global _native_panel_seen
     params = msg.get("params") or {}
     name = params.get("name") or ""
@@ -1057,6 +1083,32 @@ def run_proxy(args: list[str]) -> None:
     from kiro_crew.env import node_augmented_path
 
     os.environ["PATH"] = node_augmented_path(os.environ.get("PATH", ""))
+
+    # Self-heal a stale config BEFORE handing it to @playwright/mcp: a
+    # contextOptions.storageState pointing at a missing file makes Playwright
+    # raise ENOENT at context creation, breaking every browser_* call (#2491).
+    # This spawn is the config's load moment — the one place every config-mode
+    # launch passes through — so repairing here (the helper drops the dangling
+    # key and rewrites the file to disk) closes the trap for configs written
+    # before the #2209 generation-time fix or whose storage-state file was
+    # later removed. No-config (extension-mode) launches skip this entirely.
+    # Both argv shapes @playwright/mcp accepts are matched: ``--config <path>``
+    # and ``--config=<path>``.
+    config_arg: str | None = None
+    for i, arg in enumerate(args):
+        if arg == "--config" and i + 1 < len(args):
+            config_arg = args[i + 1]
+            break
+        if arg.startswith("--config="):
+            config_arg = arg.split("=", 1)[1]
+            break
+    if config_arg:
+        # circular import: browser.setup imports from THIS module at its
+        # top level, so import at call time (once per proxy spawn, not hot).
+        from kiro_crew.browser.setup import repair_playwright_config
+
+        repair_playwright_config(config_arg)
+
     playwright_cmd = _resolve_playwright_cmd()
     if playwright_cmd is None:
         error_resp = {

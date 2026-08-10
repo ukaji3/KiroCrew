@@ -722,6 +722,43 @@ _SANDBOX_ERR_MAX = 900
 # an arbitrarily long stderr from a broken repo.
 _GIT_ERR_MAX = 300
 
+# Identity for the "no trusted executable" failure, so callers can branch on
+# the CLASS of failure instead of re-matching prose: `_run_cmd` puts this
+# prefix on the stderr it synthesizes when `_trusted_bin` resolves nothing,
+# and error paths that want to name the remedy (set the per-tool override in
+# the service environment) test `startswith` on it. Deliberately a constant,
+# not an exception type: `_run_cmd` reports every failure through its
+# (rc, stdout, stderr) tuple and callers already handle it that way.
+_UNRESOLVED_TOOL_PREFIX = "no trusted executable for "
+
+
+def _bin_override_var(name: str) -> str:
+    """Env var that overrides trusted-bin resolution for *name*.
+
+    Single source of truth shared by `_trusted_bin` (which reads it) and the
+    user-facing remedy messages (which name it) — deriving it twice is how the
+    advertised remedy drifts from the one that works.
+    """
+    return f"KIROCREW_DEVFLEET_BIN_{name.upper().replace('-', '_')}"
+
+
+def _unresolved_tool_message(name: str) -> str:
+    """User-facing message for an unresolved trusted tool.
+
+    Blames the HOST toolchain, not the checkout (issue #2530: the previous
+    wording folded this failure into "git worktree discovery failed in
+    <repo>", sending users to debug a healthy repository), and names the
+    operator remedy in the same voice as the missing-checkout branch. The
+    trusted-PATH detail stays in the log line, not here: it is unactionable
+    noise in a UI banner.
+    """
+    return (
+        f"no trusted {name!r} executable found on this host — the checkout "
+        f"itself is not the problem. Set {_bin_override_var(name)} to an "
+        f"absolute path in the gateway's service environment (it needs a "
+        "restart to be seen)."
+    )
+
 
 def _trusted_bin(name: str) -> str | None:
     """Resolve *name* to a canonical executable in a system or Homebrew bin dir.
@@ -739,7 +776,7 @@ def _trusted_bin(name: str) -> str | None:
     # system dirs (e.g. gh in ~/.local/bin): an explicit absolute path set
     # in the SERVICE environment (operator-owned unit file), never derived
     # from the inherited PATH.
-    override = os.environ.get(f"KIROCREW_DEVFLEET_BIN_{name.upper().replace('-', '_')}")
+    override = os.environ.get(_bin_override_var(name))
     if override and Path(override).is_absolute() and Path(override).is_file() \
             and os.access(override, os.X_OK):
         _TRUSTED_BIN_CACHE[name] = override
@@ -802,7 +839,7 @@ def _toolchain_bin(name: str) -> str | None:
 
     Managed toolchain first, system npm second: a distribution's node can be
     older than ``website/package.json``'s ``engines`` (Amazon Linux 2023 ships
-    node 18 against ``20 || >=22``), while ``ensure-node.sh`` installs a version
+    node 18 against ``>=22``), while ``ensure-node.sh`` installs a version
     chosen to satisfy the build.
     """
     return find_node_tool(name, _TRUSTED_PATH) or _trusted_bin(name)
@@ -830,7 +867,9 @@ async def _run_cmd(
     if cmd and "/" not in cmd[0]:
         trusted = _trusted_bin(cmd[0])
         if trusted is None:
-            return -1, "", f"no trusted executable for {cmd[0]!r} in {_TRUSTED_PATH}"
+            return -1, "", (
+                f"{_UNRESOLVED_TOOL_PREFIX}{cmd[0]!r} in {_TRUSTED_PATH}"
+            )
         cmd = [trusted, *cmd[1:]]
     base_env["PATH"] = _TRUSTED_PATH
     base_env.update(_GIT_ENV_NEUTRALIZERS)
@@ -1509,6 +1548,15 @@ async def _discover_worktrees() -> list[dict]:
             # swallow the fix. Keep a generous bound purely to stop an unbounded
             # stderr reaching the UI.
             raise RuntimeError(raw[:_SANDBOX_ERR_MAX])  # already prefixed by _run_cmd
+        if raw.startswith(_UNRESOLVED_TOOL_PREFIX):
+            # git never ran: the HOST has no git the resolver is willing to
+            # execute. Checked before the .git probe because the probe's
+            # outcome is irrelevant here — wrapping this in "worktree
+            # discovery failed in <repo>" (the old behavior) sent users to
+            # debug a healthy checkout (#2530). The trusted-PATH detail is
+            # operator-diagnostic, so it goes to the log, not the banner.
+            logger.warning("dev-fleet: %s", raw)
+            raise RuntimeError(_unresolved_tool_message("git"))
         # Every other git failure was previously swallowed into a silent [] —
         # which the UI renders as the "No worktrees found / Nothing under the
         # worktrees root yet" empty state. When MAIN_REPO is wrong that empty
@@ -2886,6 +2934,49 @@ def _venv_python(repo: str) -> Path | None:
     return None
 
 
+def _write_locked_console_scripts(venv_python: Path) -> list[str]:
+    """The venv's ``kirocrew`` console scripts that cannot currently be rewritten.
+
+    Windows holds a mandatory lock on a running executable's image, so when the
+    gateway is served BY the very venv pip is about to reinstall into — the
+    ordinary single-checkout setup — pip cannot replace
+    ``Scripts\\kirocrew.exe``, and the reinstall can never succeed.
+
+    That matters well beyond one failed step. pip's uninstall is not atomic: by
+    the time it reaches the locked script it has already renamed the dist-info
+    aside and deleted the editable ``.pth`` that puts ``src`` on ``sys.path``,
+    and it rolls back neither. The venv is left unable to import the package at
+    all, which also kills the console script the gateway is restarted through.
+    The running process survives on already-imported modules, so the damage
+    stays invisible until the next restart fails.
+
+    Probing with an ``r+b`` open is non-destructive and discriminates correctly:
+    a running executable refuses it while every other script in the same
+    directory opens fine. It does not model every way a delete can fail — an
+    opener that permits writes but denies deletes would pass this probe — so a
+    clean result means "no known blocker", not a guarantee. A miss simply leaves
+    the previous behaviour, which is why this is worth doing even though it
+    cannot be exhaustive.
+
+    POSIX returns nothing: an executing binary can be unlinked there, which is
+    why pip has always been able to replace it.
+    """
+    if not platform_compat.IS_WINDOWS:
+        return []
+    locked: list[str] = []
+    for exe in sorted(Path(venv_python).parent.glob("kirocrew*.exe")):
+        try:
+            with exe.open("r+b"):
+                pass
+        except PermissionError:
+            locked.append(str(exe))
+        except OSError:
+            # Unreadable for some other reason. Let pip be the judge rather than
+            # skipping a step that might well have succeeded.
+            continue
+    return locked
+
+
 async def _sync_start_locked() -> dict:
     """Start the sync run. Caller holds _SYNC_LOCK."""
     global _SYNC_RID  # noqa: F824 (assigned below after await)
@@ -2914,17 +3005,30 @@ async def _sync_start_locked() -> dict:
         )}
     # Both binary lookups stat the filesystem (`_trusted_bin` walks the trusted
     # dirs; `_toolchain_bin` adds a `shutil.which` over the node bin dirs, which
-    # may be NFS-backed). Resolve them together on the executor so /api/sync
-    # cannot stall the gateway's requests and liveness behind a directory scan.
+    # may be NFS-backed). The console-script probe opens files in the target
+    # venv. Resolve them together on the executor so /api/sync cannot stall the
+    # gateway's requests and liveness behind a directory scan.
     loop = asyncio.get_running_loop()
-    git_bin, npm_bin = await loop.run_in_executor(
+    git_bin, npm_bin, locked_scripts = await loop.run_in_executor(
         subprocess_executor(),
-        lambda: (_trusted_bin("git"), _toolchain_bin("npm")),
+        lambda: (
+            _trusted_bin("git"),
+            _toolchain_bin("npm"),
+            _write_locked_console_scripts(target_py),
+        ),
     )
     if git_bin is None:
-        return {"ok": False, "error": (
-            f"no trusted executable for 'git' in {_TRUSTED_PATH}"
-        )}
+        # Same failure class as the discovery path: name the remedy in the
+        # response; the log records the event. The searched dirs are the
+        # static _TRUSTED_BIN_DIRS constant (and the discovery-path warning
+        # already prints them when it fires) — repeating them here trips
+        # CodeQL's name-based secret heuristic on _TRUSTED_PATH for no
+        # diagnostic gain.
+        logger.warning(
+            "dev-fleet: %s'git' — no trusted-dir candidate passed vetting "
+            "and no override is set", _UNRESOLVED_TOOL_PREFIX
+        )
+        return {"ok": False, "error": _unresolved_tool_message("git")}
     if npm_bin is None:
         # Drop the memoized resolution so the remedy this message advertises
         # actually works. `node_bin_dirs()` is lru_cached and `_BUILD_PATH_CACHE`
@@ -2944,6 +3048,45 @@ async def _sync_start_locked() -> dict:
             "KIROCREW_NODE_BIN_DIR=/abs/path/to/node/bin in the gateway's "
             "service environment; that one does need a restart, because a "
             "running process cannot see a new environment variable."
+        )}
+    if locked_scripts:
+        # Refuse the WHOLE sync rather than omitting just the reinstall.
+        #
+        # pip cannot replace a running executable on Windows, and its uninstall
+        # is not atomic: it renames the dist-info aside and deletes the editable
+        # `.pth` before it reaches the locked script, rolling back neither. That
+        # alone argues for not starting pip.
+        #
+        # But merging without installing is not a safe consolation prize. A
+        # revision that adds a dependency would land on disk with that dependency
+        # absent, the run would exit 0, and the UI would offer "restart gateway
+        # to apply" — so the next restart imports the new code, fails on the
+        # missing import, and the gateway does not come back. Any newly spawned
+        # subprocess hits the same gap even without a restart. That is the same
+        # unstartable-gateway outcome this guard exists to prevent, just later
+        # and with a success report in front of it.
+        #
+        # The checkout is therefore left at a revision whose dependencies are
+        # satisfied, and the remedy names itself.
+        return {"ok": False, "error": (
+            "refusing to sync: cannot reinstall into the venv this gateway runs "
+            f"from. {', '.join(locked_scripts)} is locked by a running process, so "
+            "a reinstall cannot replace it — and pip's uninstall is not "
+            "atomic, so attempting it would strip the editable install on the way "
+            "out and leave the venv unable to import the package at all. Pulling "
+            "without installing is refused too: a revision whose new dependencies "
+            "are missing crashes the gateway on its next restart. Stop the gateway "
+            "and sync from a terminal instead: "
+            # Every path is absolute and quoted. `-e .` would resolve against the
+            # terminal's cwd, and this project's normal working state is several
+            # worktrees side by side — so a command copied out of a feature
+            # worktree would install THAT checkout into the primary venv and
+            # repoint its editable install at the wrong tree. `git -C` already
+            # pins the pull, which makes an unpinned `.` actively misleading:
+            # the line reads as if it were cwd-independent. Quoting covers the
+            # spaces that are normal in a Windows home directory.
+            f'git -C "{MAIN_REPO}" pull --ff-only '
+            f'&& "{target_py}" -m pip install -e "{MAIN_REPO}"'
         )}
     raw_steps: list[tuple[list[str], str, dict, str]] = [
         ([git_bin, "fetch", remote, BASE_BRANCH], "standard",
@@ -3013,11 +3156,30 @@ async def _sync_start_locked() -> dict:
         wrapped_steps.append({"argv": w_argv, "env": w_env, "label": label})
     script = (
         "import subprocess, sys, json\n"
+        # Align the writer with the reader. `_start_run` decodes this stream as
+        # UTF-8 (`line.decode(errors="replace")`), but a piped stdout on Windows
+        # encodes with the process locale codepage — so any non-ASCII that ever
+        # reaches a print here would be mangled at best and raise
+        # UnicodeEncodeError at worst, killing the runner before its first step.
+        # errors="replace" additionally guarantees no print can be fatal.
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
         f"steps = json.loads({json.dumps(json.dumps(wrapped_steps))})\n"
         f"cwd = {json.dumps(MAIN_REPO)}\n"
         "for i, st in enumerate(steps):\n"
         "    print(f'::step::{i}::{st[\"label\"]}', flush=True)\n"
-        "    r = subprocess.run(st['argv'], cwd=cwd, env=st['env'])\n"
+        # reconfigure() above rebinds only THIS process's stdout object. Each
+        # step is a separate process that inherits the same pipe and re-derives
+        # its own encoding from the locale, so the Python steps — pip, and the
+        # build-and-stage child — would still encode a non-ASCII checkout path
+        # with the codepage and die on it. Set it in the environment, which is
+        # the only channel that reaches a child, so the whole pipe is UTF-8 from
+        # every writer the reader has to decode. Non-Python steps (git, npm)
+        # ignore the variable and are unaffected. Assigned rather than
+        # defaulted: the reader's encoding is fixed, so a divergent inherited
+        # value would be the defect, not a preference to preserve.
+        "    env = dict(st['env'])\n"
+        "    env['PYTHONIOENCODING'] = 'utf-8:replace'\n"
+        "    r = subprocess.run(st['argv'], cwd=cwd, env=env)\n"
         "    if r.returncode != 0:\n"
         "        sys.exit(r.returncode)\n"
     )

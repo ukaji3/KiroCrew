@@ -80,8 +80,8 @@ from kiro_crew.constants import CHAT_TURN_TIMEOUT, DATA_WARNING
 from kiro_crew.context import ContextBuilder
 from kiro_crew.context_management import summarize_result
 from kiro_crew.cron import CronJob, CronService, CronStoreBusy, build_cron_session_context
-from kiro_crew.cron_script import resolve_script_path, run_command_sandboxed, run_script_sandboxed
-from kiro_crew.dashboard import start_dashboard
+from kiro_crew.cron_script import run_command_sandboxed, run_script_sandboxed
+from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _run_chat
 from kiro_crew.dashboard.chat_utils import (
@@ -148,6 +148,7 @@ from kiro_crew.llm_helpers import (
     save_conversation_turn_off_loop,
     stream_and_collect,
 )
+from kiro_crew.mcp_cron import vet_job_at_fire_time
 from kiro_crew.mcp_gateway import is_gateway_supported
 from kiro_crew.mcp_gateway.manager import (
     GatewayManager,
@@ -881,9 +882,28 @@ class GatewayOrchestrator:
         # cfg.telegram.bot_token; all other settings come from the typed
         # cfg.telegram dataclass (no ad-hoc config.json re-parse).
         self._telegram_bot_token = creds.get(CRED_TELEGRAM_BOT_TOKEN, "") or cfg.telegram.bot_token
+        # telegram.accounts is deprecated and inert, and while it is set the channel
+        # stays OFF rather than falling back to the top-level token. A config that
+        # named accounts served ONLY those accounts — the top-level bot_token and
+        # allowed_user_ids were shadowed — so serving them now would reopen a bot
+        # the operator had stopped, under an allow-list they may have narrowed when
+        # they migrated. Staying off preserves what the accounts block already did
+        # and leaves re-enabling an explicit edit.
         self._telegram_enabled = bool(
-            cfg.telegram.enabled and (self._telegram_bot_token or cfg.telegram.accounts)
+            cfg.telegram.enabled and self._telegram_bot_token and not cfg.telegram.accounts
         )
+        if cfg.telegram.accounts:
+            logger.warning(
+                "telegram.accounts is no longer served (%d account(s): %s) — multi-bot "
+                "operation is withdrawn until a bot is a governable unit, and the "
+                "Telegram channel stays OFF while telegram.accounts is set (these "
+                "entries already shadowed the top-level token, so falling back to it "
+                "would start a bot you had stopped). Remove the accounts block and put "
+                "the one token you want served in telegram.bot_token; the entries are "
+                "preserved in config until you do.",
+                len(cfg.telegram.accounts),
+                ", ".join(sorted(cfg.telegram.accounts)),
+            )
         self._telegram_allowed_user_ids: list[int] = list(cfg.telegram.allowed_user_ids)
         # Forum-topic gate (fail closed): serve supergroup forum Topics only when
         # allow_forum is set AND the supergroup's chat_id is allow-listed.
@@ -1991,23 +2011,27 @@ class GatewayOrchestrator:
                         )
                     # Re-run governance at fire time, not just at cron_add authoring
                     # time. A job vetted when it was scheduled can outlive a later
-                    # policy tightening: mcp_cron._vet_cron_capability_governance and
-                    # _vet_command_governance only run once, at authoring, so a
-                    # ceiling change has no effect on an already-scheduled job until
-                    # someone notices and re-authors it. Denial here does not delete
-                    # the job, so a later policy loosening lets it resume on its own.
-                    from kiro_crew.mcp_cron import (
-                        _vet_command_governance,
-                        _vet_cron_capability_governance,
-                    )
-
-                    gate_reason = _vet_cron_capability_governance() or _vet_command_governance(
-                        job.command
+                    # policy tightening: the mcp_cron _vet_* gates only run once, at
+                    # authoring, so a ceiling change has no effect on an
+                    # already-scheduled job until someone notices and re-authors it.
+                    # Denial here does not delete the job, so a later policy
+                    # loosening lets it resume on its own. vet_job_at_fire_time is
+                    # the shared gate for all three job kinds (command/script/message).
+                    # Off-loop: the script variant of this gate reads the script
+                    # file from disk, and governance profile resolution can touch
+                    # the filesystem too — neither may block the event loop.
+                    gate_reason = await asyncio.get_running_loop().run_in_executor(
+                        cron_executor(), vet_job_at_fire_time, job
                     )
                     if gate_reason:
+                        # Deliberately NOT record_failure(): a governance denial
+                        # is a policy state, not a job defect. Counting it would
+                        # auto-pause the job after _AUTO_PAUSE_THRESHOLD fires,
+                        # and a paused job never fires again — breaking the
+                        # documented resume-on-policy-loosening semantic.
                         job.last_status = "error"
                         job.last_error = redact(gate_reason)
-                        job.record_failure()
+                        job.fire_time_denied = True
                         try:
                             sel().log_tool_invocation(
                                 session_key=f"cron:{job.id}",
@@ -2120,8 +2144,38 @@ class GatewayOrchestrator:
                         logger.debug(
                             "SEL logging failed in cron script invoked path", exc_info=True
                         )
-                    # Validate path before spawning subprocess
-                    resolve_script_path(job.script)
+                    # Fire-time governance gate — mirrors the command path above.
+                    # vet_job_at_fire_time re-runs the capabilities.cron gate AND
+                    # re-scans the script BODY on the freshly re-resolved path
+                    # (which also validates the path, as the bare
+                    # resolve_script_path call here previously did), so a policy
+                    # tightened after scheduling — or a script file edited on disk
+                    # after authoring — denies this run. The job is kept: a later
+                    # policy loosening lets it resume on its own.
+                    # Off-loop: reads the script body from disk (up to the scan
+                    # cap) — must not block the event loop on a wedged FS.
+                    gate_reason = await asyncio.get_running_loop().run_in_executor(
+                        cron_executor(), vet_job_at_fire_time, job
+                    )
+                    if gate_reason:
+                        # No record_failure() — see the command-path deny above:
+                        # a policy denial must not feed the auto-pause counter.
+                        job.last_status = "error"
+                        job.last_error = redact(gate_reason)
+                        job.fire_time_denied = True
+                        try:
+                            sel().log_tool_invocation(
+                                session_key=f"cron:{job.id}",
+                                tool_name=job.script,
+                                tool_kind="cron_script",
+                                outcome="denied",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "SEL logging failed in cron script fire-time deny path",
+                                exc_info=True,
+                            )
+                        return None
                     # Run in sandboxed subprocess via wrap_argv()
                     script_timeout = job.timeout or 30
                     result = await asyncio.wait_for(
@@ -2262,6 +2316,35 @@ class GatewayOrchestrator:
                     return None
                 finally:
                     self._running_script_ids.discard(job.id)
+
+            # ── Fire-time governance gate: message (LLM) jobs ──
+            # Command and script jobs are gated inside their blocks above; a job
+            # reaching this point dispatches an LLM turn. Message jobs previously
+            # had NO fire-time capabilities.cron check at all, so disabling the
+            # cron capability after scheduling never affected them. Same deny
+            # semantics as the other kinds: mark the run failed, keep the job.
+            # Off-loop for the same reason as the command/script sites above.
+            gate_reason = await asyncio.get_running_loop().run_in_executor(
+                cron_executor(), vet_job_at_fire_time, job
+            )
+            if gate_reason:
+                # No record_failure() — see the command-path deny above: a
+                # policy denial must not feed the auto-pause counter.
+                job.last_status = "error"
+                job.last_error = redact(gate_reason)
+                job.fire_time_denied = True
+                try:
+                    sel().log_tool_invocation(
+                        session_key=f"cron:{job.id}",
+                        tool_name="cron_message_dispatch",
+                        tool_kind="cron_message",
+                        outcome="denied",
+                    )
+                except Exception:
+                    logger.debug(
+                        "SEL logging failed in cron message fire-time deny path", exc_info=True
+                    )
+                return None
 
             def _cron_extra_env() -> dict[str, str] | None:
                 """job.env plus KIROCREW_APPROVAL_MODE when the job runs auto.
@@ -6230,6 +6313,13 @@ class GatewayOrchestrator:
         from kiro_crew.slack.events import SeenCache, init_socket_mode
         from kiro_crew.slack.interactions import init as init_interactions
 
+        # Cautious boot: decide ONCE — off-loop — whether the previous instance
+        # left a recent loop-stall crash dump. If it did, the pause_before()
+        # calls below (and in start_dashboard) stagger the startup battery so
+        # a host that is possibly still under the same memory pressure is not
+        # hit with everything at once. Fails open: any error means normal boot.
+        await cautious_boot.initialize()
+
         seen = SeenCache()
         self._init_services()
 
@@ -6248,8 +6338,13 @@ class GatewayOrchestrator:
         # rewriter writes the agent-JSON overlay first so kiro-cli picks up
         # the broker-wired MCP entries the moment a session starts.  No-op
         # when ``mcp_gateway.enabled`` is False.
+        await cautious_boot.pause_before("MCP gateway sidecar")
         await self._init_mcp_gateway()
 
+        # Arming the cron scheduler fires any overdue jobs immediately, so
+        # under cautious boot this pause also defers the post-restart cron
+        # catch-up burst out of the app/MCP launch window.
+        await cautious_boot.pause_before("cron scheduler")
         await self._init_cron()
         await self._init_heartbeat()
         self._init_mcp_discovery()

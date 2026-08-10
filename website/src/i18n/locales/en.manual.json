@@ -1685,6 +1685,11 @@
       "restart_update": "Restart & Update",
       "restarting": "Restarting..."
     },
+    "voiceDisabledModal": {
+      "voice_not_available_remote": "Voice input may not work here",
+      "voice_remote_instance_body": "Voice input on a remote instance requires microphone permission delegation across the iframe boundary. This may not work reliably depending on browser security policies and the parent's configuration.",
+      "voice_remote_instance_hint": "If the mic doesn't respond, use the local dashboard's voice input instead."
+    },
     "voiceStatusBar": {
       "default_microphone": "Default microphone"
     },
@@ -1710,7 +1715,9 @@
       "exit_expanded_preview": "Collapse",
       "expand_preview": "Expand preview",
       "expand_preview_hide_nav_sessions": "Expand (hide nav and sessions)",
-      "responsive_desktop": "Responsive (desktop)"
+      "responsive_desktop": "Responsive (desktop)",
+      "can_t_preview_this_dashboard_here": "Can't preview this dashboard here",
+      "this_url_is_the_dashboard_s_own_server_which_ref": "This URL is the dashboard's own server, which refuses to be embedded. Enter a dev server URL instead."
     },
     "welcomeView": {
       "autopilot": "Autopilot",
@@ -2335,11 +2342,9 @@
       },
       "sideChat": {
         "ask_a_side_question_2": "Ask a side question…",
-        "copied": "Copied!",
         "queue_cancel_failed": "Could not cancel that queued question",
         "queue_edit_failed": "Could not update that queued question",
-        "steer_demoted_to_queue": "The turn ended — queued instead",
-        "steered": "Steered"
+        "steer_demoted_to_queue": "The turn ended — queued instead"
       },
       "sidePanel": {
         "hide_line_numbers": "Hide line numbers",
@@ -2426,7 +2431,11 @@
         "aria_show_details": "Show details for tool: {{label}}",
         "blocked_by_security_policy": "Blocked by security policy",
         "open_in_side_panel": "Open {{path}} in side panel",
-        "opened_in_the_side_panel": "Opened in the side panel"
+        "opened_in_the_side_panel": "Opened in the side panel",
+        "wait_end_now": "End wait",
+        "wait_ending": "Ending…",
+        "wait_remaining": "{{time}} left",
+        "wait_status": "Waiting"
       }
     },
     "chatPage": {
@@ -2623,6 +2632,7 @@
       "restart_gateway_2": "Restart gateway?",
       "restart_pod": "Restart pod",
       "restarting_reconnecting": "Restarting — reconnecting…",
+      "scanning_merged": "Scanning for merged…",
       "select": "Select {{name}}",
       "spin_up_pod": "Spin up pod",
       "start": "Start",
@@ -3183,8 +3193,12 @@
         "your_chat_sessions_were_restarted_so_this_takes": "Your chat sessions were restarted so this takes effect right away — Kiro reads its tool list once per session, so an open chat would not have picked it up otherwise. Your messages are still there; the agent re-reads its context on your next message."
       },
       "mcpPoolableServers": {
+        "could_not_update_all_try_again": "Could not update servers. No changes were made. Try again.",
         "could_not_update_try_again": "Could not update {{name}}. Try again.",
-        "pool": "Pool {{name}}"
+        "n_of_m_pooled": "{{on}} of {{total}} poolable servers pooled",
+        "n_of_m_pooled_plus_agent": "{{on}} of {{total}} poolable servers pooled, +{{extra}} via agent config",
+        "pool": "Pool {{name}}",
+        "toggle_all": "Toggle all"
       },
       "postureDisclosure": {
         "filter": "Filter {{label}}",
@@ -3583,7 +3597,8 @@
         "step_installing_whisper": "Installing whisper (~1.6 GB)…",
         "step_installing_xcode": "Installing Xcode CLI Tools…",
         "step_pulling": "Pulling Docker image…",
-        "step_starting": "Starting…"
+        "step_starting": "Starting…",
+        "voice_input_remote_instance_note": "Voice input on a remote instance requires microphone permission delegation across the iframe boundary. If the mic doesn't respond here, use the local (parent) dashboard instead."
       },
       "teamsPanel": {
         "microsoft_app_id": "Microsoft App ID",

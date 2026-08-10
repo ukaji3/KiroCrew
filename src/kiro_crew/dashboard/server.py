@@ -8,6 +8,7 @@ import faulthandler
 import importlib
 import logging
 import os
+import stat
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -33,10 +34,12 @@ from kiro_crew.config import data_home
 from kiro_crew.config.loader import KiroCrewConfig, refresh_materialized_agents
 from kiro_crew.constants import env_flag_enabled
 from kiro_crew.dashboard import (
+    cautious_boot,
     channel_slots,
     chat,
     handlers,
     handlers_channel,
+    handlers_cloud,
     handlers_instances,
     handlers_project,
     openai_compat,
@@ -148,6 +151,7 @@ from kiro_crew.dashboard.origin import (
     build_allowed_origins,
     check_host,
     check_origin,
+    dashboard_socket_path,
     resolve_dashboard_host,
     should_canonicalize_host,
 )
@@ -173,6 +177,7 @@ from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import ScriptHookStore, set_global_hook_store
 from kiro_crew.instances.registry import InstancesRegistry
 from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager, TunnelState
+from kiro_crew.mcp_gateway.socketsec import chmod_socket_0600
 from kiro_crew.metrics.http_metrics import (
     make_route_latency_middleware,
     record_boot_to_ready,
@@ -1230,6 +1235,95 @@ async def _start_site(
     raise SystemExit(1) from last_exc
 
 
+def _remove_stale_unix_socket(path: Path) -> None:
+    """Best-effort unlink of a leftover unix-socket file before rebind.
+
+    Only a socket inode is removed — anything else at the path is left in
+    place (and the subsequent bind fails, degrading to TCP-only). Safe against
+    a live sibling instance: the socket name is port-suffixed and the TCP port
+    bind (a singleton per port) has already succeeded by the time this runs,
+    so an existing file with our port's name can only be stale.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        logger.warning(
+            "path %s exists and is not a socket (mode=%o); leaving in place", path, st.st_mode
+        )
+        return
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.warning("could not remove stale dashboard socket %s: %s", path, exc)
+
+
+async def _start_unix_site(runner: web.AppRunner, port: int) -> Path | None:
+    """Additionally serve the internal API on a unix socket (POSIX only).
+
+    Binds ``dashboard_socket_path(port)`` on the same :class:`web.AppRunner`
+    as the TCP site, so both transports serve the identical app + middleware
+    chain. The unix transport exists so ``token_auth_middleware`` can
+    kernel-verify (``SO_PEERCRED`` + /proc ancestry) the session identity an
+    internal caller declares in ``X-Session-Key`` — TCP loopback carries no
+    peer credentials.
+
+    Strictly additive: skipped entirely on Windows, and ANY failure (bind
+    error, permission problem) logs once and degrades to TCP-only, which is
+    exactly today's behavior. The socket file inherits the data home's 0700
+    directory gate (created here if missing) and is itself tightened to 0600,
+    mirroring ``mcp_gateway/transport`` conventions. Returns the bound path,
+    or ``None`` when the transport is unavailable.
+    """
+    if platform_compat.IS_WINDOWS:
+        return None
+    try:
+        path = dashboard_socket_path(port)
+        # Offloaded: directory creation, the stale-socket stat/unlink, and the
+        # post-bind chmod are blocking fs I/O (no-blocking-call-on-event-loop).
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            subprocess_executor(), platform_compat.make_owner_only_dir, path.parent
+        )
+        await loop.run_in_executor(subprocess_executor(), _remove_stale_unix_socket, path)
+        unix_site = web.UnixSite(runner, str(path))
+        await unix_site.start()
+        await loop.run_in_executor(subprocess_executor(), chmod_socket_0600, path)
+        logger.info("dashboard internal API also listening on unix socket %s", path)
+        return path
+    except Exception as exc:
+        logger.warning(
+            "dashboard unix socket unavailable (%s); internal API stays TCP-only", exc
+        )
+        return None
+
+
+def _register_unix_socket_cleanup(app: web.Application, holder: dict[str, Path | None]) -> None:
+    """Register best-effort removal of the unix socket file at shutdown.
+
+    Registered BEFORE ``runner.setup()`` freezes the app's signal lists; the
+    socket path only becomes known after the site starts, so it is read from
+    *holder* lazily. aiohttp does not unlink a ``UnixSite``'s socket file on
+    stop, and while startup self-heals a stale file, a clean shutdown should
+    not leave one for clients to trip over (each stale connect costs the
+    client a refused-connect before its TCP fallback).
+    """
+
+    async def _unlink_unix_socket(app_: web.Application) -> None:
+        path = holder.get("path")
+        if path is None:
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _remove_stale_unix_socket, path
+            )
+        except Exception:  # pragma: no cover — cleanup must never break shutdown
+            logger.debug("dashboard unix socket cleanup failed", exc_info=True)
+
+    app.on_cleanup.append(_unlink_unix_socket)
+
+
 def _write_secret_file(secret_path: Path, secret: str) -> None:
     """Write *secret* to *secret_path* with mode 0o600.
 
@@ -2047,6 +2141,8 @@ async def start_dashboard(
     # Off-loop: a large cron_folders.json would otherwise block the event
     # loop with synchronous file I/O + JSON parsing during startup.
     await asyncio.to_thread(state.load_cron_folders)
+    # Off-loop: a large chat_pins.json must not block the event loop at startup.
+    await asyncio.to_thread(state.load_chat_pins)
     state.load_tags()
     app["port"] = port
 
@@ -2332,12 +2428,8 @@ async def start_dashboard(
     app.router.add_post("/api/source/pull-request/comment", api_pull_request_comment)
     app.router.add_post("/api/source/pull-request/auto-merge", api_pull_request_auto_merge)
     app.router.add_post("/api/source/pull-request/ready", api_pull_request_ready)
-    app.router.add_post(
-        "/api/source/pull-request/pending-review", api_pull_request_pending_review
-    )
-    app.router.add_post(
-        "/api/source/pull-request/submit-review", api_pull_request_submit_review
-    )
+    app.router.add_post("/api/source/pull-request/pending-review", api_pull_request_pending_review)
+    app.router.add_post("/api/source/pull-request/submit-review", api_pull_request_submit_review)
     app.router.add_post("/api/source/issue", api_issue_source)
     app.router.add_get("/api/chat/slots", chat.api_chat_slots)
     app.router.add_post("/api/chat/slots", chat.api_chat_slot_create)
@@ -2350,6 +2442,7 @@ async def start_dashboard(
     app.router.add_get("/api/chat/slots/{slot}", chat.api_chat_slot_detail)
     app.router.add_post("/api/chat/slots/{slot}/stop", chat.api_chat_slot_stop)
     app.router.add_post("/api/chat/slots/{slot}/interrupt", chat.api_chat_slot_interrupt)
+    app.router.add_post("/api/chat/slots/{slot}/end-wait", chat.api_chat_slot_end_wait)
     # Deliberately NOT /resume — that path is already taken by "open a history
     # session into a tab" (api_chat_slot_resume) and means something else.
     app.router.add_post("/api/chat/slots/{slot}/continue", chat.api_chat_slot_continue)
@@ -2443,6 +2536,11 @@ async def start_dashboard(
     app.router.add_patch("/api/chat/slots/{slot}/folder", chat.api_chat_slot_folder)
     app.router.add_patch("/api/chat/slots/{slot}/pin", chat.api_chat_slot_pin)
     app.router.add_patch("/api/chat/slots/{slot}/mode", chat.api_chat_slot_mode)
+    # Message pins
+    app.router.add_get("/api/chat/pins", chat.api_chat_pins_list)
+    app.router.add_post("/api/chat/pins", chat.api_chat_pins_create)
+    app.router.add_delete("/api/chat/pins/by-query", chat.api_chat_pins_delete_by_query)
+    app.router.add_delete("/api/chat/pins/{id}", chat.api_chat_pins_delete)
     # Tags
     app.router.add_get("/api/chat/tags", chat.api_chat_tags)
     app.router.add_post("/api/chat/tags", chat.api_chat_tag_create)
@@ -2608,6 +2706,19 @@ async def start_dashboard(
     app.router.add_post(
         "/api/instances/{id}/send-session", handlers_instances.api_instances_send_session
     )
+
+    # Cloud provisioning (owner-only, user-initiated) — provision a Kiro Crew
+    # instance in the user's own AWS account as a durable launch job.
+    app.router.add_get("/api/cloud/preflight", handlers_cloud.api_cloud_preflight)
+    app.router.add_get("/api/cloud/iam-policy", handlers_cloud.api_cloud_iam_policy)
+    app.router.add_get("/api/cloud/launch", handlers_cloud.api_cloud_launch_list)
+    app.router.add_post("/api/cloud/launch", handlers_cloud.api_cloud_launch_create)
+    app.router.add_get("/api/cloud/launch/{id}", handlers_cloud.api_cloud_launch_get)
+    app.router.add_post("/api/cloud/launch/{id}/cancel", handlers_cloud.api_cloud_launch_cancel)
+    app.router.add_post("/api/cloud/launch/{id}/signin", handlers_cloud.api_cloud_launch_signin)
+    app.router.add_post("/api/cloud/{tag}/stop", handlers_cloud.api_cloud_stop)
+    app.router.add_post("/api/cloud/{tag}/start", handlers_cloud.api_cloud_start)
+    app.router.add_delete("/api/cloud/{tag}", handlers_cloud.api_cloud_destroy)
 
     # Misc (notifications GET/clear and send-message via _register_mcp_routes)
     app.router.add_get("/api/notifications", handlers.api_notifications)
@@ -2835,6 +2946,7 @@ async def start_dashboard(
     # wedge-prone blocking work that would freeze this event loop if run inline.
     # subprocess_executor (not the default to_thread pool) isolates it so a hung
     # `ps` cannot starve asyncio's default executor (the RFC's bulkhead intent).
+    await cautious_boot.pause_before("app backends")
     started_apps = await asyncio.get_running_loop().run_in_executor(
         subprocess_executor(), start_enabled_app_backends
     )
@@ -3018,8 +3130,13 @@ async def start_dashboard(
     # Off by default; resolved in a thread so the daemon call cannot stall the
     # loop; "" whenever Tailscale is absent, stopped, or produced nothing that
     # validated.
-    _tailnet_host = await tailnet.resolve_tailnet_host(
-        KiroCrewConfig.load().dashboard.tailscale.enabled
+    _ts_cfg = KiroCrewConfig.load().dashboard.tailscale
+    _tailnet_host = await tailnet.resolve_tailnet_host(_ts_cfg.enabled)
+    # Identity trust (RFC §2–§3.1): validated at config load, governance
+    # ceiling applied inside the shared helper — ONE code path for both
+    # startup surfaces, so they cannot drift.
+    _tailnet_trust = await tailnet.governed_tailnet_trust(
+        _ts_cfg.trust_identity, tuple(_ts_cfg.allowed_logins), _ts_cfg.pin_scope
     )
     if _tailnet_host:
         logger.info(
@@ -3036,6 +3153,10 @@ async def start_dashboard(
     # already shipped a bug from touching one startup site and not the other.
     app["tailnet_host"] = _tailnet_host
     app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
+    # The governance-filtered identity-trust value the middleware was built
+    # with, for handlers the middleware bypasses (POST /api/auth/refresh must
+    # re-bind a rotated access token to the same verified peer identity).
+    app["tailnet_trust"] = _tailnet_trust
     app["allowed_origins"] = build_allowed_origins(
         port, local_only, configured_host, tailnet_host=_tailnet_host
     )
@@ -3111,6 +3232,7 @@ async def start_dashboard(
             port=port,
             local_only=local_only,
             spa_shell_handler=handlers.index,
+            tailnet_trust=_tailnet_trust,
         ),
         sel_audit_middleware,
         spa_fallback,
@@ -3166,6 +3288,12 @@ async def start_dashboard(
     # ``_register_instances_hooks`` for why ordering matters.
     _register_instances_hooks(app, state, port)
 
+    # Unix-socket cleanup hook — registered before runner.setup freezes the
+    # signal lists; the path itself only becomes known after the site starts
+    # (below), hence the holder indirection.
+    _unix_socket_holder: dict[str, Path | None] = {"path": None}
+    _register_unix_socket_cleanup(app, _unix_socket_holder)
+
     # Hardened runner: bounds the request-line/header read time (slowloris /
     # CWE-400) and reaps idle keep-alive connections. See dashboard.slowloris.
     # max_field_size is raised from aiohttp's 8190 default so the accumulated
@@ -3175,6 +3303,9 @@ async def start_dashboard(
     await runner.setup()
     site = web.TCPSite(runner, bind_address_for(local_only), port)
     await _start_site(site, port)
+    # Additional kernel-verifiable transport for the internal API (POSIX only;
+    # degrades to TCP-only on any failure — see _start_unix_site).
+    _unix_socket_holder["path"] = await _start_unix_site(runner, port)
 
     # Port bind succeeded — now safe to write the secret file. Offloaded:
     # _write_secret_file does blocking fs I/O (os.open/os.close and, on Windows,
@@ -3318,7 +3449,10 @@ async def start_dashboard(
                 except Exception:
                     logger.debug("stall-exit notification failed", exc_info=True)
 
-    # Fire background MCP probe at startup (non-blocking)
+    # Fire background MCP probe at startup (non-blocking). The probe spawns a
+    # handshake subprocess per configured MCP server, so under cautious boot it
+    # gets its own launch window instead of landing on top of the app backends.
+    await cautious_boot.pause_before("MCP server probe")
     asyncio.create_task(handlers._bg_mcp_probe())
 
     # Start terminal orphan reaper (kills PTYs with no WS past the reaper window)
@@ -3406,6 +3540,9 @@ async def start_dashboard(
         # messages, so starting up without it is safe.
         logger.warning("channel transcript migration failed", exc_info=True)
 
+    # Session restores spawn a kiro-cli process per restored tab — the last
+    # large group of the startup battery, so it too gets a cautious-boot window.
+    await cautious_boot.pause_before("session restore")
     with state.suspend_slots_push():
         await chat.restore_open_slots_async(state)
         restored = await chat.restore_recent_sessions_async(
@@ -3527,9 +3664,7 @@ async def start_api_server(
     # reached through the task runner. Logged on a miss rather than silently
     # recording nothing, since a route that credits no reads is the bias this
     # observer exists to remove.
-    if not register_skill_read_observer(
-        state.context_builder, getattr(task_runner, "_ctx", None)
-    ):
+    if not register_skill_read_observer(state.context_builder, getattr(task_runner, "_ctx", None)):
         logger.info("skill-read observer not registered: no skills loader reachable")
 
     # Wire script hooks into subagent tool execution path
@@ -3562,6 +3697,8 @@ async def start_api_server(
     # Off-loop: a large cron_folders.json would otherwise block the event
     # loop with synchronous file I/O + JSON parsing during startup.
     await asyncio.to_thread(state.load_cron_folders)
+    # Off-loop: a large chat_pins.json must not block the event loop at startup.
+    await asyncio.to_thread(state.load_chat_pins)
     state.load_tags()
     app["port"] = port
 
@@ -3571,8 +3708,12 @@ async def start_api_server(
     # The MCP route surface is identical to the dashboard's, so the middleware
     # chain must be too. Host-allowlist source of truth is shared with the CSRF
     # Origin check via build_allowed_origins/build_allowed_hosts (see origin.py).
-    _tailnet_host = await tailnet.resolve_tailnet_host(
-        KiroCrewConfig.load().dashboard.tailscale.enabled
+    _ts_cfg = KiroCrewConfig.load().dashboard.tailscale
+    _tailnet_host = await tailnet.resolve_tailnet_host(_ts_cfg.enabled)
+    # Same identity-trust value as start_dashboard, via the same shared helper
+    # — the auth surface is identical, so the middleware inputs must be too.
+    _tailnet_trust = await tailnet.governed_tailnet_trust(
+        _ts_cfg.trust_identity, tuple(_ts_cfg.allowed_logins), _ts_cfg.pin_scope
     )
     app["allowed_origins"] = build_allowed_origins(
         port,
@@ -3587,6 +3728,10 @@ async def start_api_server(
     # surface later would silently read "" as "nothing was trusted".
     app["tailnet_host"] = _tailnet_host
     app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
+    # The governance-filtered identity-trust value the middleware was built
+    # with, for handlers the middleware bypasses (POST /api/auth/refresh must
+    # re-bind a rotated access token to the same verified peer identity).
+    app["tailnet_trust"] = _tailnet_trust
     app["local_only"] = local_only
 
     # Per-session internal secret for machine-to-machine (mcp-core, cron) auth.
@@ -3685,6 +3830,7 @@ async def start_api_server(
             # No SPA shell in headless mode: a no-token request must be denied
             # outright, never served an HTML shell (there is no UI to boot).
             spa_shell_handler=None,
+            tailnet_trust=_tailnet_trust,
         ),
         sel_audit_middleware,
     ]
@@ -3713,6 +3859,11 @@ async def start_api_server(
     # Slack task, identically to the full dashboard.
     _register_prevent_sleep_shutdown(app, state)
 
+    # Unix-socket cleanup hook — same holder pattern as start_dashboard,
+    # registered before runner.setup freezes the signal lists.
+    _unix_socket_holder: dict[str, Path | None] = {"path": None}
+    _register_unix_socket_cleanup(app, _unix_socket_holder)
+
     # Hardened runner: same slowloris / CWE-400 mitigation as start_dashboard,
     # plus the raised max_field_size (see start_dashboard for the cookie-jar
     # rationale).
@@ -3726,6 +3877,9 @@ async def start_api_server(
     bind_addr = bind_address_for(local_only)
     site = web.TCPSite(runner, bind_addr, port)
     await _start_site(site, port)
+    # Additional kernel-verifiable transport for the internal API (parity with
+    # start_dashboard; POSIX only, degrades to TCP-only on any failure).
+    _unix_socket_holder["path"] = await _start_unix_site(runner, port)
 
     # Port bind succeeded — now safe to persist the secret file (parity with
     # start_dashboard: write deferred so a failed bind can't poison it).

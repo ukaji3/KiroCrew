@@ -1101,6 +1101,10 @@ class TestSandboxActiveMarkerCleared:
         import sys
 
         monkeypatch.setenv("KIROCREW_SANDBOX_ACTIVE", "1")
+        # The companion tier record must be dropped with it: a stale inherited
+        # level would be read as the ACTIVE tier by a descendant's passthrough
+        # and corrupt its downgrade audit.
+        monkeypatch.setenv("KIROCREW_SANDBOX_LEVEL", "strict")
         # A trivial subcommand so main() dispatches and returns cleanly; assert
         # the marker was popped before dispatch (patch the target to observe).
         argv = ["kirocrew", "cron", "list"]
@@ -1108,13 +1112,16 @@ class TestSandboxActiveMarkerCleared:
 
         def _capture(_ns):
             seen["marker"] = os.environ.get("KIROCREW_SANDBOX_ACTIVE")
+            seen["level"] = os.environ.get("KIROCREW_SANDBOX_LEVEL")
 
         with patch.object(sys, "argv", argv), patch("kiro_crew.cli._cron", _capture):
             from kiro_crew.cli import main
 
             main()
         assert seen.get("marker") is None
+        assert seen.get("level") is None
         assert os.environ.get("KIROCREW_SANDBOX_ACTIVE") is None
+        assert os.environ.get("KIROCREW_SANDBOX_LEVEL") is None
 
 
 class TestDirectCliOverrideAttestation:
@@ -1739,6 +1746,13 @@ class TestArgsLookLikeKirocrew:
             "python3 -m kiro_crew gateway",
             "python -m kiro_crew dashboard",
             "python3.10 -m kiro_crew start",
+            # macOS framework build: the vendored interpreter's basename is
+            # "Python" (capital P) — a case-sensitive startswith("python") missed
+            # it, so stop/restart no-oped on macOS framework-build installs
+            # (Toolbox being the common one).
+            "/Library/Frameworks/Python.framework/Versions/3.10/Resources/"
+            "Python.app/Contents/MacOS/Python -m kiro_crew gateway --no-open",
+            "Python -m kiro_crew gateway",
             # Subcommand followed by trailing flags.
             "python -m kiro_crew gateway --no-open --port 7777",
             # Legacy dotted-submodule form.

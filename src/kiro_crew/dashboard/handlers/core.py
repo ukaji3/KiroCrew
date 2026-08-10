@@ -1469,6 +1469,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # enterprise ceiling can refuse the enabling write outright — see the
     # ``capabilities.tailnet_origin`` gate below.
     "dashboard.tailscale.enabled": {"type": "bool"},
+    # Identity trust for tailnet peers (RFC §2–§3.1). Only the boolean opt-in
+    # and the pin scope are editable here; ``allowed_logins`` is a list and is
+    # deliberately config-file-only — the write surface below has no list type,
+    # and the allowlist is the control that decides who gets in, so it should
+    # be an explicit file edit rather than an API-reachable value. Loader-side
+    # validation keeps every bad combination narrowing-only (trust with an
+    # empty allowlist stays off; an unrecognised pin_scope falls back to node).
+    "dashboard.tailscale.trust_identity": {"type": "bool"},
+    "dashboard.tailscale.pin_scope": {"type": "str", "max_len": 8},
     # SSO login flags for an edition that supplies a real sso_login_handler.
     # Bounded to a short string here; the companion login handler re-validates
     # each token against its own flag allowlist before spawning the login PTY
@@ -1492,6 +1501,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "knowledge.auto_ingest_chunk_budget": {"type": "int", "min": 0, "max": 10000},
     "knowledge.folder_ingest_chunk_budget": {"type": "int", "min": 0, "max": 10000},
     "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": 288},
+    "knowledge.sweep_chunk_budget": {"type": "int", "min": 0, "max": 50000},
+    "knowledge.max_sources": {"type": "int", "min": 0, "max": 1000},
+    "knowledge.embed_rate_limit": {"type": "int", "min": 0, "max": 10000},
+    "knowledge.extraction_model": {"type": "str"},
+    "knowledge.extraction_pool_size": {"type": "int", "min": 1, "max": 10},
     # Computer use — BUDGET KNOBS ONLY. There is deliberately no
     # "computer_use.enabled" key here: the primary enable lives on the keystone
     # ``computer_use.json`` (see config.loader.computer_use_state_path) so the
@@ -1680,7 +1694,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     # does nothing — `resolve_tailnet_host` already refuses to derive, so without
     # this the config file and the card would both claim "on" while no origin is
     # ever added.
-    if path_key == "dashboard.tailscale.enabled" and value is True:
+    if (
+        path_key in ("dashboard.tailscale.enabled", "dashboard.tailscale.trust_identity")
+        and value is True
+    ):
         pinned = await asyncio.to_thread(_tailnet_governance_pinned_off)
         if pinned:
             return _deny(
@@ -1986,7 +2003,29 @@ async def api_logout(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid secret"}, status=403)
 
-    revoke_all_sessions()
+    # Fail-closed: bump_revocation_gen raises when the persisted counter
+    # cannot be read (bumping from an assumed base could persist a LOWER
+    # counter, resurrecting revoked sessions after restart) or when the write
+    # fails (the counter is left unchanged, so the revocation did not take
+    # effect). Report the failure instead of a false success.
+    try:
+        revoke_all_sessions()
+    except OSError:
+        logger.warning("logout failed: could not persist session revocation", exc_info=True)
+        _sel().log_api_access(
+            caller=request.remote or "unknown",
+            operation="logout",
+            outcome="error",
+            source="cli",
+            resources="revocation-persist-failed",
+        )
+        return web.json_response(
+            {
+                "error": "could not persist session revocation; logout not completed",
+                "code": "revocation_persist_failed",
+            },
+            status=500,
+        )
     _sel().log_api_access(
         caller=request.remote or "unknown",
         operation="logout",

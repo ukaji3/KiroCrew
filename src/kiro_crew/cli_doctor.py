@@ -29,6 +29,7 @@ from kiro_crew.config.paths import (
     kiro_agents_dir,
     preserved_entries,
 )
+from kiro_crew.constants import MIN_NODE_MAJOR
 from kiro_crew.dashboard.crash_dump_store import (
     dump_age_seconds,
     dump_first_stack_lines,
@@ -63,9 +64,6 @@ from kiro_crew.sel import sel
 from kiro_crew.transcribe import _find_whisper, ensure_ffmpeg_in_path
 
 logger = logging.getLogger(__name__)
-
-_MIN_NODE_VERSION = 16
-
 
 # ``KIRO_AGENTS_DIR`` is an import-time override hook, NOT a frozen path.
 # ``None`` means "resolve from the live data home"; tests patch this
@@ -598,18 +596,18 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                 timeout=5,
             )
             major = int(node_ver_result.stdout.strip().lstrip("v").split(".")[0])
-            if major >= _MIN_NODE_VERSION:
+            if major >= MIN_NODE_MAJOR:
                 print(f"  node:        ✅ {node} (v{major})")
             else:
                 print(
-                    f"  node:        ⚠️  v{major} < {_MIN_NODE_VERSION} (frontend needs Node {_MIN_NODE_VERSION}+)"
+                    f"  node:        ⚠️  v{major} < {MIN_NODE_MAJOR} (frontend needs Node {MIN_NODE_MAJOR}+)"
                 )
-                print("               Fix: install Node.js >= 16")
+                print(f"               Fix: install Node.js >= {MIN_NODE_MAJOR}")
         except Exception:
             print(f"  node:        ✅ {node}")
     else:
-        print(f"  node:        ⚠️  not found (frontend needs Node {_MIN_NODE_VERSION}+)")
-        print("               Fix: install Node.js >= 16")
+        print(f"  node:        ⚠️  not found (frontend needs Node {MIN_NODE_MAJOR}+)")
+        print(f"               Fix: install Node.js >= {MIN_NODE_MAJOR}")
 
     # venv detection — used by the runtime section below. Windows venvs put the
     # interpreter under .venv\Scripts\python.exe, not .venv/bin/python3, so a
@@ -962,7 +960,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             if _age_s < 7 * 86400:  # Less than 7 days old
                 _age_h = _age_s / 3600
                 print(f"  last dump:   ⚠️  {_latest.name} ({_age_h:.1f}h ago)")
-                _stack = dump_first_stack_lines(_latest, max_lines=5)
+                # 8 lines = preamble + thread header + ~6 frames: enough to
+                # reach past the asyncio plumbing into the Kiro Crew frame
+                # that identifies WHERE the loop wedged.
+                _stack = dump_first_stack_lines(_latest, max_lines=8)
                 if _stack:
                     print("  MainThread stuck at:")
                     for _line in _stack:

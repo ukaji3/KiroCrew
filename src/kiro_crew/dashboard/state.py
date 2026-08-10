@@ -435,6 +435,28 @@ _SESSION_RECYCLED_NOTICE = (
     "♻️ This session was recycled by the watchdog ({reason}). "
     "Conversation history is preserved — your next message starts a fresh process."
 )
+#: Shown when the out-of-band watchdog finds a turn whose consumer stopped
+#: pulling events. Deliberately describes the observation rather than promising a
+#: remedy: nothing is cancelled or retried, because what the turn is blocked on
+#: is not knowable from the loop that noticed. Stating a duration is the point —
+#: it is what distinguishes this from a turn that is merely slow.
+_STUCK_TURN_NOTICE = (
+    "⏳ This turn has produced nothing for {minutes} min and is not waiting on an "
+    "approval — it may be stuck. Nothing has been cancelled. Press Stop to end it "
+    "and try again."
+)
+
+
+def stuck_turn_notice(parked_secs: float) -> str:
+    """Render the stuck-turn notice for a park of ``parked_secs``.
+
+    Module-level and pure so the rounding is testable without standing up a whole
+    ``DashboardState``. Floors at 1 minute: the hook's threshold is minutes-scale,
+    so "0 min" would only ever read as a bug to the person seeing it.
+    """
+    return _STUCK_TURN_NOTICE.format(minutes=max(1, int(parked_secs // 60)))
+
+
 _MAX_SLOT_MESSAGES = 10000  # Keep all messages — virtual scrolling handles performance
 
 #: Roles that exist only on the wire: appended so a reader/flush can see them,
@@ -908,6 +930,10 @@ class _ChatSlot:
         "_native_subagent_tracker",
         "_native_subagent_output",
         "_pending_steers",
+        "_wait_state",
+        "_end_wait_request",
+        "_wait_last_ping",
+        "_wait_contested",
     )
 
     def __init__(
@@ -1234,6 +1260,28 @@ class _ChatSlot:
         # STOP, error). Without this, a steer swallowed by a dying turn
         # vanished with no trace (see the requeue site).
         self._pending_steers: list[str] = []
+        # In-flight `wait` tool sleep, as reported by the tool's own keepalive
+        # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
+        # deadline is on the dashboard's clock (see api_session_keepalive) so
+        # the browser can count down against it directly. None whenever no wait
+        # is sleeping.
+        self._wait_state: dict | None = None
+        # wait_id the user asked to end early, parked here until the sleeping
+        # tool collects it on its next poll. Consumed exactly once.
+        self._end_wait_request: str | None = None
+        # Wall clock of the tracked wait's last keepalive ping. Server-side only
+        # (deliberately NOT in to_dict): it is the heartbeat that distinguishes a
+        # sleep that ended from one that is still running, which is how
+        # _service_wait_ping tells a legitimate hand-over from two concurrent
+        # waits colliding on one session key.
+        self._wait_last_ping: float = 0.0
+        # True once two sleeps have been seen sharing this slot: neither may be
+        # tracked or ended, because there is no way to know which one the user is
+        # looking at. Latched for the rest of the turn and cleared by the same
+        # turn-end block that clears the two fields above -- an earlier revision
+        # expired it on a timer, which let whichever sleep pinged first after
+        # expiry re-publish its deadline onto the other's pill.
+        self._wait_contested: bool = False
 
     @property
     def _dirty(self) -> bool:
@@ -1897,6 +1945,12 @@ class _ChatSlot:
             "last_activity_ts": last_activity_ts,
             "waiting_for_input": waiting_for_input,
             "stop_state": self._stop_state,
+            # In-flight `wait` sleep, or None. Carries the absolute deadline the
+            # transcript counts down against and the wait_id the "End wait"
+            # button must quote. Rides the slots payload rather than a bespoke
+            # WS event so a page reload mid-wait re-seeds it from
+            # GET /api/chat/slots for free.
+            "wait_state": self._wait_state,
             "created": self.created_at,
             "last_ts": last_ts,
             "last_message": last_msg,
@@ -1998,6 +2052,13 @@ class DashboardState:
         self.tunnel_manager: Any = None  # lazy-init in server.py (TunnelManager)
         self.instances_manager: Any = None  # lazy-init in server.py (SshTunnelManager)
         self.instances_registry: Any = None  # lazy-init in server.py (InstancesRegistry)
+        # Cloud provisioning launch jobs (lazy-init in handlers_cloud).
+        self.cloud_launch_store: Any = None  # LaunchJobStore
+        self.cloud_launch_cancels: Any = None  # dict[str, threading.Event]
+        self.cloud_launch_engine: Any = None  # test-injected LaunchEngine (None -> RealLaunchEngine)
+        self.cloud_launch_sync: bool = False  # tests set True to run launches inline
+        self.cloud_launch_reaped: bool = False  # orphan reap is once per process
+        self.cloud_launch_lock: Any = None  # asyncio.Lock serializing launch creation
         # MCP gateway control plane — wired by GatewayOrchestrator AFTER
         # dashboard init (the broker starts before dashboard_state exists).
         # Read by the /api/mcp-gateway/* handlers off request.app['state'].
@@ -2112,6 +2173,13 @@ class DashboardState:
         # applied at the delivery sink so the bus stays pure.
         self.notification_channel_settings = ChannelSettings()
         self._slots: dict[str, _ChatSlot] = {}
+        # Slot keys that EXIST but are deliberately absent from ``_slots`` while
+        # they are being built (see ``session_transfer``'s import path, which
+        # retracts a slot so it is unreachable until its transcript and context
+        # are in place). They still consume memory, so every cap must count them:
+        # ``len(_slots)`` alone undercounts by however many imports are in flight,
+        # and each concurrent import would then be waved past a full-slot cap.
+        self._slots_under_construction: set[str] = set()
         self._slack_to_slot: dict[str, str] = {}  # Slack session_key → slot name
         # Live OPTIONS controls, keyed by the SESSION KEY that owns them.
         #
@@ -2152,6 +2220,10 @@ class DashboardState:
         self._context_snapshots_flush_lock = threading.Lock()
         self._folders: list[dict[str, Any]] = []  # project folder definitions
         self._cron_folders: list[dict[str, Any]] = []  # cron job folder groupings
+        self._chat_pins: list[dict[str, Any]] = []  # pinned chat messages
+        # Serializes pin mutation + persistence so concurrent requests cannot
+        # interleave snapshots and replace chat_pins.json out of order.
+        self._chat_pins_lock = asyncio.Lock()
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
         # True once load_tags() parsed tags.json successfully (or seeded a
@@ -2340,6 +2412,40 @@ class DashboardState:
                 )
 
         self.sessions.set_recycle_callback(_on_recycled)
+
+        def _on_stuck_turn(key: str, parked_secs: float) -> None:
+            """Surface a stuck turn in the chat where it is happening.
+
+            Same delivery choice as the recycle notice above, for the same
+            reason: the person who needs to know is whoever is watching that
+            session, so the notice goes to that transcript rather than to a DM or
+            a global feed. A WARNING in the journal is not reaching a user.
+
+            Sync, unlike ``_on_recycled``: the hook that fires this is not
+            awaiting anything, and appending to a slot needs no I/O.
+            """
+            from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+
+            # A channel-born session's key is the channel's own even while its tab
+            # is open, so ask which tab displays it (see _on_recycled).
+            slot_key = dashboard_slot_key(key)
+            if not slot_key:
+                return
+            slot = self.get_slot(slot_key)
+            if slot is None:
+                return
+            message = stuck_turn_notice(parked_secs)
+            try:
+                # kind="compaction" for the same reason as the recycle notice: it
+                # keeps the dashboard's follow-up [OPTIONS:] backward scan from
+                # treating a proactive system notice as the turn's own output.
+                slot.append("assistant", message, "msg msg-a", meta={"kind": "compaction"})
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to append stuck-turn notice to slot %s", slot_key
+                )
+
+        self.sessions.on_stuck_turn = _on_stuck_turn
 
     def _count_lessons(self) -> int:
         """Count lessons from JSONL store + vector store (if enabled)."""
@@ -3419,6 +3525,28 @@ class DashboardState:
         self.push_slots_update()
         return slot
 
+    def live_slot_count(self) -> int:
+        """Slots that occupy memory: published PLUS still under construction.
+
+        The number every slot cap must test. A slot retracted for construction is
+        missing from ``_slots`` but is fully allocated, so a cap reading
+        ``len(self._slots)`` directly undercounts and lets concurrent creators
+        each slip past a cap that is already full.
+        """
+        return len(self._slots) + len(self._slots_under_construction)
+
+    def begin_slot_construction(self, key: str) -> None:
+        """Mark *key* as allocated-but-unpublished.
+
+        Pair with :meth:`end_slot_construction` in a ``finally`` -- a leaked key
+        inflates every slot cap for the lifetime of the process.
+        """
+        self._slots_under_construction.add(key)
+
+    def end_slot_construction(self, key: str) -> None:
+        """Drop *key* from the under-construction set. Idempotent."""
+        self._slots_under_construction.discard(key)
+
     def reseed_slot_counter(self) -> None:
         """Advance ``_slot_counter`` past the highest index among live slots.
 
@@ -3674,6 +3802,85 @@ class DashboardState:
                     )
         return True
 
+    # ── Chat message pin persistence ──
+
+    _CHAT_PINS_FILE = "chat_pins.json"
+
+    def load_chat_pins(self) -> None:
+        """Load pinned chat messages from disk, dropping malformed records.
+
+        Legacy pins (pre-mid era) may lack the ``mid`` field — they are preserved
+        for backward compatibility; new pins always carry ``mid``.
+
+        Error classification:
+        - Missing file: normal (first run) → empty list.
+        - Malformed JSON / invalid shape: tolerated for compatibility → empty list.
+        - Transient I/O errors (PermissionError, OSError): MUST NOT replace
+          valid in-memory state — re-raise so callers know load failed.
+        """
+        path = config_dir() / self._CHAT_PINS_FILE
+        try:
+            if not path.exists():
+                self._chat_pins = []
+                return
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            # Malformed content — treat as empty (data corruption).
+            logger.warning("chat_pins.json has malformed content: %s", exc)
+            self._chat_pins = []
+            return
+        except OSError:
+            # Transient I/O error — do NOT clobber valid in-memory state.
+            logger.warning("Transient I/O error reading chat_pins.json", exc_info=True)
+            raise
+
+        if not isinstance(raw, list):
+            logger.warning("chat_pins.json is not a list (%s); ignoring", type(raw).__name__)
+            self._chat_pins = []
+            return
+
+        valid = [
+            pin
+            for pin in raw
+            if isinstance(pin, dict)
+            and all(isinstance(pin.get(key), str) and pin.get(key) for key in ("id", "slot_key"))
+            # Require at least one identity field: mid or message_ts
+            and (
+                (isinstance(pin.get("mid"), str) and pin.get("mid"))
+                or (isinstance(pin.get("message_ts"), str) and pin.get("message_ts"))
+            )
+            and isinstance(pin.get("preview"), str)
+            and isinstance(pin.get("pinned_at"), str)
+            and pin.get("pinned_at")
+        ]
+        if len(valid) != len(raw):
+            logger.warning("Dropped %d malformed chat pin record(s) on load", len(raw) - len(valid))
+        self._chat_pins = valid
+
+    def save_chat_pins(self) -> None:
+        """Persist pinned chat messages with an atomic, owner-only file replacement."""
+        path = config_dir() / self._CHAT_PINS_FILE
+        atomic_write(path, json.dumps(self._chat_pins), fsync=True, mode=0o600)
+
+    async def remove_chat_pins_for_slots(self, slot_keys: set[str]) -> int:
+        """Remove pins when their persisted history sessions are permanently deleted."""
+        keys = {key for key in slot_keys if key}
+        if not keys:
+            return 0
+        async with self._chat_pins_lock:
+            previous = self._chat_pins
+            remaining = [pin for pin in previous if pin.get("slot_key") not in keys]
+            removed = len(previous) - len(remaining)
+            if not removed:
+                return 0
+            self._chat_pins = remaining
+            try:
+                await asyncio.to_thread(self.save_chat_pins)
+            except Exception:
+                self._chat_pins = previous
+                raise
+            return removed
+
     def folder_breadcrumb(self, folder_id: str, sep: str = " › ") -> str:
         """Render a folder's ancestry root→leaf as a breadcrumb string.
 
@@ -3755,6 +3962,20 @@ class DashboardState:
                 raw = json.loads(columns_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     self._tag_boards = [c for c in raw if isinstance(c, dict) and c.get("id")]
+                    # Prune column tag_ids missing from the vocabulary: tag
+                    # deletion commits the vocab write first (crash-atomic),
+                    # so a crash mid-delete can leave dangling ids here. The
+                    # column API rejects unknown ids, so a dangling id left
+                    # in place would make that column's filter permanently
+                    # un-editable (the popover echoes the full list back).
+                    # Same fail-open rule as the slot-restore prune: only
+                    # prune when the vocabulary is authoritative.
+                    if self._tags_authoritative:
+                        known = {t.get("id") for t in self._tags}
+                        for col in self._tag_boards:
+                            tag_ids = col.get("tag_ids")
+                            if isinstance(tag_ids, list):
+                                col["tag_ids"] = [t for t in tag_ids if t in known]
         except Exception:
             logger.warning("Failed to load sidebar columns", exc_info=True)
 
