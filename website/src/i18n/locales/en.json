@@ -2829,8 +2829,9 @@
         "personal_shopper": "Personal Shopper",
         "say_something_like_help_me_find_running_shoes_or": "Say something like \"help me find running shoes\" or \"my daughter's birthday is coming up\"",
         "start_a_conversation_with_your_personal_advisor": "Start a conversation with your personal advisor in any chat session.",
+        "start_advisor_conversation": "Start advisor conversation",
+        "start_conversation_failed": "Couldn't start the conversation ({{code}})",
         "your_life_problem_advisor_solves_first_shops_sec": "Your life-problem advisor — solves first, shops second",
-        "tab_chat": "Chat",
         "tab_preferences": "Preferences",
         "tab_history": "History",
         "tab_sites": "Sites"
@@ -3383,6 +3384,7 @@
       }
     },
     "artifactBody": {
+      "image_could_not_be_loaded": "Image couldn't be loaded",
       "rendering": "Rendering…"
     },
     "artifactFolderDeleteDialog": {
@@ -3590,7 +3592,10 @@
       "shared_comment": "Shared comment"
     },
     "contentRenderer": {
-      "loading_editor": "Loading editor…"
+      "changes_update_svg_preview_as_you_type": "Changes update the preview as you type.",
+      "editing_svg": "Editing SVG",
+      "loading_editor": "Loading editor…",
+      "svg_source_code": "SVG source code"
     },
     "detailPanel": {
       "close_panel": "Close panel",
@@ -4967,6 +4972,7 @@
       "folder_breadcrumb": "Folder breadcrumb",
       "folder_color": "Folder color",
       "from_your_chats": "From your chats",
+      "image_could_not_be_loaded": "Image couldn't be loaded",
       "kind": "Kind",
       "loading": "Loading…",
       "name": "Name",
@@ -4981,10 +4987,10 @@
       "remove_from_library": "Remove from library",
       "rename": "Rename",
       "rename_folder": "Rename folder",
-      "slug": "Slug",
-      "source": "Source",
       "show_all_count": "Show all ({{count}})",
       "show_less": "Show less",
+      "slug": "Slug",
+      "source": "Source",
       "star_a_document_in_from_your_chats_to_save_it_he": "No saved artifacts yet — star a document in \"From your chats\" to save it here.",
       "star_creates_a_starred_artifact_from_this_docume": "Star (creates a starred artifact from this document)",
       "star_document": "Star document",

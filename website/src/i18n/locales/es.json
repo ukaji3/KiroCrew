@@ -3744,8 +3744,9 @@
         "personal_shopper": "Personal Shopper",
         "say_something_like_help_me_find_running_shoes_or": "Di algo como «ayúdame a encontrar zapatillas de running» o «pronto es el cumpleaños de mi hija»",
         "start_a_conversation_with_your_personal_advisor": "Empieza una conversación con tu asesor personal en cualquier sesión de chat.",
+        "start_advisor_conversation": "Hablar con el asesor",
+        "start_conversation_failed": "No se pudo iniciar la conversación ({{code}})",
         "your_life_problem_advisor_solves_first_shops_sec": "Tu asesor para los problemas del día a día — primero resuelve, después compra",
-        "tab_chat": "Chat",
         "tab_preferences": "Preferencias",
         "tab_history": "Historial",
         "tab_sites": "Sitios"
@@ -4489,6 +4490,7 @@
     },
     "artifactBody": {
       "artifact": "Artefacto: {{slug}}",
+      "image_could_not_be_loaded": "No se pudo cargar la imagen",
       "rendering": "Renderizando…"
     },
     "artifactChatPanel": {
@@ -4872,7 +4874,10 @@
       "updated": "actualizado"
     },
     "contentRenderer": {
-      "loading_editor": "Cargando el editor…"
+      "changes_update_svg_preview_as_you_type": "Los cambios actualizan la vista previa mientras escribes.",
+      "editing_svg": "Editando SVG",
+      "loading_editor": "Cargando el editor…",
+      "svg_source_code": "Código fuente SVG"
     },
     "contextBar": {
       "context_pct": "Contexto: {{pct}} %"
@@ -7202,6 +7207,7 @@
       "folder_color": "Color de la carpeta",
       "from_your_chats": "De tus chats",
       "gallery": "Galería",
+      "image_could_not_be_loaded": "No se pudo cargar la imagen",
       "import_from_a_file": "Importar desde un archivo…",
       "kind": "Tipo",
       "live": "En vivo",
@@ -7234,12 +7240,12 @@
       "remove_star_from_artifact": "Quitar el destacado del artefacto",
       "rename": "Cambiar nombre",
       "rename_folder": "Cambiar nombre de la carpeta",
-      "slug": "Slug",
-      "source": "Origen",
-      "star_artifact": "Destacar el artefacto",
       "show_all_count": "Mostrar todo ({{count}})",
       "show_less": "Mostrar menos",
+      "slug": "Slug",
+      "source": "Origen",
       "star_a_document_in_from_your_chats_to_save_it_he": "Aún no hay artefactos guardados: destaca un documento en \"De tus chats\" para guardarlo aquí.",
+      "star_artifact": "Destacar el artefacto",
       "star_creates_a_starred_artifact_from_this_docume": "Destacar (crea un artefacto destacado a partir de este documento)",
       "star_document": "Destacar documento",
       "starred": "Destacados",
