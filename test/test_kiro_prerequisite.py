@@ -115,6 +115,59 @@ async def _wait_for_operation(service: KiroPrerequisiteService) -> None:
 
 
 class TestKiroPrerequisiteHelpers:
+    @pytest.mark.parametrize("windows", [True, False], ids=["windows", "posix"])
+    def test_identity_env_forwards_proxy_configuration_and_refuses_secrets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        windows: bool,
+    ) -> None:
+        """A proxy-only host's ``whoami`` reaches the IdP the way the user's shell does.
+
+        Every spelling of the proxy set passes through the IDENTITY probe env —
+        matching is exact on POSIX and the HTTP stacks disagree on which case
+        they honour — while a non-allowlisted variable is still refused, so the
+        allowlist does not silently widen into a passthrough. The
+        ``--version``/``whoami`` split stays intact: the base probe environment
+        carries neither the CLI's own credential nor the (possibly
+        credentialed) proxy configuration, because ``--version`` is the first
+        execution of an unvalidated candidate and needs no network.
+        """
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", windows)
+        proxies = {
+            "ALL_PROXY": "socks5://proxy.example:1080",
+            "HTTP_PROXY": "http://proxy.example:3128",
+            "HTTPS_PROXY": "http://user:pass@proxy.example:3128",
+            "NO_PROXY": "localhost,127.0.0.1",
+            "all_proxy": "socks5://proxy.example:1080",
+            "http_proxy": "http://proxy.example:3128",
+            "https_proxy": "http://user:pass@proxy.example:3128",
+            "no_proxy": "localhost,127.0.0.1",
+        }
+        secrets = {
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "GITHUB_TOKEN": "ghp_secret",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        }
+        environ = {"HOME": "/home/u", **proxies, **secrets}
+
+        version_env = prerequisite_module._probe_env(environ, "/probe/search/path")
+        identity_env = prerequisite_module._identity_probe_env(environ, version_env)
+
+        # The unvalidated --version candidate never sees proxy configuration.
+        for name in proxies:
+            assert name not in version_env
+        # whoami gets the full proxy set, values intact.
+        for name, value in proxies.items():
+            assert identity_env[name] == value
+        # Non-allowlisted variables stay refused in both environments.
+        for name in secrets:
+            assert name not in version_env
+            assert name not in identity_env
+        # _probe_env pins PATH to the caller's search path regardless of the
+        # allowlist admitting the host PATH.
+        assert version_env["PATH"] == "/probe/search/path"
+        assert identity_env["PATH"] == "/probe/search/path"
+
     def test_binary_digest_rejects_oversized_candidate(
         self,
         tmp_path: Path,
@@ -1384,15 +1437,27 @@ class TestKiroPrerequisiteWorkflow:
                     str(tmp_path / ".local" / "share" / "kiro-cli"),
                     str(tmp_path / ".local" / "share" / "amazon-q"),
                 )
+                # Proxy configuration never reaches the unvalidated --version
+                # candidate (a proxy URL can embed credentials); it joins only
+                # the whoami stage below. Desktop IPC beyond the session bus
+                # stays excluded.
                 assert "HTTPS_PROXY" not in runtime.kwargs[index]["env"]
                 assert "DISPLAY" not in runtime.kwargs[index]["env"]
-                # The session bus IS forwarded now — some CLI builds connect to
+                # The session bus IS forwarded — some CLI builds connect to
                 # the D-Bus secret-service keyring even at --version (AL2023).
-                # Other desktop IPC / proxy vars stay excluded.
                 assert (
                     runtime.kwargs[index]["env"].get("DBUS_SESSION_BUS_ADDRESS")
                     == "unix:path=/tmp/bus"
                 )
+            if call[1] == ["whoami"]:
+                # A proxy-only host is exactly where whoami must reach the IdP
+                # the way the user's shell does, so the identity stage carries
+                # the proxy configuration the version stage withheld.
+                assert (
+                    runtime.kwargs[index]["env"].get("HTTPS_PROXY")
+                    == "http://secret@proxy.example:8443"
+                )
+                assert "DISPLAY" not in runtime.kwargs[index]["env"]
 
     @pytest.mark.asyncio
     async def test_probe_does_not_spawn_when_invoked_audit_fails(
@@ -3937,6 +4002,129 @@ class TestKiroCrewNeverSetsUpKiroCli:
             assert not hasattr(prerequisite_module, attribute), attribute
         for method in ("start_login", "_login", "_capture_operation_output"):
             assert not hasattr(KiroPrerequisiteService, method), method
+
+    @pytest.mark.asyncio
+    async def test_identity_probe_gets_idp_budget_and_version_stays_short(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # whoami may refresh an OIDC token against an organization IdP (IAM
+        # Identity Center), a 12-20s round trip, so it carries its own budget.
+        # --version is the FIRST execution of an unknown candidate and must
+        # keep the short leash, or a missing/hung binary blocks the gate for
+        # the full identity budget.
+        executable = tmp_path / ".local" / "bin" / "kiro-cli"
+        _make_executable(executable)
+        runtime = _FakeRuntime(executable)
+        runtime.authenticated = True
+
+        service = KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": str(executable.parent)},
+            home=tmp_path,
+            process_runner=runtime.run,
+            audit_writer=_no_audit,
+        )
+        await service.snapshot(force=True)
+
+        budgets = {
+            tuple(args): kwargs["timeout_secs"]
+            for (_, args), kwargs in zip(runtime.calls, runtime.kwargs)
+        }
+        assert budgets[("--version",)] == prerequisite_module._PROBE_TIMEOUT_SECS
+        assert budgets[("whoami",)] == prerequisite_module._IDENTITY_PROBE_TIMEOUT_SECS
+        assert (
+            prerequisite_module._IDENTITY_PROBE_TIMEOUT_SECS
+            > prerequisite_module._PROBE_TIMEOUT_SECS
+        )
+
+    @pytest.mark.asyncio
+    async def test_slow_idp_whoami_inside_new_budget_resolves_authenticated(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # A whoami that needs longer than the old shared ceiling but fits the
+        # identity budget must resolve as authenticated. The runner times out
+        # iff the granted budget cannot cover an Identity Center token refresh
+        # (measured at 12-20s), which is exactly what the real subprocess does.
+        executable = tmp_path / ".local" / "bin" / "kiro-cli"
+        _make_executable(executable)
+        idp_refresh_secs = 20.0
+
+        async def run(command: str, args: list[str], **kwargs: Any) -> ProcessResult:
+            del command
+            if args == ["--version"]:
+                return ProcessResult(ok=True)
+            if args == ["whoami"]:
+                if kwargs["timeout_secs"] <= idp_refresh_secs:
+                    return ProcessResult(ok=False, timed_out=True, error="process timed out")
+                return ProcessResult(ok=True)
+            return ProcessResult(ok=False)
+
+        service = KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": str(executable.parent)},
+            home=tmp_path,
+            process_runner=run,
+            audit_writer=_no_audit,
+        )
+        status = await service.snapshot(force=True)
+        assert status["authenticated"] is True
+        assert status["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_auto_poll_serves_latched_state_while_slow_probe_runs(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # The identity probe can legitimately run for the full IdP budget. A
+        # machine poll arriving mid-probe must answer immediately from the
+        # latched state — queueing behind _probe_lock would freeze the gate's
+        # pane for the probe's remaining duration, in every open tab.
+        executable = tmp_path / ".local" / "bin" / "kiro-cli"
+        _make_executable(executable)
+        probe_entered = asyncio.Event()
+        release_probe = asyncio.Event()
+        slow = {"active": False}
+        calls: list[list[str]] = []
+        clock = {"now": 1_000.0}
+
+        async def run(command: str, args: list[str], **kwargs: Any) -> ProcessResult:
+            del command, kwargs
+            calls.append(args)
+            if slow["active"] and args == ["whoami"]:
+                probe_entered.set()
+                await release_probe.wait()
+            return ProcessResult(ok=True)
+
+        service = KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": str(executable.parent)},
+            home=tmp_path,
+            process_runner=run,
+            audit_writer=_no_audit,
+            clock=lambda: clock["now"],
+        )
+        # Latch a fast, healthy answer first.
+        first = await service.snapshot(force=True)
+        assert first["ready"] is True
+
+        # Past the floor, a slow probe starts and hangs inside whoami.
+        clock["now"] += prerequisite_module._FORCED_PROBE_FLOOR_SECS + 1
+        slow["active"] = True
+        in_flight = asyncio.create_task(service.snapshot(force=True, coalesce=True))
+        await asyncio.wait_for(probe_entered.wait(), timeout=2)
+
+        # Machine polls answer promptly from the latch, spawning nothing.
+        spawns_before = len(calls)
+        polled = await asyncio.wait_for(
+            service.snapshot(force=True, coalesce=True), timeout=1
+        )
+        assert polled["ready"] is True
+        assert len(calls) == spawns_before
+
+        release_probe.set()
+        await asyncio.wait_for(in_flight, timeout=2)
 
     @pytest.mark.asyncio
     async def test_auto_poll_is_coalesced_but_check_again_always_probes(

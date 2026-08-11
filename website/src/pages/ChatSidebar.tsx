@@ -384,6 +384,11 @@ interface Slot {
   // Derived (not a payload field), like `unread`: true when the slot's last
   // activity falls inside `RECENT_WINDOW_MS`. Computed in `enrichedSlots`.
   recent?: boolean
+  // Derived: the RAW per-turn flag, preserved before `running` is widened to
+  // the "in progress" notion (live workflow run / active goal loop) for the
+  // session filter. Subtitle logic reads this to tell mid-turn from idle —
+  // an idle-between-cycles loop must show its last message, not "Thinking…".
+  midTurn?: boolean
   tags?: string[]
   forked_from?: string | null
   source_links?: Array<{
@@ -1053,11 +1058,18 @@ function ChatSidebar({
       // A slot with a live dynamic-workflow run counts as running so the
       // "In progress" filter (and its count) surfaces it, even though the
       // parent turn has ended while the run executes in the background.
-      return { ...s, running: s.running || !!workflowActive[s.key], unread: unreadSet.has(s.key), recent }
+      // An active goal loop (auto-nudge) counts too: a looping session idles
+      // between cycles with running=false, but it is still mid-mission — its
+      // row shows "Loop N/M", so dropping it from "In progress" undercounts.
+      // Own-property read, matching the row renderer: the store normalizes
+      // writes through `safeKey`, so a bare index read could resolve a
+      // `__proto__`-like key to a truthy `Object.prototype`.
+      const looping = Object.prototype.hasOwnProperty.call(goalLoops ?? {}, s.key)
+      return { ...s, running: s.running || !!workflowActive[s.key] || looping, midTurn: s.running, unread: unreadSet.has(s.key), recent }
     })
     // `recentTick` is an intentional dep: it forces recency to re-evaluate on
     // the heartbeat above so idle sessions age out of the Recent filter.
-  }, [slots, unreadSet, recentWindowMs, recentTick, workflowActive]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [slots, unreadSet, recentWindowMs, recentTick, workflowActive, goalLoops]) // eslint-disable-line react-hooks/exhaustive-deps
   const filterCounts = useMemo(() => {
     const counts = {} as Record<SessionFilterKey, number>
     for (const filterDef of SESSION_FILTERS) counts[filterDef.key] = enrichedSlots.filter(slot => slot[filterDef.key]).length
@@ -1482,14 +1494,20 @@ function ChatSidebar({
     [foldersWithActiveSubtree],
   )
 
+  // State and in the memo deps on purpose, not a ref: a frozen run caches its
+  // stale list against new deps, so clearing a ref would invalidate nothing.
+  const [dragFrozen, setDragFrozen] = useState(false)
+  const frozenSlotsRef = useRef<Slot[]>([])
+
   const filteredSlots = useMemo(() => {
+    if (dragFrozen) return frozenSlotsRef.current
     const activeFilterDefs = SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
     // Active content search: order by the backend's relevance ranking instead
     // of the sidebar sort (mirrors the Older Sessions lane and the command
     // palette). Pinning stays a reachability promise for browsing, not a
     // ranking hint inside explicit search results.
     const searchRanked = slotFilter.trim().length >= SEARCH_MIN_CHARS ? slotSearchRanks : null
-    return enrichedSlots
+    const next = enrichedSlots
       .filter(slot => {
         if (activeFilterDefs.length > 0 && !activeFilterDefs.some(filterDef => slot[filterDef.key])) return false
         if (!slotFilter) return true
@@ -1499,8 +1517,10 @@ function ChatSidebar({
       .sort((a, b) => searchRanked
         ? (searchRanked.get(a.key) ?? Infinity) - (searchRanked.get(b.key) ?? Infinity)
         : comparePinnedThenSort(a, b, sortKey, pinned))
+    frozenSlotsRef.current = next
+    return next
   },
-    [enrichedSlots, slotFilter, slotSearchRanks, pinned, sortKey, activeFilters]
+    [enrichedSlots, slotFilter, slotSearchRanks, pinned, sortKey, activeFilters, dragFrozen]
   )
 
   // Folder IDs whose sessions are excluded from the flat lane because the
@@ -1784,12 +1804,14 @@ function ChatSidebar({
   // (draggable rows + droppable folder/root targets); the active item's
   // data.type routes the drop.
   const handleSidebarDragStart = useCallback((e: DragStartEvent) => {
+    setDragFrozen(true)
     const d = e.active.data.current as { type?: string; key?: string } | undefined
     if (d?.type === 'session' && d.key) setActiveDrag({ type: 'session', id: d.key })
     else if (d?.type === 'folder') setActiveDrag({ type: 'folder', id: e.active.id as string })
   }, [])
   const handleSidebarDragEnd = useCallback((event: DragEndEvent) => {
     setActiveDrag(null)
+    setDragFrozen(false)
     if (dragExpandTimer.current) { clearTimeout(dragExpandTimer.current.timer); dragExpandTimer.current = null }
     const { active, over } = event
     if (!over) return
@@ -1834,7 +1856,7 @@ function ChatSidebar({
       else if (o?.type === 'folder') assignToFolder(a.key, over.id as string)
     }
   }, [reorderFolders, assignToFolder, moveFolderTo, slots, activeSlot, onDropSessionRef])
-  const handleSidebarDragCancel = useCallback(() => { setActiveDrag(null); if (dragExpandTimer.current) { clearTimeout(dragExpandTimer.current.timer); dragExpandTimer.current = null } }, [])
+  const handleSidebarDragCancel = useCallback(() => { setActiveDrag(null); setDragFrozen(false); if (dragExpandTimer.current) { clearTimeout(dragExpandTimer.current.timer); dragExpandTimer.current = null } }, [])
   // Auto-expand collapsed folders when a dragged item hovers over them for 500ms.
   const dragExpandTimer = useRef<{ id: string; timer: ReturnType<typeof setTimeout> } | null>(null)
   const handleSidebarDragOver = useCallback((event: DragOverEvent) => {
@@ -2151,11 +2173,14 @@ function ChatSidebar({
     // loop line's trailing detail. This is why the loop branch can outrank the
     // working signals below without swallowing them: live workflow/subagent/tool
     // status still shows, and between cycles it falls back to the last message.
+    // Reads `midTurn` (the raw turn flag), NOT `running`: enrichment widens
+    // `running` to include this very loop, and an idle-between-cycles row must
+    // say "Loop 7/24 · <last message>", not "Loop 7/24 · Thinking…".
     const goalLoopDetail = wfActive
       ? wfActive.label
       : subagentCount > 0
         ? subagentLabel
-        : s.running
+        : s.midTurn
           ? slotStatusText(slotStatusDetail[s.key], simplifiedToolNames, uiLang)
           : (s.last_message || '')
     const ci = s.color_index != null && s.color_index >= 0 && s.color_index < paletteColors.length ? s.color_index : null
@@ -2490,7 +2515,12 @@ function ChatSidebar({
                       {link.state === 'closed' && <span className="capitalize text-danger">{link.state}</span>}
                       {/* CI status is moot once the PR is terminal (merged or closed) —
                           the lifecycle glyph is the terminal signal. */}
-                      {showsChipCi(link.state) && link.ci === 'running' && <Loader2 className="lucide-inline shrink-0 animate-spin" aria-label={i18nT('pages.chatSidebar.checks_running')} />}
+                      {/* Pending CI is a STATIC amber dot (the provider's own pending
+                          convention), never a spinner: an animated glyph on a session
+                          card reads as "the agent is working on this session", which is
+                          a stronger claim than "this PR's checks haven't finished".
+                          Motion on the card stays reserved for session activity. */}
+                      {showsChipCi(link.state) && link.ci === 'running' && <Circle className="lucide-inline shrink-0 text-warn scale-75" fill="currentColor" strokeWidth={0} aria-label={i18nT('pages.chatSidebar.checks_running')} />}
                       {showsChipCi(link.state) && link.ci === 'passed' && <Check className="lucide-inline shrink-0 text-ok" aria-label={i18nT('pages.chatSidebar.checks_passed')} />}
                       {showsChipCi(link.state) && link.ci === 'failed' && <X className="lucide-inline shrink-0 text-danger" aria-label={i18nT('pages.chatSidebar.checks_failed')} />}
                     </a>
@@ -2639,6 +2669,15 @@ function ChatSidebar({
                *  path is the ⋯-menu Rename item, so scope-disable the interaction rule. */}
               {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
               <span className="flex-1 text-[13px] font-medium text-text truncate text-left" title={i18nT('pages.chatSidebar.double_click_to_rename')} onDoubleClick={e => { e.stopPropagation(); setEditingId(folder.id); setEditScope('list'); setEditName(folder.name) }}>{folder.name}</span>
+              {/* Channel-owned folder (created by per-channel session filing):
+               *  show the channel's brand mark so the folder reads as "these are
+               *  the Discord conversations" at a glance. Guarded the same way the
+               *  session rows are — a channel with no brand asset shows nothing
+               *  rather than ChannelBrandIcon's generic Link2 fallback, which
+               *  means "live mirroring" elsewhere in this sidebar. */}
+              {folder.channel && hasChannelBrandIcon(folder.channel) && (
+                <span className="shrink-0 opacity-80" aria-hidden><ChannelBrandIcon channel={folder.channel} size={11} /></span>
+              )}
               {folder.project_dir && <span className="text-[10px] text-accent/60 shrink-0" title={folder.project_dir}><Link2 size={9} /></span>}
               {hasUnread && folder.collapsed && <span className="w-2 h-2 rounded-full shrink-0" style={{ background: 'var(--accent)' }} />}
               <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>

@@ -394,6 +394,9 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   const [deviceId, setDeviceId] = useState('responsive')
   const [deviceMenuOpen, setDeviceMenuOpen] = useState(false)
   const deviceMenuRef = useRef<HTMLDivElement>(null)
+  // The native address-bar input. The view-URL sync effect reads its focus so a
+  // view-initiated navigation never overwrites the field while the user types.
+  const nativeInputRef = useRef<HTMLInputElement>(null)
 
   const url = nav.index >= 0 ? nav.stack[nav.index] : ''
   const canBack = nav.index > 0
@@ -530,6 +533,27 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     window.addEventListener(PREVIEW_PENDING_EVENT, onPending)
     return () => window.removeEventListener(PREVIEW_PENDING_EVENT, onPending)
   }, [sessionKey])
+
+  // Reflect view-initiated navigation (agent browser_navigate, in-page link
+  // clicks, redirects) into the native address bar. `did-navigate` already
+  // updates `native.state.url`, but the input is bound to `draft`, which
+  // otherwise only changes on typing or back/forward — so an agent-opened page
+  // left the bar empty and showing its placeholder. Mirror the live URL into
+  // `draft`, but never while the user is editing the field, so a slow redirect
+  // cannot overwrite what they are typing.
+  //
+  // Display only — deliberately does NOT persist. `native.state` carries no
+  // session tag, and on a slot switch this component instance is reused (its
+  // `sessionKey` changes) while `useNativeBrowser` may still hold the previous
+  // slot's state until `getState` resolves; persisting here would write that
+  // stale URL into the NEW slot's storage. User-typed navigation persists via
+  // `commitNative`; view-initiated navigation stays display-only, as before.
+  useEffect(() => {
+    const u = native.state?.url
+    if (!nativeOpen || !u) return
+    if (document.activeElement === nativeInputRef.current) return
+    setDraft(u)
+  }, [nativeOpen, native.state?.url])
 
   // Close the device menu on outside click.
   useEffect(() => {
@@ -729,6 +753,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
       >
         <div className="flex-1 min-w-0 flex items-center gap-0.5 h-7 pl-1 pr-1 rounded-md bg-bg-elevated border border-border focus-within:border-accent transition-colors">
           <input
+            ref={nativeInputRef}
             type="text"
             value={draft}
             onChange={e => setDraft(e.target.value)}
@@ -934,15 +959,18 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             <div className="text-[11px] text-muted max-w-[320px] leading-snug">
               {i18nT('components.webPreviewPanel.this_dashboard_is_served_over_https_so_the_brows')}
               <span className="font-mono"> {i18nT('components.webPreviewPanel.http')} </span>
-              {i18nT('components.webPreviewPanel.page_mixed_content_open_it_in_a_new_tab_instead')}
+              {i18nT('components.webPreviewPanel.page_mixed_content')}
             </div>
+            <code className="text-[11px] font-mono px-2 py-1 rounded bg-bg-elevated text-text break-all max-w-[320px]">
+              {url}
+            </code>
             <a
               href={url}
               target="_blank"
               rel="noreferrer"
               className="inline-flex items-center gap-1.5 text-[12px] px-3 py-1.5 rounded-md border border-border text-text hover:bg-bg-hover transition-colors no-underline"
             >
-              <ExternalLink size={13} /> {i18nT('components.webPreviewPanel.open')} {url}
+              <ExternalLink size={13} /> {i18nT('components.webPreviewPanel.open_in_browser')}
             </a>
           </div>
         ) : selfOrigin ? (

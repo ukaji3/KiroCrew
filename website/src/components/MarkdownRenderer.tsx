@@ -34,11 +34,13 @@ import { usePathKind, type PathKind } from '../hooks/usePathKind'
 import { fileIcon } from '../utils/fileIcons'
 import { urlTransform, ALLOWED_PROTOCOLS } from '../utils/urlTransform'
 import { safeHttpUrl } from '../lib/safeUrl'
-import { useLinkMeta } from '../lib/linkMeta'
+import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
-import { parseSourceLinkUrl } from '../utils/pullRequestLinks'
+import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import JiraLogo from './icons/JiraLogo'
+import GithubLogo from './icons/GithubLogo'
+import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
 import MonacoCodeBlock from './MonacoCodeBlock'
 import { SmoothResize } from './SmoothResize'
@@ -405,21 +407,35 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // the unfurl gate for a claimed href also means a claimed link is never
   // fetched, so the priority holds at the network boundary, not just visually.
   const claimed = href && override ? override({ href, children }) : null
-  const target = useUnfurlHref(claimed ? null : href)
-  const meta = useLinkMeta(target ?? undefined, target !== null)
-  // Jira issue URLs chip synchronously from the URL alone (icon + issue key) —
-  // no fetch, unlike the unfurl chip below. Jira instances sit behind auth, so
-  // an unfurl of one can never succeed; parsing the key out of the path is the
-  // only way these links ever get at-a-glance recognition. Self-hosted
-  // instances come through `JiraHostsCtx` from the operator allowlist.
+  // Jira, GitHub, and GitLab issue / PR / MR URLs chip synchronously from the
+  // URL alone (provider mark + reference) — no fetch, unlike the unfurl chip
+  // below, so these chips render in user messages and with `link_previews`
+  // off. Jira instances sit behind auth, so an unfurl of one can never
+  // succeed; GitHub/GitLab pages unfurl fine but only in assistant messages
+  // and only when the operator opted in, which left forge links as raw text
+  // in most contexts (#2579). The parser matches hostnames EXACTLY
+  // (`github.com` / `gitlab.com`, `www.` stripped) — a lookalike host such as
+  // `evil-github.com.attacker.test` falls through to the plain anchor.
+  // Self-hosted Jira instances come through `JiraHostsCtx` from the operator
+  // allowlist. Forge chips additionally require `safeHttpUrl`: the chip keeps
+  // the AUTHORED href (preserving e.g. `#issuecomment` fragments the parser's
+  // canonical url drops), so a credential-smuggling `user:pass@github.com`
+  // href must never be dressed up as a trusted-looking chip.
   const jiraHosts = useContext(JiraHostsCtx)
-  const jira = useMemo(() => {
+  const source = useMemo(() => {
     if (!href || claimed) return null
     const link = parseSourceLinkUrl(href, [], jiraHosts)
-    return link?.provider === 'jira' ? link : null
+    if (!link) return null
+    if (link.provider === 'jira') return link
+    return safeHttpUrl(href) ? link : null
   }, [href, claimed, jiraHosts])
+  // A chipped link is never handed to the unfurl gate — mirroring `claimed`,
+  // so the no-fetch guarantee holds at the network boundary, not just visually.
+  const target = useUnfurlHref(claimed || source ? null : href)
+  const meta = useLinkMeta(target ?? undefined, target !== null)
   if (claimed) return <>{claimed}</>
-  if (jira) {
+  if (source?.provider === 'jira') {
+    const jira = source
     return (
       <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
@@ -431,6 +447,25 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
         >
           <JiraLogo size={12} className="shrink-0" />
           <span className="truncate max-w-[24ch]">{`${jira.repo}-${jira.number}`}</span>
+        </a>
+      </span>
+    )
+  }
+  const forgeLabel = source ? forgeChipLabel(source) : null
+  if (source && forgeLabel) {
+    return (
+      <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={href}
+          className="inline-flex min-w-0 items-center gap-1.5 text-text no-underline focus-ring"
+        >
+          {source.provider === 'github'
+            ? <GithubLogo size={12} className="shrink-0" />
+            : <GitlabLogo size={12} className="shrink-0" />}
+          <span className="truncate max-w-[32ch]">{forgeLabel}</span>
         </a>
       </span>
     )
@@ -641,20 +676,75 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
  * (see `MdAnchor`), a link standing alone is a card. `LinkCard` replaces the
  * `<p>` rather than nesting inside it, so the card is a block-level sibling of
  * the surrounding paragraphs.
+ *
+ * Jira issue URLs take a synchronous branch of the same rule, mirroring
+ * `MdAnchor`'s chip: Jira instances sit behind auth, so the unfurl fetch can
+ * never be relied on to produce a preview for them. The card is built from the
+ * URL alone (provider mark, issue key, instance host) with NO request, and
+ * recognition is the same allowlist-gated parse as the chip (`JiraHostsCtx`).
+ * It obeys the same `enabled`/`live` gate as the fetched card, so ungated
+ * surfaces (file previews, artifact pages, sourcePos mode) and streaming tails
+ * keep today's inline chip.
  */
 function MdParagraph({ node, children }: React.HTMLAttributes<HTMLParagraphElement> & ExtraProps) {
   const override = useContext(LinkOverrideCtx)
+  const { enabled: cardsOn, live } = useContext(LinkUnfurlCtx)
+  const jiraHosts = useContext(JiraHostsCtx)
   const sole = soleLinkInParagraph(node)
-  const target = useUnfurlHref(sole?.href)
+  const jira = useMemo(() => {
+    if (!sole?.href || !cardsOn || live) return null
+    const link = parseSourceLinkUrl(sole.href, [], jiraHosts)
+    return link?.provider === 'jira' ? link : null
+  }, [sole?.href, cardsOn, live, jiraHosts])
+  // A recognized Jira link never reaches the unfurl machinery: its card is
+  // synchronous, so handing the href on would only add a fetch whose result
+  // is discarded.
+  const target = useUnfurlHref(jira ? null : sole?.href)
   // Same priority rule as MdAnchor: a link the override owns stays an in-app
   // affordance inside an ordinary paragraph, never a card. The provider is a
   // pure render prop (Issue Radar's returns a RefLink element), and the probe
   // only runs when a card is otherwise on the table.
-  const claimed = !!(target && override && override({ href: target, children: sole?.text }))
+  const cardHref = jira ? sole?.href ?? null : target
+  const claimed = !!(cardHref && override && override({ href: cardHref, children: sole?.text }))
   const unfurl = claimed ? null : target
   const meta = useLinkMeta(unfurl ?? undefined, unfurl !== null)
+  if (jira && !claimed) {
+    // `jira.url` (the parser's canonical form), NEVER `sole.href`: this branch
+    // sits before the `safeHttpUrl()` rejection the unfurl path gets, so the
+    // raw href could still carry Basic-auth userinfo. The canonical URL is
+    // rebuilt from hostname+port alone — credentials cannot survive into it —
+    // and it is the same target the inline chip's anchor already uses.
+    return (
+      <LinkCard
+        meta={jiraCardMeta(jira)}
+        href={jira.url}
+        icon={<JiraLogo size={18} className="shrink-0" />}
+      />
+    )
+  }
   if (unfurl && meta) return <LinkCard meta={meta} href={unfurl} />
   return <p {...sp(node)} className="my-1.5 leading-relaxed">{children}</p>
+}
+
+/**
+ * Synthetic `LinkMeta` for the Jira card, from the parsed URL alone: the issue
+ * key is the title and the instance host is the domain — the same information
+ * the inline chip carries, in card layout. No description on purpose: main has
+ * no Jira issue fetch, and inventing one here would put this card behind auth.
+ */
+function jiraCardMeta(link: PullRequestLink): LinkMeta {
+  let domain = ''
+  try { domain = new URL(link.url).host } catch { /* unreachable: link.url came out of the parser */ }
+  return {
+    url: link.url,
+    title: `${link.repo}-${link.number}`,
+    description: '',
+    siteName: '',
+    domain,
+    icon: '',
+    iconDark: '',
+    fetchedAt: 0,
+  }
 }
 
 const MD_COMPONENTS: Components = {

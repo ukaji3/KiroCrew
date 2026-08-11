@@ -517,6 +517,22 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "the same output-boundary reason as the app activity log.",
     ),
     (
+        "Shared options-overflow sink",
+        "messaging/renderer.py",
+        "The one place LLM-authored [OPTIONS:] choices that do not fit a channel's "
+        "interactive widget are written into the message BODY (format_overflow, "
+        "reached from apply_options_cap on slack/telegram/discord). That crosses a "
+        "boundary the widget path does not: a widget label is plain text, while the "
+        "body is markdown-parsed, so a key split by a code span, emphasis or a "
+        "Discord spoiler is broken to every byte-level scan -- including the "
+        "TurnDriver's streaming redactor -- and whole on screen once the platform "
+        "drops the delimiters. Choices are therefore redacted here in DISPLAY form "
+        "(messaging/display_safety.py) BEFORE mention syntax is defanged, since the "
+        "ZWSP insertion is itself a post-scan transformation. Enforced at this sink "
+        "rather than per renderer for the same reason the max_buttons cap lives in "
+        "shared code: a channel cannot forget what it does not call.",
+    ),
+    (
         "Slack render pipeline",
         "slack/format.py",
         "The Slack RENDERING boundary: text that is converted to mrkdwn goes "
@@ -703,6 +719,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
         "apps/builtins/mochi/redact.py",
+        # Same shape: applies a redactor the CALLER injects, to scan the form a
+        # platform will actually render (markup collapsed, ANSI stripped). It owns
+        # no output of its own -- the registered sinks are the modules that call
+        # it (slack/format.py, messaging/renderer.py).
+        "messaging/display_safety.py",
         "autonudge_authz.py",
         "acp/_dispatch.py",
         "acp/client.py",
@@ -729,6 +750,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # scan hits, and the change degrades to the local queue instead. Lives in
         # push_policy because all three push paths share this one implementation.
         "apps/builtins/auto_improvement/spine/push_policy.py",
+        # Inbound: the crew worker's slot title is derived from an issue title,
+        # which is untrusted text anyone who can open an issue wrote. It is
+        # scrubbed before it becomes a slot title (and fails CLOSED to the slot
+        # key if the redactors are unavailable), so this is inbound sanitisation
+        # rather than an egress boundary — the slot title's user-visible surface
+        # is already covered by the registered dashboard sinks.
+        "apps/builtins/issue_radar/backend/crew_runtime.py",
         # Internal persistence / indexing (the on-disk or in-memory copy), whose
         # user-visible surface is already covered by a registered sink.
         "dashboard/chat_folders.py",
@@ -884,6 +912,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # are the app's own surface, same classification as its siblings above.
         "apps/builtins/code_review_sage/sage_lib/store.py",
         "apps/builtins/code_review_sage/sage_lib/discovery.py",
+        # `chat_session` scrubs every turn of a post-review conversation at its
+        # serialization boundary: the reviewer can repeat a credential it read in
+        # the diff, and a tool title carries the arguments it was called with. Same
+        # classification as its siblings — the app's own surface, rendered by this
+        # app's panel, not a core egress path.
+        "apps/builtins/code_review_sage/sage_lib/chat_session.py",
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",

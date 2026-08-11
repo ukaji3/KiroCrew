@@ -154,7 +154,7 @@ import {
   sourceSelection,
   withSourceSelection,
 } from '../utils/pullRequestLinks'
-import { deriveFollowUpOptions } from '../utils/deriveFollowUpOptions'
+import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import OverlayDrawer from '../components/OverlayDrawer'
 import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
@@ -183,6 +183,7 @@ import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './chat/Work
 import SubagentCompletionCard from './chat/SubagentCompletionCard'
 import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './chat/subagentCompletion'
 import { renderMcpOAuthMessage } from './chat/McpOAuthBanner'
+import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import TurnBlock from './chat/TurnBlock'
 import Clickable from '../components/Clickable'
 import StopEventCard from './chat/StopEventCard'
@@ -382,7 +383,7 @@ function KnowledgeBubbleChip({ knowledge }: { knowledge: { items: number; tokens
   )
 }
 
-export function renderUserContent(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, onFolderOpen?: (path: string) => void) {
+export function renderUserContent(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, onFolderOpen?: (path: string) => void, linkPreviews?: boolean) {
   // Per-message containment (defense-in-depth): a render crash in a
   // user/inject bubble must degrade to a per-message fallback, not unwind to
   // the root boundary and blank the whole dashboard.
@@ -393,12 +394,12 @@ export function renderUserContent(content: string, meta: Record<string, unknown>
   // context export.)
   return (
     <MessageErrorBoundary rawContent={content}>
-      {renderUserContentInner(content, meta, onFileOpen, onFolderOpen)}
+      {renderUserContentInner(content, meta, onFileOpen, onFolderOpen, linkPreviews)}
     </MessageErrorBoundary>
   )
 }
 
-function renderUserContentInner(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, onFolderOpen?: (path: string) => void) {
+function renderUserContentInner(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, onFolderOpen?: (path: string) => void, linkPreviews?: boolean) {
   const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
   const knowledge = meta?.knowledge as { items: number; tokens: number; titles: string[]; content?: { title: string; text: string }[] } | undefined
 
@@ -416,7 +417,7 @@ function renderUserContentInner(content: string, meta: Record<string, unknown> |
     <KnowledgeBubbleChip knowledge={knowledge} />
   ) : null
 
-  if (!pastes.length) return <>{knowledgeBadge}{renderFileSegment(content, meta, onFileOpen, 'seg', dirMentionMap, onFolderOpen)}</>
+  if (!pastes.length) return <>{knowledgeBadge}{renderFileSegment(content, meta, onFileOpen, 'seg', dirMentionMap, onFolderOpen, linkPreviews)}</>
 
 
   // History load re-serves the fully-EXPANDED content (what the LLM saw), so a
@@ -437,7 +438,7 @@ function renderUserContentInner(content: string, meta: Record<string, unknown> |
       ranges = findTokenRanges(text, pastes)
     }
   }
-  if (!ranges.length) return <>{knowledgeBadge}{renderFileSegment(text, meta, onFileOpen, 'seg', dirMentionMap, onFolderOpen)}</>
+  if (!ranges.length) return <>{knowledgeBadge}{renderFileSegment(text, meta, onFileOpen, 'seg', dirMentionMap, onFolderOpen, linkPreviews)}</>
 
   // Paste chips are inline by nature, so to keep them flowing with the
   // surrounding text (e.g. "hey [chip] thanks"), render each text segment
@@ -611,13 +612,15 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
  *  server stores the token form in `content` AND keeps `meta.files` at once.
  *  Files referenced inline stay inline chips; the rest become block cards.
  *  Images keep their inline `![image](path)` markdown and are excluded here. */
-function renderFileSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string, dirMap?: Map<string, string>, onFolderOpen?: (path: string) => void) {
+function renderFileSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string, dirMap?: Map<string, string>, onFolderOpen?: (path: string) => void, linkPreviews?: boolean) {
   const parsedFiles = parseFiles(content, meta)
   const dirKeys = dirMap ? [...dirMap.keys()].filter(k => tokenPresent(content, k)).slice(0, 20) : []
 
   // No attachments — plain markdown (bold, code, links, etc.).
   // softBreaks: preserve Shift+Enter line breaks as <br> (see MarkdownRenderer).
   // compactImages: this is user-message content, so attached images render small.
+  // linkPreviews: mirrors the assistant path — a URL the user pasted unfurls
+  // under the same opt-in gate as one the model wrote (issue #2580).
   //
   // A folder token routes the message into the inline chip-split body below,
   // which renders surrounding text as plain whitespace-preserving spans — so
@@ -627,7 +630,7 @@ function renderFileSegment(content: string, meta: Record<string, unknown> | unde
   // inline-widget seam; a folder-referencing prompt with block markdown is
   // the uncommon combination.
   if (!parsedFiles.length && !dirKeys.length) {
-    return <MarkdownRenderer content={content} softBreaks compactImages />
+    return <MarkdownRenderer content={content} softBreaks compactImages linkPreviews={linkPreviews} />
   }
 
   // Pass the ORIGINAL ordered list (images included) so [attached_file N] token
@@ -660,7 +663,7 @@ function renderFileSegment(content: string, meta: Record<string, unknown> | unde
   // then the cards.
   if (!mentionMap.size && !dirKeys.length) {
     const caption = display.trim()
-    return <>{caption ? <MarkdownRenderer key={`${keyBase}-cap`} content={caption} softBreaks compactImages /> : null}{cards}</>
+    return <>{caption ? <MarkdownRenderer key={`${keyBase}-cap`} content={caption} softBreaks compactImages linkPreviews={linkPreviews} /> : null}{cards}</>
   }
 
   // Inline-mention path: the caption keeps files inline, so render it as a
@@ -984,7 +987,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => { window.removeEventListener('focus', reload); window.removeEventListener('mc-config-changed', reload) }
   }, [])
 
-  const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger)
+  const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined)
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Promotes an agent to the global default. Set-only: clearing the default lives on
   // the Agent Templates page, where the control is labelled and the outcome is visible.
@@ -2165,6 +2168,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // belonging to another chat lives in this panel subtree, so deciding to unmount
   // on the active slot's (possibly empty) tab list would destroy that canvas.
   const hasLiveAppTab = useAnyLiveAppTab()
+  // Current slot only — unlike app tabs (hosted cross-slot via `allAppTabs`), a
+  // Browser tab renders solely from the active slot's strip, and a background
+  // slot's browser view already unmounts (its WebContentsView released) on the
+  // slot switch. So keep-mounted follows THIS slot's tabs, not every slot's.
+  const hasBrowserTab = tabsCtl.tabs.some(t => t.kind === 'browser')
   // Which file (if any) the Files tab is showing inline — kept PER SLOT (above
   // the SidePanel subtree so it survives panel collapse). Per-slot (not a single
   // value reset on switch) so it stays consistent with the per-slot tab buckets
@@ -3473,6 +3481,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // stable primitive so it can sit in the transcript renderer's dep list — flipping
   // the toggle has to re-render already-rendered messages, not just the next one.
   const linkPreviewsOn = dashCfg?.link_previews === true
+  // Connections cards own consent for the providers they render, so chat drops
+  // the duplicate OAuth banner — but only while that gallery is reachable.
+  const connectionsUiOn = useConnectionsUiEnabled()
   // Pop-out state for the title-bar control (shared singleton — same channel the menus use).
   const { isPoppedOut: isSlotPoppedOut, open: openActivePopout, focus: focusActivePopout, returnSelfToMain } = useChatPopouts()
   const activePoppedOut = !!activeSlot && isSlotPoppedOut(activeSlot)
@@ -4340,23 +4351,58 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     window.addEventListener('kirocrew-browser-frame', onFrame)
     return () => window.removeEventListener('kirocrew-browser-frame', onFrame)
   }, [dispatch])
-  // Reachability: declare the active slot to the Electron main process so the
-  // agent command channel polls for it (see listPanelIds) even before the Browser
+  // Reachability: declare open chat slots to the Electron main process so the
+  // agent command channel polls for them (see listPanelIds) even before the Browser
   // tab is ever opened — this is what makes the built-in browser the default for a
   // fresh chat. It is NOT a grant: authorization to drive the built-in browser is
   // Browser Mode (the Settings toggle), and the main-process gate is just the view
-  // precondition. There is no longer a separate per-session consent registration —
-  // the command channel can only deliver an op for a session key it polls for, and
-  // it must poll before any URL is known, so gating reachability on a per-session
+  // precondition. There is no separate per-session consent registration — the
+  // command channel can only deliver an op for a session key it polls for, and it
+  // must poll before any URL is known, so gating reachability on a per-session
   // grant would make the whole native path unreachable for a fresh chat.
+  //
+  // EVERY open chat is declared, not just the active one.
+  //
+  // The command channel can only deliver an op for a session key it polls for,
+  // and it must poll BEFORE any URL is known. Declaring only `activeSlot` made
+  // that a moving target, and both consequences were observed live in a diagnostic
+  // run:
+  //   * a chat created and messaged within seconds RACED the registration — the
+  //     navigate reached the gateway first, which answered `no-native-panel` (503)
+  //     because no poller held that key yet, so the proxy fell back to the
+  //     Playwright mirror for the whole turn (observed: slot created at T+0, the
+  //     navigate at T+15s, the key first reported 9 minutes later);
+  //   * a BACKGROUND chat was never reachable at all, even when it was the session
+  //     the agent was acting for.
+  //
+  // Declaring a key is NOT authorization — it grants nothing, and every op still
+  // runs the same gate — so there is no reason to report one key instead of all of
+  // them. Tracking is diffed rather than torn down per change: re-registering the
+  // same keys on every slot-list edit would churn IPC for no reason, and dropping
+  // them mid-turn is exactly the race above.
+  const trackedSlotsRef = useRef<Set<string>>(new Set())
+  const trackableSlotKeys = useMemo(
+    () => slots.map(s => s.key).filter((k): k is string => !!k),
+    [slots],
+  )
   useEffect(() => {
     const api = (window as unknown as {
       browserAPI?: { trackSession?: (id: string, tracked: boolean) => Promise<unknown> }
     }).browserAPI
-    if (!api?.trackSession || !activeSlot) return
-    void api.trackSession(activeSlot, true)
-    return () => { void api.trackSession?.(activeSlot, false) }
-  }, [activeSlot])
+    if (!api?.trackSession) return      // plain browser (no bridge)
+    const want = new Set(trackableSlotKeys)
+    const tracked = trackedSlotsRef.current
+    for (const key of want) {
+      if (tracked.has(key)) continue
+      tracked.add(key)
+      void api.trackSession(key, true)
+    }
+    for (const key of [...tracked]) {
+      if (want.has(key)) continue
+      tracked.delete(key)
+      void api.trackSession(key, false)
+    }
+  }, [trackableSlotKeys])
   // Native counterpart of the mirror auto-open above. When the agent opens a page
   // in the BUILT-IN browser, the WebContentsView is created in the Electron main
   // process but the dashboard owns layout — until the Browser panel mounts and
@@ -4544,6 +4590,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     ? ''
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
   const [sidebarPinned, setSidebarPinned] = useState(() => localStorage.getItem('mc-sidebar-pinned') !== 'false')
+  const sidebarPinnedRef = useRef(sidebarPinned)
+  sidebarPinnedRef.current = sidebarPinned
+  // Pre-focus session-list state while the Web Preview expand mode auto-hides
+  // it, so exiting focus mode restores what the user had. null = focus mode is
+  // not the reason the list is hidden (the user owns the state).
+  const sidebarAutoHidden = useRef<boolean | null>(null)
   const isMobile = useIsMobile()
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const v = parseInt(localStorage.getItem('mc-sidebar-width') || '', 10)
@@ -4754,8 +4806,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }), [search.term, search.caseSensitive, search.currentMessageIdx, search.currentOccurrenceIdx])
 
   const renderUserContentCb = useCallback(
-    (c: string, mt: Record<string, unknown> | undefined) => renderUserContent(c, mt, handleFileOpen, handleFolderOpen),
-    [handleFileOpen, handleFolderOpen]
+    (c: string, mt: Record<string, unknown> | undefined) => renderUserContent(c, mt, handleFileOpen, handleFolderOpen, linkPreviewsOn),
+    [handleFileOpen, handleFolderOpen, linkPreviewsOn]
   )
 
   const cancelTitleRef = useRef(false)
@@ -4765,6 +4817,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // Always-available collapse. Only guard is no-sessions (the sidebar is
       // force-open then anyway, so there is nothing to collapse).
       if (filteredSlotsRef.current.length === 0) return
+      // Explicit user intent outranks the preview-focus auto-hide, so exiting
+      // focus mode leaves this choice alone.
+      sidebarAutoHidden.current = null
       setSidebarPinned(p => {
         const next = !p
         safeSetItem('mc-sidebar-pinned', String(next))
@@ -5498,7 +5553,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (m.role === 'notice') return <div key={key} className="bg-card text-muted text-[13px] px-3 py-2 rounded-md border border-border self-center animate-scale-in">{m.content}</div>
     if (m.role === 'permission') return null
     if (m.role === 'mcp_oauth') {
-      const banner = renderMcpOAuthMessage(m)
+      const banner = renderMcpOAuthMessage(m, connectionsUiOn)
       return banner ? <div key={key}>{banner}</div> : null
     }
     // An injected workflow completion event renders as a compact status card
@@ -5586,7 +5641,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // apply-plan handler, so it belongs here for correctness. approve/send/
     // dismissApproval are NOT referenced in this renderer (user/approval rows go
     // through renderUserContentCb), so they are omitted to keep it stable.
-  }, [messages, visibleIndexMap, slotRunning, slotState, lastTextIdx, handleFileOpen, handleArtifactOpen, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage])
+  }, [messages, visibleIndexMap, slotRunning, slotState, lastTextIdx, handleFileOpen, handleArtifactOpen, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn])
 
   const [mobileSessions, setMobileSessions] = useState(false)
   // Close mobile sessions panel when a session is selected
@@ -5696,16 +5751,49 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return true
   }, [dispatch, isMobile, selectSource])
   // Web Preview "focus" (expand) mode — broadcast by the Web Preview tab's
-  // expand toggle. When on, hide the session list (below) and maximize the side
-  // panel (passed to SidePanel), so the preview gets max room and chat shrinks
-  // to its minimum. App collapses the left nav off the same event.
+  // expand toggle. When on, hide the session list and maximize the side panel
+  // (passed to SidePanel), so the preview gets max room and chat shrinks to its
+  // minimum. App collapses the left nav off the same event.
+  //
+  // Hiding the list drives `sidebarPinned` directly instead of overriding
+  // `sidebarOpen`: an override leaves the sessions toggle visibly present but
+  // inert. Driving the real state keeps that toggle working normally inside
+  // focus mode. `sidebarAutoHidden` holds the pre-focus state to restore on
+  // exit, and is cleared once the user toggles the list themselves. Neither
+  // transition persists `mc-sidebar-pinned` — only a user toggle does.
+  //
+  // The ref is read and cleared HERE, in the handler, and only plain values
+  // reach the setter: a state updater must be pure, and React invokes one twice
+  // under StrictMode, which would make the second pass read an already-cleared
+  // ref and lose the restore value.
+  //
+  // The mobile drawer is a separate state, so it is closed outright rather than
+  // suppressed — a swipe or a tap still reopens it, which an override would not
+  // allow.
   const [previewFocused, setPreviewFocused] = useState(false)
   useEffect(() => {
-    const onFocus = (e: Event) => setPreviewFocused(!!(e as CustomEvent<{ focused?: boolean }>).detail?.focused)
+    const onFocus = (e: Event) => {
+      const focused = !!(e as CustomEvent<{ focused?: boolean }>).detail?.focused
+      setPreviewFocused(focused)
+      if (focused) {
+        setMobileSessions(false)
+        if (sidebarAutoHidden.current === null) sidebarAutoHidden.current = sidebarPinnedRef.current
+        setSidebarPinned(false)
+        return
+      }
+      const prior = sidebarAutoHidden.current
+      sidebarAutoHidden.current = null
+      if (prior !== null) setSidebarPinned(prior)
+    }
     window.addEventListener(PREVIEW_FOCUS_EVENT, onFocus)
     return () => window.removeEventListener(PREVIEW_FOCUS_EVENT, onFocus)
   }, [])
-  const sidebarOpen = !previewFocused && (isMobile ? mobileSessions : (sidebarPinned || filteredSlots.length === 0))
+  // The no-sessions force-open yields to focus mode: with an empty list no
+  // sessions toggle is rendered, so suppressing it makes nothing inert, and the
+  // preview would otherwise stay covered by a list that cannot be dismissed.
+  const sidebarOpen = isMobile
+    ? mobileSessions
+    : (sidebarPinned || (filteredSlots.length === 0 && !previewFocused))
 
   // ── Collapsed-sidebar hover flyout ──────────────────────────────────────
   // Hovering the toggle while collapsed opens a recents list over the chat, so
@@ -5718,7 +5806,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const flyoutSurfaceRef = useRef<HTMLDivElement>(null)
   // Touch is a second gate beyond isMobile: a desktop-width touch device has no
   // hover, so the flyout would only ever appear as a tap artefact.
-  const flyoutEligible = !isMobile && !isTouchDevice() && !previewFocused && !splitMode
+  const flyoutEligible = !isMobile && !isTouchDevice() && !splitMode
     && embedMode !== 'chat' && embedMode !== 'sessions'
     && !sidebarOpen && filteredSlots.length > 0
   const flyout = useHoverIntent({
@@ -5761,12 +5849,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     focusComposerAfter(dispatch(createSlot({ agent: defaultAgent || undefined, mode: effectiveMode })).unwrap())
   }, [dispatch, defaultAgent, mode, flyout])
 
+  // Force the list open when there is nothing in it, so a user with no sessions
+  // still has the surface that creates one. Skipped while focus mode owns the
+  // hidden state: re-pinning there would fight the auto-hide and, worse, persist
+  // 'true' over the user's stored preference, which the restore on exit then
+  // contradicts in the live state.
   useEffect(() => {
-    if (filteredSlots.length === 0 && !sidebarPinned) {
+    if (filteredSlots.length === 0 && !sidebarPinned && !previewFocused) {
       setSidebarPinned(true)
       safeSetItem('mc-sidebar-pinned', 'true')
     }
-  }, [filteredSlots.length, sidebarPinned])
+  }, [filteredSlots.length, sidebarPinned, previewFocused])
 
   // Horizontal space (px) the detail panel must keep clear so it never grows
   // past its flex row and collapses the chat pane: the open sidebar's width
@@ -5774,6 +5867,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // shared row), so no reserve applies.
   const CHAT_PANE_MIN = CHAT_PANE_MIN_W
   const panelReserve = isMobile ? undefined : (sidebarOpen ? sidebarWidth : 0) + CHAT_PANE_MIN
+  // The panel takes its maximum only while the session list is actually hidden.
+  // That maximum is measured against the header's reserve, which knows nothing
+  // about the session list's width — so keeping it while the user reopens the
+  // list inside focus mode pushes the chat pane below CHAT_PANE_MIN and clips
+  // its content. Reverting to the normal width maths there costs the preview a
+  // few hundred px in a state the user asked for by reopening the list.
+  const panelMaximized = previewFocused && !sidebarOpen
 
   // FILL vs BESIDE for the activity panel, decided from the width left for the
   // CHAT once the shell's hideable chrome is subtracted — the nav rail track and
@@ -5820,7 +5920,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           mode, morphTarget below). Desktop, non-embed, with sessions only.
           While collapsed, hovering it opens the recents flyout below; clicking
           hands that flyout's rect to the drawer so the panel grows out of it. */}
-      {!isMobile && embedMode !== 'chat' && embedMode !== 'sessions' && !previewFocused && filteredSlots.length > 0 && (
+      {!isMobile && embedMode !== 'chat' && embedMode !== 'sessions' && filteredSlots.length > 0 && (
         <button
           ref={flyoutTriggerRef}
           type="button"
@@ -5985,7 +6085,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 <ChatHeaderMenu
                   activeSlot={activeSlot}
                   agent={currentSlot?.agent}
-                  onReveal={activeSlot ? () => { if (!sidebarPinned) setSidebarPinned(true); window.dispatchEvent(new CustomEvent('reveal-slot', { detail: activeSlot })) } : undefined}
+                  onReveal={activeSlot ? () => { sidebarAutoHidden.current = null; if (!sidebarPinned) setSidebarPinned(true); window.dispatchEvent(new CustomEvent('reveal-slot', { detail: activeSlot })) } : undefined}
                   onRename={activeSlot ? () => { setEditingTitle(true); setTitleDraft(title) } : undefined}
                   mode={effectiveMode}
                 />
@@ -6655,7 +6755,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
               <div ref={agentDropdownRef} role="dialog" aria-label={i18nT('pages.chatPage.agent_selector')} tabIndex={-1} onKeyDown={onAgentListKeyDown} className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl min-w-[260px] max-w-[340px] flex flex-col p-1 gap-0.5 animate-slide-up" style={(() => { const left = Math.max(8, Math.min(agentBtnRect.left, window.innerWidth - 348)); return { bottom: window.innerHeight - agentBtnRect.top + 4, left } })()}>
                 <div className="px-1.5 pt-1.5 pb-1">
-                  <Input ref={agentInputRef} type="text" aria-label={i18nT('pages.chatPage.filter_agents')} placeholder={i18nT('pages.chatPage.type_to_filter')} value={agentFilter} onChange={e => setAgentFilter(e.target.value)} className="w-full px-2 py-1 text-[13px] font-mono" />
+                  <Input ref={agentInputRef} type="text" aria-label={i18nT('pages.chatPage.filter_agents')} placeholder={i18nT('pages.chatPage.type_to_filter')} value={agentFilter} onChange={e => setAgentFilter(e.target.value)} className="w-full px-2 py-1 text-[13px]" />
                 </div>
                 <div role="listbox" aria-label={i18nT('pages.chatPage.agent_list')} className="overflow-y-auto max-h-[280px]">
                 {/* Embedded chat gets neither half of the default-agent affordance: it has
@@ -6779,7 +6879,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       <AnimatePresence initial={false}>
         {/* Inline side panel — mobile / embed frames where there's no actbar
             grid column. Desktop uses the actbar portal below. */}
-        {shouldMountSidePanel({ activityOpen, hasLiveAppTab, searchOpen: search.isOpen }) && !activitySlot && (
+        {shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) && !activitySlot && (
           <motion.div
             key="side-panel-inline"
             initial={{ width: 0 }}
@@ -6789,7 +6889,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             className="h-full overflow-hidden flex justify-end shrink-0"
             // Kept mounted for a live app tab: hide instead of unmounting so the
             // iframe (and the drawing inside it) survives a panel close.
-            style={isSidePanelHidden({ activityOpen, hasLiveAppTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
+            style={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
           >
             <SidePanel
               tabsCtl={tabsCtl}
@@ -6802,7 +6902,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onAddSourceToChat={addSourceCommentToChat}
               onSubmitComments={submitComments} onFileSave={handleFileSave} onClose={toggleAct}
               inlinePreviewPath={inlinePreviewPath} onInlinePreviewChange={setInlinePreviewPath}
-              expanded={previewFocused}
+              expanded={panelMaximized}
               fillWidth={panelFillWidth}
             />
           </motion.div>
@@ -6817,7 +6917,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           the window edge — both sides move together instead of snapping. */}
       {activitySlot && createPortal(
         <AnimatePresence initial={false}>
-          {shouldMountSidePanel({ activityOpen, hasLiveAppTab, searchOpen: search.isOpen }) && (
+          {shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) && (
             <motion.div
               key="side-panel"
               initial={{ width: 0, opacity: 0 }}
@@ -6825,7 +6925,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               exit={{ width: 0, opacity: 0 }}
               transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
               className="h-full overflow-visible flex justify-end"
-              style={isSidePanelHidden({ activityOpen, hasLiveAppTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
+              style={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
             >
               <SidePanel
                 tabsCtl={tabsCtl}
@@ -6838,7 +6938,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onAddSourceToChat={addSourceCommentToChat}
                 onSubmitComments={submitComments} onFileSave={handleFileSave} onClose={toggleAct}
                 inlinePreviewPath={inlinePreviewPath} onInlinePreviewChange={setInlinePreviewPath}
-                expanded={previewFocused}
+                expanded={panelMaximized}
                 fillWidth={panelFillWidth}
               />
             </motion.div>
