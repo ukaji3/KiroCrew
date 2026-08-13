@@ -546,6 +546,10 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # cli.py::_ensure_node / env.py::_run below, which shell the same
         # node/ensure-node toolchain and are benign for the same reason.
         # ``_npx_cache_playwright_roots`` runs the fixed ``npm config get cache``.
+        # ``_chromium_needs_cups_symbol`` runs ``nm -D <binary>`` on a Playwright-
+        # managed Chromium binary to probe symbol binding — fixed argv, no agent
+        # input, read-only inspection of a local file.
+        "browser/setup.py::_chromium_needs_cups_symbol",
         "browser/setup.py::_npx_cache_playwright_roots",
         "browser/setup.py::_resolve_playwright_core_cli",
         "browser/setup.py::_run",
@@ -553,6 +557,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli.py::_ensure_node",
         "cli.py::_node_ok",
         "cli.py::main",
+        "cli_chat.py::_run_chat",
         "cli_chat.py::_tui",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``), here used only to drive the now-async
@@ -571,6 +576,10 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
         "cli_doctor.py::_doctor_mcp_tools",
+        # ``systemctl is-active <unit>`` probes for the memory-pressure
+        # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
+        # names), no agent influence, 5s-capped, read-only query.
+        "cli_doctor.py::_detect_userspace_oom_killer",
         # Read-only diagnostic: `loginctl show-user <user> -p Linger --value`,
         # a fixed argv whose only variable is the invoking account name taken
         # from $USER/$LOGNAME (never agent-supplied). Same class as
@@ -761,7 +770,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "session_pid.py::kill_orphan_mcps",
         "slack/gateway.py::_auto_apply_update",
         "slack/gateway.py::_check_missing_deps",
-        "slack/gateway.py::_init_services",
+        # The kiro-cli version probe, extracted from _init_services (issue
+        # #3051). Fixed argv ("kiro-cli --version"), no agent-influenced
+        # input; sandboxing the probe would be circular for the same reason
+        # as the other boot-time self-checks above.
+        "slack/gateway.py::_warn_if_kiro_cli_outdated",
         "testing/harness.py::spawn_feature_gateway",
         # Apple on-device speech (macOS only). None of these takes an agent-authored
         # command: the argv is a fixed toolchain path, the helper Kiro Crew itself

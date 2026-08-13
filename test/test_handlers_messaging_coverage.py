@@ -277,6 +277,20 @@ class TestApiSpawnContinue:
         assert resp.status == 200
         assert mgr.continue_conversation.call_args.kwargs["max_turns"] == 0
 
+    def test_the_runs_own_cwd_is_resolved_off_loop_and_forwarded(self) -> None:
+        """A continuation has to run where the run ran, or a project-local agent
+        fails to resolve and the caller respawns from a digest -- losing the
+        conversation. `continue_conversation` is synchronous and on the event loop,
+        so the lookup happens here, in a thread, and is passed in.
+        """
+        mgr = _mgr()
+        mgr.recorded_cwd = MagicMock(return_value="/proj/alpha")
+        mgr.continue_conversation.return_value = _info(id="run2")
+        resp = _run(mod.api_spawn_continue, self._req(mgr, {"task": "x"}))
+        assert resp.status == 200
+        assert mgr.continue_conversation.call_args.kwargs["cwd"] == "/proj/alpha"
+        mgr.recorded_cwd.assert_called_once_with("conv1")
+
 
 # ── api_spawn_steer / release ──
 
@@ -1187,6 +1201,30 @@ class TestBrowserConfig:
             "installed": True,
         }
 
+    def test_get_does_not_probe_on_the_event_loop(self, monkeypatch) -> None:
+        """Every field is a filesystem read and the launcher probe resolves over
+        the Node-augmented PATH, so on a network HOME answering this route inline
+        would stall the loop for every other request and the heartbeat."""
+        import threading
+
+        loop_thread = threading.current_thread()
+        seen: list[threading.Thread] = []
+
+        def _probe() -> bool:
+            seen.append(threading.current_thread())
+            return True
+
+        monkeypatch.setattr(mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(mod, "get_browser_engine", lambda: "chromium")
+        monkeypatch.setattr(mod, "has_playwright_extension", lambda: False)
+        monkeypatch.setattr(mod, "get_extension_token", lambda: None)
+        monkeypatch.setattr(mod, "is_playwright_installed", _probe)
+
+        resp = _run(mod.api_browser_config_get, _Req(_state()))
+
+        assert _payload(resp)["installed"] is True
+        assert seen and seen[0] is not loop_thread
+
     def _stub_enable_side_effects(self, monkeypatch) -> None:
         monkeypatch.setattr(mod, "generate_playwright_config", lambda engine=None: None)
         monkeypatch.setattr(
@@ -1338,6 +1376,10 @@ class TestHelpers:
             ("abcdefgh", "••••efgh"),
             ("ab", "••••"),
         ],
+        # Safe display labels: without them pytest embeds the token-shaped
+        # value in the test ID, which then lands in derived artifacts
+        # (.test_durations, junit XML) and trips GitHub push protection.
+        ids=["empty", "slack-token", "generic", "too-short"],
     )
     def test_mask_secret(self, value: str, expected: str) -> None:
         assert mod._mask_secret(value) == expected
@@ -2005,12 +2047,21 @@ class TestBrowserCommandDrain:
         req = _Req(_state(), {"session_keys": ["chat-1"]}, extra=_INTERNAL)
         assert _payload(_run(mod.api_browser_command_drain, req)) == command
 
-    @pytest.mark.parametrize("wait_ms", [None, 0, True, "500"])
+    @pytest.mark.parametrize("wait_ms", [None, True, "500"])
     def test_invalid_wait_falls_back_to_the_default(self, monkeypatch, wait_ms: Any) -> None:
         bus = _install_bus(monkeypatch, _FakeBus(drain=None))
         req = _Req(_state(), {"session_keys": [], "wait_ms": wait_ms}, extra=_INTERNAL)
         _run(mod.api_browser_command_drain, req)
         assert bus.drain_calls[0][1] == mod.DEFAULT_DRAIN_WAIT_MS
+
+    def test_zero_wait_is_an_immediate_heartbeat(self, monkeypatch) -> None:
+        # ``wait_ms == 0`` is the Electron idle host-presence heartbeat: it must
+        # pass through as 0 (register + return at once), NOT be coerced to the
+        # long default wait.
+        bus = _install_bus(monkeypatch, _FakeBus(drain=None))
+        req = _Req(_state(), {"session_keys": [], "wait_ms": 0}, extra=_INTERNAL)
+        _run(mod.api_browser_command_drain, req)
+        assert bus.drain_calls[0][1] == 0
 
 
 class TestBrowserCommandResult:

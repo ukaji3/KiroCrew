@@ -21,7 +21,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Container, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
@@ -481,8 +481,13 @@ def append_if_absent_off_loop(
     content: str,
     *,
     agent: str | None = None,
-) -> None:
+    cls: str = "",
+) -> Any:
     """Idempotent, loop-safe variant of :func:`append_off_loop`.
+
+    Returns the executor future for the scheduled write, or None when the write
+    already happened inline (no running loop). A caller holding the ONLY durable
+    copy of something must await that future: scheduling is not durability.
 
     Routes :meth:`ConversationLog.append_if_absent` — which atomically skips a
     message already persisted under the same session lock — off the event loop
@@ -497,7 +502,7 @@ def append_if_absent_off_loop(
     """
 
     def _do() -> None:
-        conversation_log.append_if_absent(key, role, content, agent=agent)
+        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls)
 
     try:
         loop = asyncio.get_running_loop()
@@ -512,7 +517,7 @@ def append_if_absent_off_loop(
                 key,
                 exc_info=True,
             )
-        return
+        return None
 
     def _report(fut: "asyncio.Future[None]") -> None:
         exc = fut.exception()
@@ -523,7 +528,12 @@ def append_if_absent_off_loop(
                 exc,
             )
 
-    loop.run_in_executor(None, _do).add_done_callback(_report)
+    fut = loop.run_in_executor(None, _do)
+    fut.add_done_callback(_report)
+    # Hand the future BACK: a caller holding the only durable copy awaits this
+    # to turn "scheduled" into "on disk". Dropping it here made the barrier a
+    # no-op on every running-loop path, i.e. every real gateway path.
+    return fut
 
 
 def update_metadata_off_loop(
@@ -1733,6 +1743,93 @@ class ConversationLog:
             json.dumps({"sig": sig, "summary": summary}),
         )
 
+    def _intent_summary_cache_path(self, key: str) -> Path:
+        """Sidecar path for a session's cached intent-structured summary.
+
+        Deliberately a different file from :meth:`_summary_cache_path`: the
+        one-line summary and the intent summary have independent writers and
+        independent triggers, and sharing one file would reintroduce the
+        read-modify-write race the sidecar design exists to avoid.
+        """
+        return self._dir / ".intents" / f"{_safe_key(key)}.json"
+
+    def get_cached_intent_summary(self, key: str) -> dict | None:
+        """Return the cached intent summary payload for *key* if still valid.
+
+        Same mtime-signature contract as :meth:`get_cached_summary`: any real
+        append advances the session file's mtime and invalidates the cache,
+        while metadata-only rewrites preserve it. Returns the whole payload so
+        the caller can read ``generated_at`` for display.
+        """
+        try:
+            raw = self._intent_summary_cache_path(key).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("intents"), list):
+            return None
+        sig = self.session_mtime(key)
+        if sig is None or data.get("sig") != sig:
+            return None
+        return data
+
+    def read_intent_summary(self, key: str) -> tuple[dict | None, bool]:
+        """Return ``(payload, stale)`` for a session's intent summary.
+
+        Unlike :meth:`get_cached_intent_summary`, this does not discard a
+        payload whose signature no longer matches — it reports it as stale
+        instead. The panel prefers showing the last known summary marked as
+        out of date over showing nothing, because an empty panel reads as
+        "this feature is broken" while a stale one reads as "not regenerated
+        yet", which is the truth.
+        """
+        try:
+            raw = self._intent_summary_cache_path(key).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return None, False
+        if not isinstance(data, dict) or not isinstance(data.get("intents"), list):
+            return None, False
+        sig = self.session_mtime(key)
+        return data, not (sig is not None and data.get("sig") == sig)
+
+    def set_cached_intent_summary(self, key: str, payload: dict, sig: float) -> bool:
+        """Persist a derived intent summary *payload* to its sidecar cache.
+
+        Writes only the sidecar, never the session JSONL, so generating a
+        summary cannot clobber the transcript or advance its mtime (which would
+        both invalidate every other derived cache and reorder ``list_sessions``).
+
+        The write happens under ``_locked`` and only if the transcript still
+        exists with the *same* signature the generation started from. Generation
+        holds no lock while the model call is in flight (it can take tens of
+        seconds), so a permanent :meth:`delete_session` can complete in that
+        window -- removing the transcript AND this sidecar. An unconditional
+        write here would then recreate the sidecar, resurrecting deleted
+        conversation data after the user was told it was gone. The sig equality
+        check also drops a summary that a mid-generation append has already made
+        stale, rather than storing it as the latest word.
+
+        Returns True when the payload was written, False when it was refused
+        (transcript deleted or changed, or the lock could not be acquired).
+        Callers run this off the event loop (``asyncio.to_thread``) because
+        ``_locked`` blocks.
+        """
+        try:
+            with self._locked(key):
+                if _safe_mtime(self._path(key)) != sig:
+                    return False
+                atomic_write(
+                    self._intent_summary_cache_path(key),
+                    json.dumps({**payload, "sig": sig}),
+                )
+                return True
+        except HistoryLockTimeout:
+            logger.warning(
+                "set_cached_intent_summary: lock timeout, not writing key=%s", key
+            )
+            return False
+
     def append(
         self,
         key: str,
@@ -1743,8 +1840,14 @@ class ConversationLog:
         source_user: str | None = None,
         agent: str | None = None,
         tab_id: str | None = None,
+        cls: str = "",
     ) -> None:
         """Append a message with optional provenance to the session log.
+
+        *cls* persists the message's presentation class. The in-memory slot
+        carries one (``_ChatSlot.append``) but this durable copy had nowhere to
+        put it, so any class-borne distinction silently vanished the moment a
+        session's rows had to be replayed from disk after a restart.
 
         If the session file does not yet exist, it will be created with an
         initial metadata line.  When *agent* is supplied, the agent name is
@@ -1779,6 +1882,7 @@ class ConversationLog:
             msg: dict = {
                 "role": role,
                 "content": _redact_at_write_boundary(role, content),
+                **({"cls": cls} if cls else {}),
                 # Strictly after the row already on disk, so the pair written by
                 # one turn stays ordered on a host whose clock cannot separate
                 # them (see monotonic_transcript_ts). Consulting the file here is
@@ -1830,6 +1934,7 @@ class ConversationLog:
         *,
         agent: str | None = None,
         tab_id: str | None = None,
+        cls: str = "",
     ) -> bool:
         """Append a message only if an identical one is not already persisted.
 
@@ -1862,7 +1967,7 @@ class ConversationLog:
             # Reentrant: ``append`` re-enters ``_locked`` for the same key on
             # this thread (RLock + refcounted flock), so the write stays inside
             # the critical section we already hold.
-            self.append(key, role, content, agent=agent, tab_id=tab_id)
+            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls)
             return True
 
     def recent(
@@ -3093,6 +3198,10 @@ class ConversationLog:
                     self._summary_cache_path(key).unlink(missing_ok=True)
                 except OSError:
                     pass
+                try:
+                    self._intent_summary_cache_path(key).unlink(missing_ok=True)
+                except OSError:
+                    pass
         except HistoryLockTimeout:
             logger.warning("delete_session: lock timeout, not deleting key=%s", key)
             return False
@@ -3536,6 +3645,21 @@ class ConversationLog:
             return None
         ts = tail[-1].get("ts")
         return ts if isinstance(ts, str) and ts else None
+
+    def last_row_ts(self, key: str) -> str | None:
+        """The ``ts`` of the last persisted message row for *key*, or ``None``.
+
+        The public form of :meth:`_last_row_ts`: it takes :meth:`_locked` itself,
+        so a caller outside this class gets a read that no concurrent append can
+        tear. Ordering derived from it survives a restart, because the value is a
+        field of the persisted row rather than a count of what a process happens
+        to hold in memory.
+
+        BLOCKING. It performs file I/O, so an async caller must run it off the
+        event loop (``asyncio.to_thread``).
+        """
+        with self._locked(key):
+            return self._last_row_ts(key)
 
     def _invalidate_cache(self, key: str) -> None:
         """Invalidate caches for a key after a write operation."""

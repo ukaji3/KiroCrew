@@ -369,6 +369,37 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     if not message:
         return web.json_response({"error": "message is required"}, status=400)
 
+    # ── Crew Mode dispatch (RFC orchestrator-chat-sessions) ─────────
+    # MUST precede the hold-users gate below: crew topics ARE background
+    # sub-agents, so the hold would swallow every message the moment one
+    # topic runs — killing the mode's whole point (parallel ingress). Crew
+    # messages are durable queue entries, not turns; the CrewOrchestrator
+    # acks instantly and routes them to topic sub-sessions.
+    if getattr(slot, "mode", "") == "crew":
+        _crew = getattr(state, "crew", None)
+        if _crew is None:
+            return web.json_response(
+                {"error": "crew mode unavailable", "code": "crew_unavailable"}, status=503
+            )
+        # Do NOT append the user message here. `ingest` shows it only after the
+        # queue entry is durable: a visible message with no queue entry (process
+        # exit during a cold-store build) is a request that can never resume.
+        _refusal = await _crew.ingest(
+            slot, message,
+            user_meta=_redact_meta(user_meta) if user_meta else None,
+        )
+        if _refusal:
+            # Crew declined this ingress (app-owned session). Answering 200 told
+            # a programmatic caller its message was accepted for work that will
+            # never run — the transcript note it posts is not visible to an API
+            # caller, so the refusal has to reach the status line too.
+            return web.json_response(
+                {"error": "crew mode is not available for this session",
+                 "code": _refusal},
+                status=409,
+            )
+        return web.json_response({"ok": True, "slot": slot.key, "crew": True})
+
     # Queue a message typed while background sub-agents are still running for
     # this slot. The slot.running queue path above covers the mid-turn case;
     # this covers the idle case (spawn_run is fire-and-forget, so the main slot
@@ -765,12 +796,80 @@ async def _context_snapshot_fields_inner(
     )
 
 
+async def api_chat_slot_summary(request: web.Request) -> web.Response:
+    """GET /api/chat/slots/{slot}/summary — intent summary for the panel.
+
+    Read-only: it never triggers generation. Summaries are produced at turn end
+    by the background pass, deliberately, so that opening the panel cannot spend
+    tokens and repeated opening cannot turn into a refresh loop.
+
+    Responses:
+      - 200 with ``{enabled, generated_at, stale, intents, constraints, ...}``
+      - 200 with ``intents: []`` and ``enabled: false`` when the feature is off,
+        so the panel can render an explanatory empty state rather than an error
+      - 404 ``slot_not_found`` for an unknown slot, or for a slot an app caller
+        does not own (App Kit §5.2 isolation; 404 not 403 for anti-enumeration)
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    # App ownership check (App Kit §5.2), mirroring api_chat_slot_delete: a
+    # summary is derived conversation content, so a slot merely existing must
+    # not make it readable. Dashboard users carry an explicit empty request_app
+    # and are unaffected; an app token may only read summaries for slots it
+    # created, never for unscoped slots.
+    request_app = request.get("app", "")
+    if request_app and (not slot._app or slot._app != request_app):
+        sel().log_api_access(
+            caller=request_app,
+            operation="slot_summary_read",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={name}",
+            error="app does not own this slot",
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    enabled = bool(cfg.session_summary.enabled)
+
+    payload: dict | None = None
+    stale = False
+    log = state.conversation_log
+    # Gate the cache read on the flag as well: turning the feature off has to
+    # stop serving summaries, not just stop producing them, or a sidecar written
+    # during an earlier opt-in keeps being returned after opt-out.
+    if enabled and log is not None:
+        history_key = slot_history_key(slot)
+        payload, stale = await asyncio.to_thread(log.read_intent_summary, history_key)
+
+    body: dict = {
+        "enabled": enabled,
+        "stale": stale,
+        "intents": (payload or {}).get("intents", []),
+        "constraints": (payload or {}).get("constraints", []),
+        "generated_at": (payload or {}).get("generated_at"),
+        "user_turns": (payload or {}).get("user_turns"),
+        "last_activity": (payload or {}).get("last_activity"),
+    }
+    return web.json_response(body)
+
+
 async def api_chat_slot_detail(request: web.Request) -> web.Response:
     """GET /api/chat/slots/{slot} — message history for a slot.
 
     Query params:
-      - ``limit``: max messages to return (optional; if omitted, returns ALL messages from disk)
-      - ``before``: return messages before this index (legacy pagination, still supported)
+      - ``limit``: max messages to return (optional; if omitted, returns ALL messages from disk).
+        Clamped to 1..500. A value below 1 is rejected rather than clamped up, because
+        no caller asking for 0 wanted exactly one message.
+      - ``before``: return messages before this index (legacy pagination, still supported).
+        ``before=0`` is valid and yields an empty page.
+
+    Either param being a non-integer is a 400; both used to raise out of the
+    handler and surface as a 500.
 
     By default (no limit), reads the full chained history from disk across
     gateway restarts. Pagination params are retained for backwards compatibility.
@@ -782,23 +881,46 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
 
     limit_raw = request.query.get("limit")
-    before = request.query.get("before")
+    before_raw = request.query.get("before")
+
+    # Both params arrive as strings and were converted at their point of use, so a
+    # non-integer escaped as a ValueError and the client saw a 500 for what is
+    # plainly a bad request. The branch below still keys off the RAW values, so
+    # routing is unchanged.
+    try:
+        limit = min(int(limit_raw or "200"), 500)
+        before = int(before_raw) if before_raw is not None else None
+    except ValueError:
+        return web.json_response(
+            {"error": "limit and before must be integers", "code": "invalid_query_params"},
+            status=400,
+        )
+    # Clamped above but not below, limit=0 made `start == end`: an empty page
+    # reporting has_more true, which paginates forever.
+    if limit < 1:
+        return web.json_response(
+            {"error": "limit must be >= 1", "code": "limit_out_of_range"}, status=400
+        )
 
     # No limit → load ALL messages (chained across gateway restarts).
     # In-memory slot.messages is authoritative for the current session.
     # _disk_older_count gates whether to read disk AND provides the stable
     # slice boundary (set at restore/resume, never drifts with new messages).
-    if limit_raw is None and before is None:
+    if limit_raw is None and before_raw is None:
         mem_msgs = list(slot.messages)
         if slot._disk_older_count > 0 and state.conversation_log:
             history_key = slot_history_key(slot)
             try:
-                disk_msgs = state.conversation_log.read_messages_chained(history_key)
+                disk_msgs = await asyncio.to_thread(
+                    state.conversation_log.read_messages_chained, history_key
+                )
             except Exception:
                 logger.warning("read_messages_chained failed for %s", history_key, exc_info=True)
                 disk_msgs = []
             older = disk_msgs[: slot._disk_older_count] if disk_msgs else []
-            messages = older + mem_msgs
+            # Re-read the tail after the await: that suspension point lets a message
+            # land mid-read, and the client replaces its list with this response.
+            messages = older + list(slot.messages)
         else:
             messages = mem_msgs
         total = len(messages)
@@ -806,11 +928,12 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     else:
         # Legacy pagination path (retained for programmatic callers).
         # Always reads from chained disk history; no in-memory offset math.
-        limit = min(int(limit_raw or "200"), 500)
         history_key = slot_history_key(slot)
         try:
             all_msgs = (
-                state.conversation_log.read_messages_chained(history_key)
+                await asyncio.to_thread(
+                    state.conversation_log.read_messages_chained, history_key
+                )
                 if state.conversation_log
                 else []
             )
@@ -828,7 +951,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
             all_msgs = list(all_msgs) + list(slot.messages[-unflushed:])
         total = len(all_msgs)
         if before is not None:
-            end = max(0, min(int(before), total))
+            end = max(0, min(before, total))
         else:
             end = total
         start = max(0, end - limit)
@@ -928,12 +1051,39 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             memory_mode = body.get("memory_mode", "persistent")
             if memory_mode not in ("persistent", "incognito", "temporary"):
                 return web.json_response({"error": "invalid memory_mode"}, status=400)
+            _mode = body.get("mode", "")
+            if _mode not in ("", "orchestrator", "crew"):
+                return web.json_response(
+                    {"error": "invalid mode", "code": "invalid_mode"}, status=400
+                )
+            # Same boundary as the mode-switch endpoint: a slot whose name folds
+            # to nothing but dots has no crew store, so accepting `mode="crew"`
+            # here would hand back a tab that 500s on its first message. Only a
+            # CALLER-SUPPLIED name can be that: an omitted name is generated by
+            # `get_or_create_slot` and is always storable. Checked on the
+            # NORMALIZED form, which is the key the store is built from — the raw
+            # body name is not what `CrewStore` ever sees.
+            if _mode == "crew" and name:
+                # Deferred: this module is imported when the dashboard package is,
+                # which the gateway does on its boot path, and crew is a
+                # dashboard-only subsystem. Only a crew request pays for it.
+                from kiro_crew.crew_chat import is_crew_capable_slot_key
+            if (
+                _mode == "crew"
+                and name
+                and not is_crew_capable_slot_key(_normalize_slot_key(str(name)))
+            ):
+                return web.json_response(
+                    {"error": "this session name cannot run crew mode",
+                     "code": "crew_unsupported_slot"},
+                    status=400,
+                )
             slot = state.get_or_create_slot(
                 name,
                 agent=agent,
                 workspace=workspace,
                 model=model,
-                mode=body.get("mode", ""),
+                mode=_mode,
                 memory_mode=memory_mode,
                 ephemeral=body.get("ephemeral"),
                 app=request.get("app", ""),

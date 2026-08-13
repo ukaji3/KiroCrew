@@ -18,7 +18,8 @@ from kiro_crew.messaging.link import (
     legacy_dashboard_mirror_key,
     release_conversation_location,
 )
-from kiro_crew.session_map import ConversationOwnershipConflict, SessionMap
+from kiro_crew.session import SessionManager, _opt_out_key
+from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG, ConversationOwnershipConflict, SessionMap
 
 
 @pytest.fixture()
@@ -26,6 +27,18 @@ def session_map(tmp_path):
     """A SessionMap backed by a temp directory."""
     with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
         yield SessionMap()
+
+
+def _manager_over(session_map):
+    """A SessionManager wired to just this map.
+
+    ``set_mirror_opt_out`` / ``mirror_opt_out`` touch nothing but
+    ``_session_map``, so binding that one attribute exercises the real accessors
+    without standing up a whole manager.
+    """
+    mgr = SessionManager.__new__(SessionManager)
+    mgr._session_map = session_map
+    return mgr
 
 
 def plant_binding(session_map, key, link, *, accepts_inbound=False):
@@ -331,6 +344,32 @@ class TestReleaseConversationLocation:
         assert reply == "✅ Unlinked."
         assert swept == []
 
+    def test_the_three_clears_are_one_write(self, session_map):
+        # Freeing a location is ONE action. Its three clears each rewrite the
+        # whole map, so unbatched they are three writes and three separately
+        # interruptible steps — a crash or a concurrent writer partway through
+        # leaves the location half-freed while the reply already said ✅.
+        plant_binding(session_map, self.KEY, self.LINK)
+        plant_binding(session_map, f"{self.KEY}:gen1", self.LINK)
+        with patch.object(SessionMap, "_write", autospec=True) as write:
+            release_conversation_location(
+                session_map, key=self.KEY, location=self.LINK, channel="discord"
+            )
+        assert write.call_count == 1
+
+    def test_an_outer_batch_still_collapses_to_one_write(self, session_map):
+        # Telegram wraps this call together with its opt-out write. Nesting is
+        # counted, so the wider sequence must stay a single write rather than
+        # this function's batch flushing early inside it.
+        plant_binding(session_map, self.KEY, self.LINK)
+        with patch.object(SessionMap, "_write", autospec=True) as write:
+            with session_map.batched_save():
+                session_map.set_flag(self.KEY, "mirror_opt_out", True)
+                release_conversation_location(
+                    session_map, key=self.KEY, location=self.LINK, channel="discord"
+                )
+        assert write.call_count == 1
+
 
 class TestPrunePreservesMirror:
     def test_mirror_only_entry_survives_prune(self, tmp_path):
@@ -538,3 +577,232 @@ class TestConversationOwnership:
             "dashboard:brand-new"
         ]
         assert reloaded.mirror_accepts_inbound("dashboard:brand-new") is True
+
+
+class TestBatchedSave:
+    """One write per related mutation sequence, not one per mutation.
+
+    A mutation rewrites the WHOLE map (measured: ~1ms at 192 entries, ~43ms at
+    10k), and on the event loop each write is a stall every task shares.
+    """
+
+    LINK = ChannelLink(channel_type="telegram", channel_id="7")
+
+    def test_a_sequence_writes_once(self, session_map):
+        writes = []
+        with patch.object(session_map, "_write", side_effect=lambda: writes.append(1)):
+            with session_map.batched_save():
+                session_map.set_mirror_link("telegram:kirocrew:direct:7", self.LINK)
+                session_map.set_flag("telegram:kirocrew:direct:7", MIRROR_OPT_OUT_FLAG, True)
+                session_map.set("telegram:kirocrew:direct:7", "sid-1")
+        assert writes == [1]
+
+    def test_the_write_still_happens_when_the_block_raises(self, session_map):
+        writes = []
+        with patch.object(session_map, "_write", side_effect=lambda: writes.append(1)):
+            with pytest.raises(RuntimeError):
+                with session_map.batched_save():
+                    session_map.set_mirror_link("telegram:kirocrew:direct:7", self.LINK)
+                    raise RuntimeError("mid-sequence failure")
+        # Leaving the mutation only in memory would lose it on the next restart.
+        assert writes == [1]
+
+    def test_nesting_writes_once_at_the_outermost_exit(self, session_map):
+        writes = []
+        with patch.object(session_map, "_write", side_effect=lambda: writes.append(1)):
+            with session_map.batched_save():
+                with session_map.batched_save():
+                    session_map.set_mirror_link("telegram:kirocrew:direct:7", self.LINK)
+                assert writes == []  # inner exit must not write
+        assert writes == [1]
+
+    def test_a_block_that_mutates_nothing_writes_nothing(self, session_map):
+        writes = []
+        with patch.object(session_map, "_write", side_effect=lambda: writes.append(1)):
+            with session_map.batched_save():
+                session_map.get_mirror_link("telegram:kirocrew:direct:7")
+        assert writes == []
+
+    def test_the_batched_data_actually_reaches_disk(self, session_map, tmp_path):
+        key = "telegram:kirocrew:direct:7"
+        with session_map.batched_save():
+            session_map.set_mirror_link(key, self.LINK)
+            session_map.set_flag(key, MIRROR_OPT_OUT_FLAG, True)
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            reloaded = SessionMap()
+        assert reloaded.get_mirror_link(key) == self.LINK
+        assert reloaded.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
+
+
+class TestAutomaticMirrorOptOut:
+
+    """The persisted refusal of automatic origin mirroring (issue #2959).
+
+    A channel that binds its own conversation on every inbound turn re-asserts
+    the mirror after a restart, so the in-channel "off" has to outlive the
+    binding it removes. Clearing ``mirror`` cannot express that — an entry with
+    no binding is indistinguishable from one that was never linked.
+    """
+
+    LINK = ChannelLink(channel_type="telegram", channel_id="7")
+
+    def test_opt_out_survives_a_reload(self, session_map, tmp_path):
+        session_map.set_flag("telegram:kirocrew:direct:7", MIRROR_OPT_OUT_FLAG, True)
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            reloaded = SessionMap()
+        assert reloaded.get_flag("telegram:kirocrew:direct:7", MIRROR_OPT_OUT_FLAG) is True
+
+    def test_clearing_the_binding_does_not_clear_the_opt_out(self, session_map):
+        """The two are independent: unlink does both, and only one must persist."""
+        key = "telegram:kirocrew:direct:7"
+        session_map.set_flag(key, MIRROR_OPT_OUT_FLAG, True)
+        session_map.set_mirror_link(key, self.LINK)
+        assert session_map.clear_mirror_link(key) is True
+        assert session_map.get_mirror_link(key) is None
+        assert session_map.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
+
+    def test_the_flag_name_is_the_one_the_session_manager_writes(self):
+        """Pins the ON-DISK spelling.
+
+        ``SessionManager.set_mirror_opt_out`` is the only writer; a rename would
+        silently re-enable mirroring for every conversation that turned it off.
+        """
+        assert MIRROR_OPT_OUT_FLAG == "mirror_opt_out"
+
+    def test_the_refusal_is_keyed_by_the_durable_bucket_not_the_generation(self):
+        """A preference about the conversation, not about one session.
+
+        ``/new`` and the configured idle/daily reset rotate the ``:genN`` suffix.
+        Keyed per generation the refusal expires on rotation — an idle reset would
+        undo the user's "off" unprompted — and each rotated generation strands its
+        own row that pruning is forbidden to collect.
+        """
+        assert _opt_out_key("telegram:kirocrew:direct:7:gen3") == "telegram:kirocrew:direct:7"
+        assert _opt_out_key("telegram:kirocrew:direct:7") == "telegram:kirocrew:direct:7"
+        assert (
+            _opt_out_key("telegram:kirocrew:forum:-100123:5:gen9")
+            == "telegram:kirocrew:forum:-100123:5"
+        )
+        # Outside the canonical grammar there is no generation to strip.
+        assert _opt_out_key("dashboard:chat-9") == "dashboard:chat-9"
+
+    def test_the_suffix_is_stripped_even_when_the_key_does_not_parse(self):
+        """The shapes that most need stripping are the ones the parser rejects.
+
+        A ``dm_scope="unified"`` bucket is ``unified:{agent}`` — too short for the
+        canonical grammar — so a parser-only rule would leave every unified
+        conversation keyed per generation, which is the bug being fixed.
+        """
+        assert _opt_out_key("unified:kirocrew:gen3") == "unified:kirocrew"
+        assert _opt_out_key("unified:kirocrew") == "unified:kirocrew"
+        # A trailing segment that merely starts with "gen" is not a generation.
+        assert _opt_out_key("telegram:kirocrew:direct:general") == (
+            "telegram:kirocrew:direct:general"
+        )
+
+    def test_every_generation_shares_one_flag_row(self, session_map):
+        """Bucket-keying is what bounds the unprunable rows to one per chat."""
+        for gen in ("", ":gen1", ":gen2", ":gen7"):
+            session_map.set_flag(
+                _opt_out_key(f"telegram:kirocrew:direct:7{gen}"), MIRROR_OPT_OUT_FLAG, True
+            )
+        flagged = [k for k, e in session_map._data.items() if e.get("flags")]
+        assert flagged == ["telegram:kirocrew:direct:7"]
+
+    def test_a_refusal_stored_under_the_old_generation_key_is_still_honoured(
+        self, session_map
+    ):
+        """Upgrading must not silently restore mirroring.
+
+        An earlier build keyed the refusal by the generation-suffixed session key.
+        Reading only the bucket would miss every refusal already on disk — the
+        fix for the expiry bug would itself deliver the expiry bug, once.
+        """
+        mgr = _manager_over(session_map)
+        key = "telegram:kirocrew:direct:7:gen3"
+        session_map.set_flag(key, MIRROR_OPT_OUT_FLAG, True)
+        assert mgr.mirror_opt_out(key) is True
+
+    def test_reading_a_legacy_refusal_promotes_it_to_the_bucket(self, session_map):
+        """Otherwise the refusal is honoured for that generation and lost at the next.
+
+        Reading without promoting hands an upgrading user the expiring behaviour
+        this change exists to remove, and leaves an unprunable row per generation.
+        """
+        mgr = _manager_over(session_map)
+        session_map.set_flag("telegram:kirocrew:direct:7:gen3", MIRROR_OPT_OUT_FLAG, True)
+        assert mgr.mirror_opt_out("telegram:kirocrew:direct:7:gen3") is True
+        # Promoted to the bucket, and the generation row retired with it.
+        assert session_map.get_flag("telegram:kirocrew:direct:7", MIRROR_OPT_OUT_FLAG) is True
+        assert (
+            session_map.get_flag("telegram:kirocrew:direct:7:gen3", MIRROR_OPT_OUT_FLAG)
+            is False
+        )
+        # And it now survives the rotation that would have dropped it.
+        assert mgr.mirror_opt_out("telegram:kirocrew:direct:7:gen4") is True
+
+    def test_withdrawing_also_retires_the_old_generation_key(self, session_map):
+        """Otherwise a legacy refusal outlives the withdrawal that cleared it."""
+        mgr = _manager_over(session_map)
+        key = "telegram:kirocrew:direct:7:gen3"
+        session_map.set_flag(key, MIRROR_OPT_OUT_FLAG, True)
+        mgr.set_mirror_opt_out(key, False)
+        assert mgr.mirror_opt_out(key) is False
+
+    def test_a_session_scoped_flag_does_not_make_an_entry_immortal(self, session_map):
+        """Immortality is opt-in, because prune is the only collection path.
+
+        Slack's ``temporary`` / ``incognito`` flags describe ONE session, not a
+        durable preference. Keeping their entries would leak a row per such
+        thread — and the map is rewritten whole on every mutation, so the leak
+        costs every later write, not just disk.
+        """
+        for flag in ("temporary", "incognito"):
+            key = f"slack:kirocrew:{flag}"
+            session_map.set_flag(key, flag, True)
+        assert session_map.prune() == 2
+        assert session_map.get_flag("slack:kirocrew:temporary", "temporary") is False
+        assert session_map.get_flag("slack:kirocrew:incognito", "incognito") is False
+
+    def test_a_stale_sid_is_still_collected_when_the_flag_is_session_scoped(
+        self, session_map
+    ):
+        """The repair branch is for settings only, not for any flag at all."""
+        key = "slack:kirocrew:direct:7"
+        session_map.set(key, "sid-that-no-longer-exists")
+        session_map.set_flag(key, "temporary", True)
+        assert session_map.prune() == 1
+        assert key not in session_map._data
+
+    def test_prune_keeps_an_opt_out_that_has_nothing_else_on_it(self, session_map):
+        """``/unlink`` as the very first message writes exactly this shape.
+
+        No ``sid``, no thread, no mirror — which is the stale predicate. Pruned,
+        the setting silently reverts at the next restart and the user's next
+        message lands on the default they had just switched off.
+        """
+        key = "telegram:kirocrew:direct:7"
+        session_map.set_flag(key, MIRROR_OPT_OUT_FLAG, True)
+        assert session_map.prune() == 0
+        assert session_map.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
+
+    def test_prune_clears_a_stale_sid_instead_of_dropping_the_opt_out(
+        self, session_map, tmp_path
+    ):
+        """The other stale branch: the setting must outlive the native session.
+
+        A conversation that HAS run turns carries a ``sid``. When kiro-cli
+        garbage-collects that session file the entry is stale by the first
+        predicate — and deleting it would take the opt-out with it, silently
+        restoring mirroring on the next message.
+        """
+        key = "telegram:kirocrew:direct:7"
+        session_map.set(key, "sid-that-no-longer-exists")
+        session_map.set_flag(key, MIRROR_OPT_OUT_FLAG, True)
+        assert session_map.prune() == 0
+        assert session_map.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            reloaded = SessionMap()
+        # The repair reached disk, so the next startup does not redo it.
+        assert reloaded.get_flag(key, MIRROR_OPT_OUT_FLAG) is True
+        assert not (reloaded._data.get(key) or {}).get("sid")

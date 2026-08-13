@@ -138,6 +138,8 @@ export function useWebSocket() {
   const reconnectingRef = useRef(false)  // suppress markSlotUnread during reconnect catch-up
   const lastVersionRef = useRef<string | null>(null)
   const lastGitlabHostsGenRef = useRef<number | null>(null)
+  const lastSlotsRawRef = useRef<string | null>(null)
+  const lastSlotsArrayRef = useRef<ChatSlot[] | null>(null)
   const voiceQueueRef = useRef<string[]>([])
   const voicePlayingRef = useRef(false)
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
@@ -414,6 +416,9 @@ export function useWebSocket() {
       // gateway, so after a restart an equal number can mean a different
       // allowlist. Clearing it makes the next generation frame refetch.
       lastGitlabHostsGenRef.current = null
+      // Forget the last raw slots frame too, so a reconnect whose first frame
+      // repeats the last one before it cannot swallow that first frame.
+      lastSlotsRawRef.current = null
       // Cache auto-speak preference
       api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
       if (wasConnectedRef.current) {
@@ -468,8 +473,16 @@ export function useWebSocket() {
       }
       wasConnectedRef.current = true
       dispatch(sseConnected())
-      dispatch(fetchSlots())
       seedGoalLoops()
+      // FIRST connect only: App's mount effect already dispatched fetchSlots,
+      // and this handler fires strictly after it, so repeating it here is a
+      // redundant round-trip at the worst possible moment. The reconnect branch
+      // above still refetches — there it recovers state missed while the socket
+      // was down. fetchNotifications IS still dispatched here despite the
+      // mount-effect copy: syncPendingApprovals must only run after a
+      // notifications fetch has settled, because fetchNotifications.fulfilled
+      // replaces `items` wholesale and would wipe any approval notifications
+      // synced before it.
       dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
       // Eagerly subscribe to subagent events on first connect too.
@@ -508,7 +521,14 @@ export function useWebSocket() {
             break
           }
           case 'slots': {
+            // An identical repeat carries identical values for every arm below, but
+            // only while no other writer (fetchSlots) has since replaced the list.
+            const raw = e.data as string
+            if (raw === lastSlotsRawRef.current
+                && store.getState().dashboard.slots === lastSlotsArrayRef.current) break
+            lastSlotsRawRef.current = raw
             dispatch(sseSlots(data as ChatSlot[]))
+            lastSlotsArrayRef.current = store.getState().dashboard.slots
             if (msg.yolo !== undefined) {
               dispatch(sseStatus({ yolo: msg.yolo } as StatusData))
             }

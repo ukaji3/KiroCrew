@@ -24,6 +24,7 @@ import pytest
 from conftest import MockSlackClient
 from kiro_crew.cron import CronJob, CronSchedule, CronStoreBusy
 from kiro_crew.providers.base import LLMEvent
+from kiro_crew.safety_override import NO_EXPIRY_TEXT, fmt_grant_duration
 from kiro_crew.slack import handler as h
 
 
@@ -556,7 +557,10 @@ class TestKeywordCommands:
 
     @pytest.mark.asyncio
     async def test_sessions_keyword_allowed(self, slack, sessions, owner, monkeypatch):
-        monkeypatch.setattr(h, "_collect_recent_sessions", lambda s, limit=0: [])
+        monkeypatch.setattr(
+            "kiro_crew.slack.sessions_view._collect_recent_sessions",
+            lambda s, limit=0, kind=None: [],
+        )
         handled = await h.maybe_handle_keyword_command(
             "sessions", slack, sessions, "C1", "t1", "msg1", "t1", "U1"
         )
@@ -890,16 +894,19 @@ class TestRunHelper:
 class TestSessionsHelper:
     @pytest.mark.asyncio
     async def test_collector_failure_is_audited(self, slack, monkeypatch):
-        def _boom(_sessions, limit=0):
+        def _boom(_sessions, limit=0, kind=None):
             raise OSError("history unreadable")
 
-        monkeypatch.setattr(h, "_collect_recent_sessions", _boom)
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._collect_recent_sessions", _boom)
         await h._handle_sessions_command("sessions", slack, "C1", "t1", "msg1", "t1", None)
         assert "_Sessions unavailable._" in _texts(slack)
 
     @pytest.mark.asyncio
     async def test_rows_render_blocks(self, slack, monkeypatch):
-        monkeypatch.setattr(h, "_collect_recent_sessions", lambda s, limit=0: [{"key": "s1"}])
+        monkeypatch.setattr(
+            "kiro_crew.slack.sessions_view._collect_recent_sessions",
+            lambda s, limit=0, kind=None: [{"key": "s1"}],
+        )
         monkeypatch.setattr(h, "_build_sessions_blocks", lambda rows: [{"type": "divider"}])
         await h._handle_sessions_command("sessions", slack, "C1", "t1", "msg1", "t1", None)
         assert [a for a in slack.actions if a[0] == "blocks"]
@@ -1738,11 +1745,11 @@ class TestPureHelpers:
         assert "full reasoning" in out
 
     def test_fmt_duration(self):
-        assert h._fmt_duration(7200) == "2h"
-        assert h._fmt_duration(1800) == "30min"
+        assert fmt_grant_duration(7200) == "2h"
+        assert fmt_grant_duration(1800) == "30min"
 
     def test_describe_new_grant(self):
-        assert h.describe_new_grant(0) == h._NO_EXPIRY_TEXT
+        assert h.describe_new_grant(0) == NO_EXPIRY_TEXT
         assert h.describe_new_grant(3600) == "auto-expires in 1h"
 
     def test_describe_grant_lifetime_off(self):

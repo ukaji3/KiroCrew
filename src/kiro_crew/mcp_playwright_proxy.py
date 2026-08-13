@@ -95,13 +95,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Max width (px) for relayed/saved frames — 1920 so a resized mirror panel
+# Max edge (px) for relayed/saved frames — 1920 so a resized mirror panel
 # shows real pixels instead of an upscaled blur; set KIROCREW_BROWSE_MAX_WIDTH=0
-# to disable downscaling entirely (send native resolution). JPEG quality is
-# likewise tunable. Both apply to the on-disk screenshot and the live mirror
-# frame, which share one encode.
-_MAX_FRAME_WIDTH = _env_int("KIROCREW_BROWSE_MAX_WIDTH", 1920)
+# to disable *cosmetic* downscaling (send native resolution up to the hard
+# ceiling). JPEG quality is likewise tunable. Both apply to the on-disk
+# screenshot and the live mirror frame, which share one encode.
+_MAX_FRAME_EDGE = _env_int("KIROCREW_BROWSE_MAX_WIDTH", 1920)
 _FRAME_JPEG_QUALITY = _env_int("KIROCREW_BROWSE_JPEG_QUALITY", 70)
+
+# Hard ceiling: the model gateway rejects any image dimension > 2000px in
+# multi-image requests. This limit is applied regardless of MAX_WIDTH — even
+# when the cosmetic downscale is disabled (MAX_WIDTH=0) — to prevent
+# irreversible session corruption from oversized screenshots poisoning
+# conversation history. It requires PIL; without PIL, native bytes are
+# forwarded unresized.
+_HARD_MAX_EDGE = 2000
+
+# Pixel ceiling for a frame decode. Pillow's stock decompression-bomb guard
+# (~178M pixels) is cleared by a legitimate fullPage capture of a long page
+# (3000x60000 is 180M) — exactly the frames the hard ceiling must downscale.
+# Raising it is safe for this input class (our own browser's capture, not an
+# untrusted upload) and bounded, not disabled. Mirrors web-verify's
+# downscale_image.py, which uses the same value for the same reason.
+_MAX_DECODE_PIXELS = 512_000_000
 
 # The browse session this proxy serves. kiro-cli freezes KIROCREW_SESSION_KEY in
 # the MCP subprocess env at spawn, so it identifies the session whose browse is
@@ -113,23 +129,62 @@ _SESSION_KEY = os.environ.get("KIROCREW_SESSION_KEY", "")
 def _encode_frame(data: str, media_type: str) -> tuple[bytes, str]:
     """Decode a base64 image; downscale + JPEG-encode if PIL is available.
 
+    Downscales the **longest edge** (not just width) to ``_MAX_FRAME_EDGE``,
+    matching the computer-use capture path. A hard ceiling of
+    ``_HARD_MAX_EDGE`` (2000px) is applied regardless of ``MAX_WIDTH`` to
+    prevent the model gateway from rejecting the image and permanently breaking
+    the session (requires PIL; without it, native bytes pass through unresized).
+
     Returns ``(bytes, ext)``. Shared by the on-disk save and the live-frame POST
     so the (relatively expensive) decode/resize/encode runs once per screenshot.
     """
     img_bytes = base64.b64decode(data)
     ext = "jpeg" if ("jpeg" in media_type or "jpg" in media_type) else "png"
     if _HAS_PIL:
+        # Raised only for this decode and then put back: the ceiling is a
+        # MODULE-LEVEL global in Pillow, so leaving it changed would silently
+        # relax the guard for every later decode in the process.
+        previous_ceiling = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = _MAX_DECODE_PIXELS
         try:
             img: Image.Image = Image.open(io.BytesIO(img_bytes))
-            if _MAX_FRAME_WIDTH and img.width > _MAX_FRAME_WIDTH:
-                ratio = _MAX_FRAME_WIDTH / img.width
+            longest = max(img.width, img.height)
+            # Apply cosmetic downscale (user-configurable, 0 = disabled).
+            max_edge = _MAX_FRAME_EDGE
+            # Always enforce the hard ceiling, even when cosmetic is disabled.
+            if not max_edge or max_edge > _HARD_MAX_EDGE:
+                max_edge = _HARD_MAX_EDGE
+            if longest > max_edge:
+                ratio = max_edge / longest
                 resample = getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", None))
-                img = img.resize((_MAX_FRAME_WIDTH, int(img.height * ratio)), resample)
+                img = img.resize(
+                    (
+                        max(1, round(img.width * ratio)),
+                        max(1, round(img.height * ratio)),
+                    ),
+                    resample,
+                )
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=_FRAME_JPEG_QUALITY)
             return buf.getvalue(), "jpeg"
         except Exception:
-            pass
+            # Never forward a frame we KNOW is oversized: the gateway rejects
+            # any dimension > _HARD_MAX_EDGE and the rejection permanently
+            # wedges the session. Probe the header only (``Image.open`` is
+            # lazy — no pixel decode happens, so lifting the bomb guard for
+            # the probe is safe) and substitute a placeholder if oversized.
+            try:
+                Image.MAX_IMAGE_PIXELS = None
+                with Image.open(io.BytesIO(img_bytes)) as probe:
+                    oversized = max(probe.size) > _HARD_MAX_EDGE
+                if oversized:
+                    buf = io.BytesIO()
+                    Image.new("RGB", (1, 1)).save(buf, format="JPEG")
+                    return buf.getvalue(), "jpeg"
+            except Exception:
+                pass
+        finally:
+            Image.MAX_IMAGE_PIXELS = previous_ceiling
     return img_bytes, ext
 
 
@@ -1108,6 +1163,67 @@ def run_proxy(args: list[str]) -> None:
         from kiro_crew.browser.setup import repair_playwright_config
 
         repair_playwright_config(config_arg)
+
+    # Runtime compatibility probe: on Linux with CUPS <2.5, the default
+    # Chromium revision crashes at load time (hard ippValidateAttributes dep).
+    # Inject --executable-path pointing at a compatible older revision when:
+    #   (a) the user hasn't already specified --executable-path,
+    #   (b) the effective browser is Chromium (checked via CLI flags AND config).
+    # This is the sole compatibility seam — the config stays declarative
+    # (channel: chromium) and this per-spawn probe self-heals without persisting
+    # stale paths. (#2894)
+    if not any(a == "--executable-path" or a.startswith("--executable-path=")
+               for a in args):
+        _should_probe = True
+        # Skip when the CLI explicitly selects a non-Chromium browser or
+        # extension mode — injecting a Chromium binary into a Firefox/WebKit
+        # launch would crash. Recognizes both --flag value and --flag=value.
+        _cli_browser: str | None = None
+        for _i, _a in enumerate(args):
+            if _a == "--browser" and _i + 1 < len(args):
+                _cli_browser = args[_i + 1]
+            elif _a.startswith("--browser="):
+                _cli_browser = _a.split("=", 1)[1]
+            elif _a == "--executable-path" or _a.startswith("--executable-path="):
+                _should_probe = False
+            elif _a == "--extension":
+                _should_probe = False
+        if _cli_browser and _cli_browser not in ("chrome", "chromium"):
+            _should_probe = False
+        _has_cli_browser = _cli_browser is not None
+        # Check the config's browserName when no CLI --browser override is
+        # present. Guard: refuse sensitive paths before reading (mirrors the
+        # guard in repair_playwright_config above, but applied independently
+        # so a refused repair does not leak into this read path).
+        if _should_probe and config_arg and not _has_cli_browser:
+            try:
+                from kiro_crew.security import is_sensitive_path
+
+                if is_sensitive_path(config_arg):
+                    pass  # Skip config read; probe anyway (Chromium default).
+                else:
+                    _cfg = json.loads(
+                        open(config_arg, encoding="utf-8").read()
+                    )
+                    _engine = _cfg.get("browser", {}).get(
+                        "browserName", "chromium"
+                    )
+                    if _engine != "chromium":
+                        _should_probe = False
+            except Exception:
+                pass  # Unreadable config — probe anyway (fail-safe).
+        if _should_probe:
+            try:
+                # Circular import: browser.setup imports from THIS module at
+                # top level, so the import is deferred to call time (once per
+                # proxy spawn, not hot).
+                from kiro_crew.browser.setup import _find_compatible_chromium
+
+                compat = _find_compatible_chromium()
+                if compat:
+                    args = ["--executable-path", compat] + args
+            except Exception:
+                pass  # Probe failure is non-fatal; fall through to default.
 
     playwright_cmd = _resolve_playwright_cmd()
     if playwright_cmd is None:

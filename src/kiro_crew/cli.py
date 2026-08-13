@@ -1372,6 +1372,7 @@ Examples:
     profile_show.add_argument("name", help="Profile file stem (without .json)")
 
     register_perf_parser(sub)
+    register_bench_parser(sub)
     register_desktop_parser(sub)
 
     kn_parser = sub.add_parser("knowledge", help="Knowledge Base maintenance")
@@ -1392,7 +1393,7 @@ Examples:
     )
     pod_sub = pod_parser.add_subparsers(
         dest="pod_action",
-        metavar="{up,down,ls,status,token,url,logs,exec,provision,install}",
+        metavar="{up,down,ls,prune,status,token,url,logs,exec,provision,install}",
     )
     pod_up = pod_sub.add_parser("up", help="Schedule an isolated pod for a worktree")
     pod_up.add_argument("name", help="Worktree name")
@@ -1431,6 +1432,35 @@ Examples:
     pod_down.add_argument("name", help="Worktree name")
     pod_ls = pod_sub.add_parser("ls", help="List running pods")
     pod_ls.add_argument("--json", action="store_true", help="Emit rows as JSON")
+    pod_prune = pod_sub.add_parser(
+        "prune", help="Reclaim orphaned pod HOMEs in bulk (the N-at-once `pod down`)"
+    )
+    pod_prune.add_argument(
+        "--older-than",
+        dest="older_than",
+        default="3d",
+        help=(
+            "Only reclaim orphans whose last activity is older than this "
+            "(e.g. 3d, 12h, 30m, 45s). Default: 3d, so a freshly-crashed HOME "
+            "an operator may still be debugging is kept. Use --all to reclaim "
+            "regardless of age."
+        ),
+    )
+    pod_prune.add_argument(
+        "--all",
+        dest="prune_all",
+        action="store_true",
+        help="Reclaim ALL orphans regardless of age (overrides --older-than)",
+    )
+    pod_prune.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Classify and print what would be reclaimed without deleting anything",
+    )
+    pod_prune.add_argument(
+        "--json", action="store_true", help="Emit per-name results as JSON"
+    )
     pod_status = pod_sub.add_parser("status", help="Up/down + health for one pod")
     pod_status.add_argument("name", help="Worktree name")
     pod_status.add_argument("--json", action="store_true", help="Emit status as JSON")
@@ -2173,7 +2203,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         _jail_reexec_gate(args.command, getattr(args, "no_jail", False))
 
     if args.command == "chat":
-        asyncio.run(_chat(args.message, args.model, agent=getattr(args, "agent", None)))
+        _run_chat(args.message, args.model, agent=getattr(args, "agent", None))
     elif args.command == "gateway":
         # Seam-supplied pre-launch checks (CPP IdentityProvider seam). Runs
         # HERE in the gateway dispatch — not in boot_platform (which runs for
@@ -2311,6 +2341,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         rc = perf_cmd(args)
         if rc:
             raise SystemExit(rc)
+    elif args.command == "bench":
+        rc = bench_cmd(args)
+        if rc:
+            raise SystemExit(rc)
     elif args.command == "desktop":
         rc = desktop_cmd(args)
         if rc:
@@ -2341,7 +2375,8 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
 # ── Config ──
 
 
-from kiro_crew.cli_chat import _chat  # noqa: E402
+from kiro_crew.cli_bench import bench_cmd, register_bench_parser  # noqa: E402
+from kiro_crew.cli_chat import _run_chat  # noqa: E402
 from kiro_crew.cli_cloud import add_size_choices as _cloud_size_choices  # noqa: E402
 from kiro_crew.cli_cloud import handle_cloud  # noqa: E402
 from kiro_crew.cli_commands import (  # noqa: E402

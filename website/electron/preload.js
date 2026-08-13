@@ -58,6 +58,21 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Privacy-pane dialog only if macOS is actually the one saying no. Without
   // this the toast is a dead end: macOS never re-prompts after a denial.
   reportMicDenied: () => ipcRenderer.send("mic:denied"),
+  // The system-wide summon hotkey as ACTUALLY bound by main.js (registration
+  // can degrade to the default or to nothing when a key is taken), so the
+  // shortcuts UI advertises what really works. Resolves
+  // { accelerator, default } — accelerator is "" when nothing is bound.
+  getGlobalHotkey: () => ipcRenderer.invoke("global-hotkey:get"),
+});
+
+// Local-gateway switch for the Settings > Developer toggle. The choice lives in
+// the app's own config, which page JS cannot read or write, so the renderer
+// round-trips through main.js. Both calls resolve with the stored value.
+// Absent in plain browsers and in the PWA — the renderer hides the toggle when
+// the bridge is missing, since a browser tab has no local gateway to manage.
+contextBridge.exposeInMainWorld("localGatewayAPI", {
+  get: () => ipcRenderer.invoke("local-gateway:get"),
+  set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
 });
 
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.

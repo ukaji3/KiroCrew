@@ -78,10 +78,12 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -115,8 +117,9 @@ from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
 from kiro_crew.sel import sel
-from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
 from kiro_crew.session_map import _kiro_sessions_dir  # noqa: F401
+from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG
+from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
 from kiro_crew.session_pid import (
     _build_child_map,
     _cleanup_orphaned_mcp_servers,
@@ -388,6 +391,34 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # Cap on remembered per-session channel notice targets. reset()/remove() evict
 # their own entries, so this only bounds sessions dropped by some other path.
 _MAX_ORIGIN_LINKS = 512
+
+
+# Trailing ``:gen{N}`` on a session key. Matched here rather than reused from
+# messaging.link because that module's copy is private to its own parser.
+_GEN_SUFFIX_RE = re.compile(r"^gen\d+$")
+
+
+def _opt_out_key(key: str) -> str:
+    """The key an automatic-mirroring refusal is stored under.
+
+    The durable BUCKET, never the generation-suffixed session key. The refusal is
+    a preference about the CONVERSATION, not about one session — the same reason
+    the per-route model choice is not keyed by session — and generations rotate
+    on ``/new`` and on the configured idle/daily reset. Keyed per generation, an
+    idle rotation would silently undo the user's "off" with no action on their
+    part, and every rotated generation would strand its own row that pruning is
+    forbidden to collect. Bucket-keyed, one conversation holds one such row.
+
+    The suffix is stripped textually rather than through the canonical parser,
+    because the shapes that most need it are the ones the parser rejects: a
+    ``dm_scope="unified"`` bucket is ``unified:{agent}``, which is too short for
+    the §9 grammar, so a parser-only rule would leave unified conversations keyed
+    per generation — exactly the bug this function exists to prevent.
+    """
+    canon = canonical_key(key)
+    head, sep, tail = canon.rpartition(":")
+    return head if sep and _GEN_SUFFIX_RE.match(tail) else canon
+
 
 # Background session recycle thresholds (more aggressive than chat compaction)
 _BG_RECYCLE_PCT = 70.0  # recycle at 70% — well before overflow
@@ -3096,7 +3127,25 @@ class SessionManager:
             if pct > 0:
                 logger.info("Session %s context at %.0f%% (CC-managed)", key, pct)
         elif pct >= self._cfg.session.autocompact_pct:
-            self._trigger_compaction(key, f"context at {pct:.0f}%", pct)
+            # Defensive twin of the rekey-time reset (#2932): compaction is
+            # destructive-ish (it rewrites the conversation), so it must never
+            # fire on a percentage that no telemetry has confirmed for the
+            # CURRENT session binding. Today every path that raises context_pct
+            # also calls note_pct_reported(), so this gate is unreachable in
+            # production — it exists so a future handoff/reset path that
+            # preserves a stale pct while leaving it flagged unknown degrades
+            # to a skipped compaction instead of compacting an empty session.
+            # Fail-quiet on doubles: providers without the probe read as
+            # "confirmed" (unchanged behavior).
+            if _context_pct_is_unknown(provider):
+                logger.info(
+                    "Session %s context %.0f%% is unconfirmed for this session — "
+                    "skipping compaction until telemetry reports",
+                    key,
+                    pct,
+                )
+            else:
+                self._trigger_compaction(key, f"context at {pct:.0f}%", pct)
         elif pct >= _CONTEXT_WARN_PCT:
             logger.warning("Session %s context at %.0f%%", key, pct)
         elif pct > 0:
@@ -4173,6 +4222,67 @@ class SessionManager:
     def mirror_accepts_inbound(self, key: str) -> bool:
         """True iff this session's mirror is a session-resume (two-way) binding."""
         return self._session_map.mirror_accepts_inbound(key)
+
+    def set_mirror_opt_out(self, key: str, opted_out: bool) -> None:
+        """Record (or withdraw) a refusal of AUTOMATIC origin mirroring.
+
+        A channel that mirrors its own conversation by default needs an
+        in-channel "off" that the NEXT inbound message does not silently undo,
+        and clearing the binding cannot express that: an entry with no ``mirror``
+        is indistinguishable from one that was never linked, so the automatic
+        bind would fire again one message later. This flag is that difference.
+
+        Persisted, because the bind it suppresses is itself re-asserted on every
+        turn and survives a restart — an in-memory refusal would come back on
+        its own. Only the automatic bind consults it; an explicit ``/link`` or
+        dashboard link is a direct instruction and :meth:`set_mirror_link` never
+        reads it.
+        """
+        with self._session_map.batched_save():
+            self._session_map.set_flag(_opt_out_key(key), MIRROR_OPT_OUT_FLAG, opted_out)
+            # Retire a refusal an earlier build stored under the generation key,
+            # so it cannot outlive a withdrawal made through the bucket.
+            legacy = canonical_key(key)
+            if legacy != _opt_out_key(key):
+                self._session_map.set_flag(legacy, MIRROR_OPT_OUT_FLAG, False)
+
+    def mirror_opt_out(self, key: str) -> bool:
+        """True iff this conversation declined automatic origin mirroring.
+
+        Reads the bucket, then falls back to the generation key an earlier build
+        wrote. Without the fallback, upgrading silently restores mirroring for
+        every conversation that had already turned it off — the exact failure the
+        flag exists to prevent, delivered by the fix for it.
+
+        A legacy hit is PROMOTED to the bucket, which is why this read writes.
+        Reading it without promoting would honour the refusal for the generation
+        it was stored under and lose it at the next rotation, so an upgrading user
+        would keep the expiring behaviour this change exists to remove. Retiring
+        the old row in the same write also stops it holding an entry that pruning
+        is forbidden to collect, one per generation.
+        """
+        bucket = _opt_out_key(key)
+        if self._session_map.get_flag(bucket, MIRROR_OPT_OUT_FLAG):
+            return True
+        legacy = canonical_key(key)
+        if legacy == bucket:
+            return False
+        if not self._session_map.get_flag(legacy, MIRROR_OPT_OUT_FLAG):
+            return False
+        with self._session_map.batched_save():
+            self._session_map.set_flag(bucket, MIRROR_OPT_OUT_FLAG, True)
+            self._session_map.set_flag(legacy, MIRROR_OPT_OUT_FLAG, False)
+        return True
+
+    def batched_save(self) -> AbstractContextManager[None]:
+        """Collapse the session-map writes of a related mutation sequence into one.
+
+        Each mutation rewrites the whole map, so a caller making several of them
+        (a link, an unlink) pays that cost once per operation unless it says
+        otherwise. Must not be held across an ``await`` — see
+        :meth:`SessionMap.batched_save`.
+        """
+        return self._session_map.batched_save()
 
     def set_origin_link(self, key: str, link: ChannelLink) -> None:
         """Record the channel conversation this session was started from.

@@ -11,7 +11,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
 
 from kiro_crew import mcp_apps_render, model_registry, session_directive
 from kiro_crew.acp.client import (
@@ -60,6 +59,7 @@ from kiro_crew.context_management import (
     validate_plan_format,
 )
 from kiro_crew.dashboard.chat_persistence import _build_history_prefix, save_slot_off_loop
+from kiro_crew.dashboard.chat_summary import generate_session_summary
 from kiro_crew.dashboard.chat_title import (
     _extract_and_redact_plan_metadata,
     _maybe_auto_title,
@@ -163,6 +163,7 @@ from kiro_crew.llm_helpers import (
     transient_retry_delay,
 )
 from kiro_crew.mcp_discovery import kirocrew_managed_names
+from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
 from kiro_crew.messaging.renderer import chunk_text
@@ -184,9 +185,9 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import (
-    _EXFIL_PATTERNS,
     StreamRedactor,
     is_sensitive_path,
+    oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
 )
@@ -211,6 +212,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     RecoveryPayload,
     is_synthetic_payload_item,
     is_synthetic_recovery_item,
+    mint_options_token,
     payload_for_replay,
 )
 
@@ -992,98 +994,15 @@ def _redact_acp_string(s: str) -> str:
     return s
 
 
-# Query params that are a normal, expected part of an OAuth 2.0 / OIDC
-# consent URL (incl. PKCE).  Their values are high-entropy by design
-# (``state``, ``code_challenge``, ``nonce`` …) and must NOT be treated as
-# leaked credentials — otherwise every real GitHub/Google sign-in URL is
-# rejected.  Anything *outside* this set is still scanned for real secrets.
-_OAUTH_QUERY_PARAMS = frozenset(
-    {
-        # RFC 6749 / OIDC core
-        "client_id",
-        "redirect_uri",
-        "response_type",
-        "response_mode",
-        "scope",
-        "state",
-        "nonce",
-        "code_challenge",
-        "code_challenge_method",
-        "prompt",
-        "login_hint",
-        "access_type",
-        "audience",
-        "resource",
-        "display",
-        "id_token_hint",
-        "max_age",
-        "ui_locales",
-        "acr_values",
-        "request_uri",
-        # Provider-specific but standard & benign (GitHub: login/allow_signup;
-        # Microsoft: domain_hint; Slack: user_scope/team).  Kept in sync with the
-        # legit-URL corpus in test/test_mcp_oauth_banner.py.
-        "login",
-        "allow_signup",
-        "domain_hint",
-        "user_scope",
-        "team",
-    }
-)
-
-
-# Unambiguous credential signatures that NEVER legitimately appear inside an
-# OAuth/OIDC opaque token (state, code_challenge, …). Unlike _EXFIL_PATTERNS,
-# this set excludes the generic base64-blob / heavy-URL-encoding heuristics
-# (which match a real high-entropy PKCE value), so it is safe to apply even to
-# the exempted OAuth params: a real sign-in URL never carries an AWS key, Slack
-# token, or PEM/SSH private-key header in a query value, but a malicious MCP
-# server smuggling a credential out through state= would be caught.
-_OAUTH_PARAM_CREDENTIAL_RE = re.compile(
-    r"(?:"
-    r"(?:AKIA|ASIA)[A-Z0-9]{16}"  # AWS access key ID
-    r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
-    r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
-    r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
-    r")",
-    re.IGNORECASE,
-)
-
-
 def _oauth_url_contains_credential(url: str) -> bool:
-    """True if the URL embeds an *actual* credential or secret.
+    """True if the URL embeds an actual credential or exfiltration payload.
 
-    Legitimate OAuth consent URLs carry high-entropy params (``state``,
-    ``code_challenge``, ``client_id``) and are frequently >200 chars — so we
-    deliberately do NOT apply the generic long-query exfiltration heuristic
-    here (that rule exists to catch data being smuggled out in query strings,
-    and would reject every real OAuth URL).  Instead we reject only when a
-    genuine credential pattern is present: any AWS key / Slack token / private
-    key (``redact_credentials``), the full exfil heuristic on a NON-OAuth query
-    param, or an unambiguous credential signature even inside a recognized OAuth
-    param (a real OAuth opaque token never contains an AWS/Slack/PEM secret).
+    The security module owns the exact endpoint allowlist and parameter-level
+    entropy exemption. This wrapper preserves the historical dashboard API
+    while avoiding ``redact_credentials`` here: that broader redactor includes
+    the bare-secret entropy rule that legitimate state/PKCE values trigger.
     """
-    if not url:
-        return False
-    # Hard reject: an actual embedded credential anywhere in the URL.
-    _, hit_cred = redact_credentials(url)
-    if hit_cred:
-        return True
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return True  # unparseable → refuse to render
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key in _OAUTH_QUERY_PARAMS:
-            # High-entropy OAuth/PKCE values are allowed, but a hard credential
-            # signature smuggled into an OAuth param is still exfil — reject it.
-            if _OAUTH_PARAM_CREDENTIAL_RE.search(value):
-                return True
-            continue
-        # Non-OAuth param (or path): apply the full exfil heuristic.
-        if _EXFIL_PATTERNS.search(value):
-            return True
-    return False
+    return oauth_url_contains_credential(url)
 
 
 def _emit_mcp_oauth_request(
@@ -2970,6 +2889,14 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     cron_label = match.group(1) if match else "cron"
     cron_label, _ = redact_exfiltration_urls(cron_label)
     cron_label, _ = redact_credentials(cron_label)
+    # Structured completion facts stamped at enqueue time (gateway _subagent_done)
+    # ride through to the row so the card reads them instead of re-parsing the
+    # header prose (#1792). Only a single, un-merged system injection carries
+    # them: a merge concatenates several entries under one synthetic header, for
+    # which per-entry facts are meaningless — subagent completions never merge
+    # (they drain one at a time and break any user-message merge), so this only
+    # fires on the shape it was computed for.
+    _row_meta = consumed[0].get("meta") if (is_subagent and len(consumed) == 1) else None
     slot.append(
         "subagent" if is_subagent else "inject" if (is_cron or is_recovery) else "user",
         next_msg,
@@ -2978,6 +2905,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             if is_cron
             else "msg msg-inject" if is_recovery else "msg msg-u"
         ),
+        meta=_row_meta if isinstance(_row_meta, dict) else None,
     )
 
     task = spawn_guarded_turn(
@@ -3074,6 +3002,13 @@ def _finish_queue_cycle(state: DashboardState, slot: _ChatSlot) -> None:
         refresh_task = asyncio.create_task(maybe_refresh_title(state, slot))
         state._background_tasks.add(refresh_task)
         refresh_task.add_done_callback(state._background_tasks.discard)
+
+    # Intent summary for the chat summary panel. Self-guarding: the common case
+    # (feature disabled) returns before any work, and an unchanged transcript is
+    # served from the sidecar cache without a model call.
+    summary_task = asyncio.create_task(generate_session_summary(state, slot))
+    state._background_tasks.add(summary_task)
+    summary_task.add_done_callback(state._background_tasks.discard)
 
 
 def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: bool) -> None:
@@ -3625,6 +3560,26 @@ async def _run_chat(
             reasoning_effort_override=slot.reasoning_effort or None,
         )
         _acquired = True
+        # Member activity pointer — once per SESSION, not per turn: the log
+        # answers "which sessions did this member take part in", so a per-turn
+        # append would inflate every count taken from it. `slot.agent` is the
+        # member the human picked; `kiro_agent` is the template it resolved to,
+        # and only the member identity is recorded.
+        #
+        # Offloaded: this opens and appends to a file, and `_run_chat` shares the
+        # single gateway event loop with every other session — matching the
+        # to_thread offloads used for the other file IO in this function.
+        # record_activity is total, so no guard is needed here.
+        if is_new and slot.agent:
+            await asyncio.to_thread(
+                record_activity,
+                slot.agent,
+                session_key,
+                slot.memory_mode or "",
+                project=slot.project or "",
+                via="chat",
+                dedupe_session=True,
+            )
         # Publish the live inner AcpClient onto the slot so a concurrent request
         # (the dashboard steer handler) can reach the running session's client
         # to inject a mid-turn steer. Cleared in the finally below.
@@ -4192,6 +4147,12 @@ async def _run_chat(
             await _deliver_cross_surface_user_message(state, session_key, _user_msg_for_mirror)
 
         _stop_reason = ""
+        # Cleared at turn START so post-turn consumers never read the PREVIOUS
+        # turn's value: a turn that dies before EVENT_COMPLETE (ACP crash, auth
+        # expiry, transport drop) never reaches the assignment below, and a
+        # stale "end_turn" from the last successful turn would make the failed
+        # turn look cleanly finished (e.g. to the session-summary gate).
+        slot._last_stop_reason = ""
         # Tool-stall metadata forwarded by the ACP watchdog on its terminal
         # event (title / redacted command / evidence) — feeds the dedicated
         # tool-stall recovery nudge below.
@@ -5677,6 +5638,10 @@ async def _run_chat(
                     elapsed_ms=_turn_elapsed_ms,
                 )
                 _stop_reason = event.stop_reason
+                # Recorded on the slot so post-turn consumers reached later
+                # (which do not receive the event) can tell a turn that really
+                # finished from one cut short by a timeout, cancel or stall.
+                slot._last_stop_reason = _stop_reason or ""
                 if _stop_reason == STOP_REASON_TOOL_STALL:
                     _stall_tool_title = event.title
                     _stall_command = event.tool_input
@@ -6199,7 +6164,16 @@ async def _run_chat(
                     # question clickable forever. build_options_blocks already
                     # redacts each choice through redact_for_display, so nothing
                     # extra is needed here.
-                    _mirror_blocks = build_options_blocks(_mirror_options)
+                    # The asker is THIS session, named explicitly. Resolving it
+                    # from the thread would name whoever owns the thread at mint
+                    # time, so a relink landing mid-turn would stamp the control
+                    # with a conversation that never asked the question.
+                    _mirror_token = await asyncio.to_thread(
+                        mint_options_token, state, session_key
+                    )
+                    _mirror_blocks = build_options_blocks(
+                        _mirror_options, staleness_token=_mirror_token
+                    )
                     # The thread's owner BEFORE the post. A relink landing while
                     # post_blocks is in flight moves the conversation to another
                     # session, and a control recorded under the key this turn

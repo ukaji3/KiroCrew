@@ -14,7 +14,6 @@ from typing import Any, Callable
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.browser.auth import ensure as browser_auth_ensure
 from kiro_crew.browser.command_bus import (
     DEFAULT_COMMAND_TIMEOUT_MS,
@@ -39,7 +38,6 @@ from kiro_crew.browser.setup import (
     set_browser_engine,
     set_browser_mode_enabled,
 )
-from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.cron import CronStoreBusy
 from kiro_crew.dashboard.channel_folders import (
     LIVE_RELOAD_FIELDS,
@@ -51,6 +49,7 @@ from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
 from kiro_crew.dashboard.chat_utils import (
     _remove_queued_by_id,
     dashboard_slot_key,
+    mint_options_token,
     remember_slack_options,
     slack_options_owner_key,
 )
@@ -61,7 +60,6 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     DashboardState,
 )
-from kiro_crew.executors import discovery_executor
 from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
@@ -70,7 +68,7 @@ from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exf
 from kiro_crew.session_pid_sig import verify_session_pid
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
-from kiro_crew.subagent import validate_cwd
+from kiro_crew.spawn_warm import warm_project_agents_for_spawn
 from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
@@ -92,45 +90,6 @@ def _sel():
 
 
 # ── Subagents ──
-
-
-async def _warm_project_agents_for_spawn(state: Any, cwd: str) -> None:
-    """Warm the project agent-name cache for a spawn-shaped request, safely.
-
-    ``_validate_agent`` runs on the loop and therefore reads ONLY
-    ``cached_project_agent_names()``; without this warm, a spawn that names a
-    project agent is refused ("not found") until some unrelated session happens
-    to warm that project's cache. Best-effort and never raises.
-
-    A caller-supplied cwd MUST pass the same ``validate_cwd()`` gate ``spawn()``
-    itself applies BEFORE any discovery read touches it — warming first would
-    read ``<cwd>/.kiro`` from a path the allowlist rejects. That applies to a
-    STORED cwd on retry as much as a fresh one: the allowlist can have changed
-    since the original spawn (a removed root must not stay warm-able forever),
-    so the check is against the CURRENT config on every call. On rejection the
-    cwd is simply not warmed and ``spawn()`` refuses it with the real error.
-    The pool cwd is Kiro Crew's own default project dir and needs no allowlist.
-    Config load + ``validate_cwd`` (realpath/isdir) are blocking filesystem
-    work, so the whole check runs on the discovery pool.
-    """
-    warm_dir = ""
-    if cwd:
-
-        def _validated_warm_dir() -> str:
-            try:
-                allowed_roots = KiroCrewConfig.load().agent.subagent_cwd_allowed_roots
-            except Exception:
-                allowed_roots = []  # fail closed, mirroring spawn()
-            resolved, _err = validate_cwd(cwd, allowed_roots)
-            return resolved
-
-        warm_dir = await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), _validated_warm_dir
-        )
-    else:
-        warm_dir = str(getattr(state.sessions, "_pool_cwd", "") or "")
-    if warm_dir:
-        await warm_project_agent_names(warm_dir)
 
 
 async def api_spawn(request: web.Request) -> web.Response:
@@ -205,7 +164,7 @@ async def api_spawn(request: web.Request) -> web.Response:
     # The async moment preceding the synchronous spawn(): warm here so the
     # on-loop, cache-only agent validation inside spawn() is a hit.
     if agent:
-        await _warm_project_agents_for_spawn(state, cwd)
+        await warm_project_agents_for_spawn(state, cwd)
     info = state.subagents.spawn(
         task,
         parent_session_key=parent_session,
@@ -276,6 +235,12 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         max_turns = max(0, min(int(body.get("max_turns", 0) or 0), 1000))
     except (TypeError, ValueError):
         max_turns = 0
+    # The run's own cwd, resolved OFF the event loop: a continuation has to run
+    # where the run ran (a project-local agent does not resolve against the pool
+    # project), but reading state.json and probing the path are blocking calls and
+    # `continue_conversation` is synchronous. Doing it here keeps the gateway
+    # responsive even when the recorded path lives on a stalled mount.
+    resumed_cwd = await asyncio.to_thread(state.subagents.recorded_cwd, conv_id)
     info = state.subagents.continue_conversation(
         conv_id,
         task,
@@ -283,6 +248,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         agent=agent,
         model=model or None,
         max_turns=max_turns,
+        cwd=resumed_cwd,
     )
     if not info:
         return web.json_response(
@@ -677,7 +643,7 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
     # gateway restart leaves the cache cold), so it is re-checked against the
     # current config before any discovery read.
     if old.agent:
-        await _warm_project_agents_for_spawn(state, old.cwd or "")
+        await warm_project_agents_for_spawn(state, old.cwd or "")
     info = state.subagents.spawn(
         old._raw_task or old.task,
         parent_session_key=old.parent_session_key,
@@ -1401,7 +1367,19 @@ async def api_send_message(request: web.Request) -> web.Response:
                             )
                             if options:
                                 try:
-                                    option_blocks = build_options_blocks(options)
+                                    # Asker is the thread's owner: an out-of-band
+                                    # post has no running session of its own, so
+                                    # the conversation that receives the reply is
+                                    # the right subject.
+                                    _sm_o = slack_options_owner_key(state, thread_ts or "")
+                                    _sm_t = (
+                                        await asyncio.to_thread(mint_options_token, state, _sm_o)
+                                        if _sm_o
+                                        else None
+                                    )
+                                    option_blocks = build_options_blocks(
+                                        options, staleness_token=_sm_t
+                                    )
                                     # Fallback text is the SAFE stub, not the
                                     # message body. Slack parses entities in a
                                     # message's top-level `text` -- which is what
@@ -2165,9 +2143,13 @@ async def api_browser_command_drain(request: web.Request) -> web.Response:
     Called by the Electron main process. Body:
     ``{"session_keys": [str, ...], "wait_ms"?: int}``.
 
-    SIDE EFFECT: registers ``session_keys`` as having a live native panel (TTL
-    ~2x ``wait_ms``); this registration is what ``/api/browser/command`` checks
-    to decide whether to 503.
+    SIDE EFFECT: registers ``session_keys`` as having a live native panel for a
+    fixed liveness window (independent of ``wait_ms``, refreshed by drains and
+    result posts) AND marks a native host as present for the same window; the
+    registration is what ``/api/browser/command`` checks to decide whether to
+    503, and host-presence is what lets it briefly WAIT for a cold-starting
+    panel instead. ``wait_ms == 0`` with empty ``session_keys`` is the Electron
+    idle heartbeat: it refreshes host-presence and returns 204 at once.
 
     Responses:
     - 200 ``{"id", "session_key", "op", "args"}`` — a command is available;
@@ -2194,7 +2176,10 @@ async def api_browser_command_drain(request: web.Request) -> web.Response:
     if not isinstance(session_keys, list) or not all(isinstance(k, str) for k in session_keys):
         return web.json_response({"error": "session_keys must be a list of strings", "code": "session_keys_invalid"}, status=400)
     wait_ms = body.get("wait_ms")
-    if not isinstance(wait_ms, int) or isinstance(wait_ms, bool) or wait_ms <= 0:
+    # ``wait_ms == 0`` is a valid heartbeat: register / refresh the host-present
+    # signal and return 204 at once, without holding a long-poll open. Only a
+    # missing, negative, or non-int value falls back to the default long wait.
+    if not isinstance(wait_ms, int) or isinstance(wait_ms, bool) or wait_ms < 0:
         wait_ms = DEFAULT_DRAIN_WAIT_MS
     bus = get_command_bus()
     command = await bus.drain(session_keys, wait_ms=wait_ms)
@@ -2272,6 +2257,26 @@ async def api_browser_auth_retry(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=500)
 
 
+def _browser_config_snapshot() -> dict[str, Any]:
+    """Read the Browser Mode surface. BLOCKING -- callers on the event loop must
+    offload it.
+
+    Every field is a filesystem read: three flag/token files under the data home,
+    plus a launcher probe that resolves over the Node-augmented PATH. The probe is
+    the expensive one -- it lists the Node toolchain candidate dirs (once per
+    process, then cached) and walks PATH looking for a launcher, so on a network
+    HOME those stats are slow enough to be worth keeping off the loop.
+    """
+    return {
+        "enabled": browser_mode_enabled(),
+        "engine": get_browser_engine(),
+        "engines": list(BROWSER_ENGINES),
+        "extension_mode": has_playwright_extension(),
+        "token": get_extension_token() is not None,
+        "installed": is_playwright_installed(),
+    }
+
+
 async def api_browser_config_get(request: web.Request) -> web.Response:
     """GET /api/browser/config — browser mode, engine, extension mode, token."""
     _sel().log_tool_invocation(
@@ -2280,16 +2285,7 @@ async def api_browser_config_get(request: web.Request) -> web.Response:
         outcome="completed",
         downstream_service="browser",
     )
-    return web.json_response(
-        {
-            "enabled": browser_mode_enabled(),
-            "engine": get_browser_engine(),
-            "engines": list(BROWSER_ENGINES),
-            "extension_mode": has_playwright_extension(),
-            "token": get_extension_token() is not None,
-            "installed": is_playwright_installed(),
-        }
-    )
+    return web.json_response(await asyncio.to_thread(_browser_config_snapshot))
 
 
 async def api_browser_config_save(request: web.Request) -> web.Response:

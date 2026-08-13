@@ -12,6 +12,14 @@ writing.
 
 The config module (`kiro_crew/config/loader.py`) loads runtime configuration from `~/.kiro/crew/config.json` using stdlib dataclasses with sensible defaults.
 
+A feature whose section spends tokens on the user's behalf defaults to off and
+documents its knobs in its own spec — `session_summary` is the current example
+(see [session-summary.md](session-summary.md)), following the shape
+`SkillsConfig` established: every field carries `_meta` label/help for the config
+surfaces, out-of-range values are clamped with a warning rather than raising, and
+a malformed section degrades to defaults so a hand-edited file cannot prevent the
+gateway from starting.
+
 ## Data Home Location & Migration
 
 KiroCrew's data root nests **under kiro-cli's own `~/.kiro/` base** so all
@@ -915,12 +923,20 @@ OS — so naming the browser was wrong on that surface. The row annotates itself
 with the language Auto actually resolves to ("Auto — Deutsch"), which answers the
 question accurately on every surface.
 
-The backend validates **shape only** (`_LANGUAGE_TAG_RE`, a conservative BCP-47
-subset), not membership in the set of shipped catalogs. That keeps "which
-languages exist" a pure frontend data change: add `locales/<tag>.json`, register
-the picker entry in `SUPPORTED_LANGUAGES`, and add the static import plus
-`AUTHORED_CATALOGS` entry in `i18n/index.ts`. No backend edit is required; a
-well-formed tag with no catalog falls back to detection client-side.
+The backend's **write path** validates **shape only** (`_LANGUAGE_TAG_RE`, a
+conservative BCP-47 subset), not membership in the set of shipped catalogs — a
+well-formed tag with no catalog stays writable and falls back to detection
+client-side. The **agent-injection read path** additionally requires catalog
+membership: `context.ui_language_tag()` checks the tag against
+`context._UI_LANGUAGE_CATALOGS` (a mirror of the non-dev-only
+`SUPPORTED_LANGUAGES` entries) and treats a non-catalog tag exactly like
+`""`/Auto — no `[UI LANGUAGE]` steer is emitted, so the agent is never steered
+to a language the chrome cannot render (#1130). Adding a language is therefore
+the three frontend edits — add `locales/<tag>.json`, register the picker entry
+in `SUPPORTED_LANGUAGES`, and add the static import plus `AUTHORED_CATALOGS`
+entry in `i18n/index.ts` — **plus one mechanical backend entry** in
+`_UI_LANGUAGE_CATALOGS`, which the drift gate in
+`test/test_context_ui_language.py` names explicitly on failure.
 
 Shipped catalogs (ordered by global speaker count, which is also the picker
 order): `en`, `zh-CN`, `hi`, `es`, `fr`, `bn`, `pt`, `ru`, `de`, `ja`, `ko`, `it`. Right-to-left
@@ -948,7 +964,8 @@ above is what says whether it worked.
 
 #### The tag reaches the agent, too
 
-`context.py::_build_ui_language_section` injects the configured tag into session
+`context.py::_build_ui_language_section` injects the configured tag — after the
+catalog-membership gate described above — into session
 context as a `[UI LANGUAGE] <tag>` block (next to `[CURRENT AGENT]`/`[RUNTIME]`,
 and in `minimal_context` mode as well). It exists for one string: the tool-call
 purpose (`__tool_use_purpose`), which the dashboard paints as the tool-call pill
@@ -1131,6 +1148,19 @@ Returns the effective config for a channel:
 The `dashboard.url` field controls where the dashboard is reachable. From it, the system derives the port to bind on, the bind address (`0.0.0.0` for non-loopback hosts, `127.0.0.1` otherwise), and the allowed origins for CSRF/WebSocket checks. When omitted, defaults to `localhost:5476`.
 
 A **malformed** `dashboard.url` (e.g. an unterminated IPv6 literal `http://[::1` or a non-numeric port `http://host:notaport`) does **not** abort startup: `parse_dashboard_url` degrades to the defaults (`""` host, port `5476`) and logs a warning, so a single typo in the config can never take the gateway down on boot. `KIROCREW_PORT` still overrides the port regardless.
+
+Once the dashboard's TCP site is listening, the gateway **exports the
+actually-bound port as `KIROCREW_BOUND_PORT`** into its own environment, so
+every child it spawns (kiro-cli sessions and their MCP stdio servers) inherits
+the truth instead of re-deriving a guess from `dashboard.url` — a portless URL
+would otherwise collapse to the default port in the child even when the
+gateway is bound elsewhere (including `--port auto`, where the OS assigns the
+port and no config field ever names it). It is a **distinct variable from
+`KIROCREW_PORT`** on purpose: `KIROCREW_PORT` means operator intent and is
+persisted by `service_environment()` into unit files, while
+`KIROCREW_BOUND_PORT` is ephemeral observed truth that must never be frozen
+into persistent config. Clients read it via `port_resolution.resolve_client_port`,
+one precedence step below the operator override.
 
 ## Model Resolution Chain
 

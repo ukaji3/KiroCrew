@@ -24,7 +24,7 @@ import {
   selectSubagent,
   setActiveSlot, truncateAfterIndex, replaceMessages,
   requestStop, pendingQuestionFor, captureStatelessCard, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion,
-  retireStatelessQuestion,
+  retireStatelessQuestion, capturePendingAskId,
   mcpAppKey,
 } from '../store/chatSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
@@ -32,6 +32,7 @@ import { onTerminalReady, sendToTerminalSession } from '../utils/terminalRegistr
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
 import { sseSlotTitle, triggerRefresh } from '../store/dashboardSlice'
 import { api } from '../api/client'
+import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
 import { useProvider } from '../providers'
 import { type AutoNudgeLoop } from '../components/AutoNudgePopover'
@@ -94,6 +95,7 @@ import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
 import PendingQuestionCard from '../components/PendingQuestionCard'
+import SessionPulseSurveyCard from '../components/SessionPulseSurveyCard'
 import type { FollowupItem } from '../store/chatSlice'
 
 // Stable identity for the "no follow-up cards" case: returning a fresh {} from
@@ -124,6 +126,7 @@ import { PinnedMessagesPanel } from './chat/PinnedMessagesPanel'
 import SubagentProgressBar from './chat/SubagentProgressBar'
 import TaskProgressBar from './chat/TaskProgressBar'
 import SidePanel, { CHAT_PANE_MIN_W, sidePanelFillWidth } from './chat/SidePanel'
+import { useSidePanelDock } from '../hooks/useSidePanelDock'
 import { groupDisplayItems, applyRunningState } from './chat/groupDisplayItems'
 import { setSessionPreviewPending, normalizeUrl, PREVIEW_FOCUS_EVENT, PREVIEW_SNIP_EVENT } from '../components/WebPreviewPanel'
 import { detectPreviewUrl, previewFeedDecision } from '../utils/detectPreviewUrl'
@@ -714,12 +717,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const provider = useProvider()
   const [searchParams, setSearchParams] = useSearchParams()
   const slots = useAppSelector(s => s.dashboard.slots)
-  // Unified chat view: show both default and orchestrator slots together.
+  // Unified chat view: show default, orchestrator and crew slots together.
   // App-owned worker slots (s.app) are excluded by the sidebar itself.
   const filteredSlots = useMemo(
     () => slots.filter(s => {
       const sk = s.surface ?? s.mode ?? ''
-      return sk === '' || sk === 'orchestrator'
+      return sk === '' || sk === 'orchestrator' || sk === 'crew'
     }),
     [slots],
   )
@@ -779,6 +782,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const messages = useAppSelector(s => s.chat.messages)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+  const kiroCrewVersion = useAppSelector(s => s.dashboard.status?.version) || ''
+  const assistantTurnCount = useMemo(
+    () =>
+      messages.filter(
+        m =>
+          m.role === 'assistant' &&
+          (m.kind ?? (m.meta?.kind as string | undefined)) !== 'compaction',
+      ).length,
+    [messages],
+  )
   const knowledgeFetch = useKnowledgeFetch(activeSlot)
   const knowledgeFetchRef = useRef(knowledgeFetch)
   knowledgeFetchRef.current = knowledgeFetch
@@ -2922,6 +2935,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => cancelAnimationFrame(raf)
   }, [activeTip, scrollBottom])
 
+  // Same re-anchor need as the tip above, for the session pulse survey card:
+  // it renders after ChatFooter, outside the virtualizer's measured rows, so
+  // mounting/unmounting it changes the scroll viewport's real content height
+  // without the virtualizer knowing — otherwise a new turn arriving while the
+  // card is showing renders visually behind/under it instead of pushing it
+  // out of view.
+  const [surveyVisible, setSurveyVisible] = useState(false)
+  useEffect(() => {
+    if (!isAtBottomRef.current) return
+    const raf = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (isAtBottomRef.current) scrollBottom(true)
+      })
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [surveyVisible, scrollBottom])
+
   // Navigate to a (possibly off-window) display index: mount it first via the
   // virtualizer so the DOM-based scroll can find it, then scroll next frame.
   // Tracks the in-flight row-mount poll (below) so a newer navigation cancels
@@ -3463,14 +3493,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const isStreaming = lastMsg?.role === 'streaming'
   // Follow-up options derived from the last assistant message in the current chat.
   // Swapping chats (activeSlot change) → messages change → memo recomputes fresh.
+  // A pending question card suppresses them: both would offer the same choices in
+  // the same band, and only the card can answer the blocked tool call.
   const { followUpOptions, followUpIsPlan } = useMemo(
-    () => deriveFollowUpOptions(messages, isStreaming),
-    [messages, isStreaming],
+    () => deriveFollowUpOptions(messages, isStreaming, !!pendingQuestion),
+    [messages, isStreaming, pendingQuestion],
   )
   // Visual-only highlight state; text in the input is the source of truth for
   // what gets sent. Cleared whenever the options list changes (new assistant
   // message) or the active chat switches — both signal a fresh turn.
   const [followUpPicked, setFollowUpPicked] = useState<Set<string>>(() => new Set())
+  // Read by the option handler instead of the state: two clicks landing before a
+  // re-render would both see the same set and both take the append branch.
+  const followUpPickedRef = useRef(followUpPicked); followUpPickedRef.current = followUpPicked
   const followUpOptionsKey = followUpOptions.join('\x00')
   useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, activeSlot])
   const { data: dashCfg } = useQuery<{ quick_send?: boolean; session_grid?: boolean; link_previews?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
@@ -3584,6 +3619,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // would compare against the wrong baseline (fork GPT review, 995718f).
     const entrySendSlot = targetSlot ?? uiSlot
     const cardAtSend = captureStatelessCard(store.getState().chat.pendingQuestions, entrySendSlot)
+    // Same entry-time capture for a BLOCKING card, whose staleness is resolved
+    // over the network instead of in the store.
+    const askAtSend = capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
 
     // Slash command interception (e.g. /side): runs before knowledge so a
     // bare prefix like /side returns immediately without touching input parse.
@@ -3870,7 +3908,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (bubblePastes.length) meta.pastes = bubblePastes
     if (knowledgeBlock) meta.knowledge = { items: knowledgeBlock.items.length, tokens: knowledgeBlock.totalTokens, titles: knowledgeBlock.items.map(i => i.title), content: knowledgeBlock.items.map(i => ({ title: i.title, text: i.content.slice(0, 2000) })) }
     if (widgetOrigin) meta.origin = 'widget'
-    const metaPayload = Object.keys(meta).length ? meta : undefined
+    // A client-generated correlation ID so the server echo can be matched
+    // to this exact optimistic bubble without relying on content equality.
+    // The server preserves meta fields on the user row it appends, so the
+    // echo carries both this sendId AND the server-minted `mid` (#2845).
+    const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    meta.sendId = sendId
+    const metaPayload = meta
     // Skip optimistic user bubble when the slot is busy (shared rule:
     // chatSlice.selectComposerBusy) — the backend sends a "queued" role
     // message instead, avoiding a duplicate. A steer-flagged send usually
@@ -3997,6 +4041,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         // one is not recoverable).
         dispatch(retireStatelessQuestion({ slot, expected: cardAtSend }))
       }
+      // The user answered in the composer instead of the card; a blocking card
+      // is resolved over the network, so this cannot be a store-only retirement.
+      void resolveAskAfterSend(body, slot === entrySendSlot ? askAtSend : null, dispatch)
     } catch (e: unknown) {
       clearTimeout(timeout)
       if (e instanceof DOMException && e.name === 'AbortError') {
@@ -4597,6 +4644,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // not the reason the list is hidden (the user owns the state).
   const sidebarAutoHidden = useRef<boolean | null>(null)
   const isMobile = useIsMobile()
+  const [sidePanelDock] = useSidePanelDock()
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const v = parseInt(localStorage.getItem('mc-sidebar-width') || '', 10)
     return !isNaN(v) && v >= SIDEBAR_MIN && v <= SIDEBAR_MAX ? v : 260
@@ -6394,6 +6442,32 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
               {/* Footer */}
               <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
+              {activeSlot && !slotLoading && (
+                <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                  <SessionPulseSurveyCard
+                    // Remount on session switch: without this, React reuses
+                    // the same component instance across sessions, so an
+                    // in-progress rating/feedback/email from session A would
+                    // still be sitting in state when the user switches to
+                    // session B and hits Submit — attributing A's answers to
+                    // B's sessionId prop, which had already updated.
+                    //
+                    // Gated on !slotLoading: the card captures its baseline
+                    // turn count on FIRST MOUNT (see the component's own
+                    // comment), so mounting before history finishes loading
+                    // would baseline at 0 and then count every loaded
+                    // historical turn as "live" once the fetch resolves —
+                    // reintroducing the exact reopened-session bug the
+                    // baseline exists to prevent, just via a race instead of
+                    // a missing check.
+                    key={activeSlot}
+                    sessionId={activeSlot}
+                    kiroCrewVersion={kiroCrewVersion}
+                    turnCount={assistantTurnCount}
+                    onVisibleChange={setSurveyVisible}
+                  />
+                </div>
+              )}
               <div style={{height: '2vh'}} />
             </div>
             )}
@@ -6707,12 +6781,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   return
                 }
                 // One-click: enabled + no shift + not busy + not already in multi-select
-                if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, slotRunning, followUpPicked.size, send)) return
+                if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, slotRunning, followUpPickedRef.current.size, send)) return
                 // Regular options: toggle. Click unpicked → append + mark; click
                 // picked → try to remove text + unmark (if the user edited the
                 // text so it no longer matches, leave text alone — the chip
                 // still un-highlights for consistency).
-                if (followUpPicked.has(o)) {
+                if (followUpPickedRef.current.has(o)) {
+                  const next = new Set(followUpPickedRef.current); next.delete(o)
+                  followUpPickedRef.current = next
                   setInput(prev => {
                     // Order matters: try leading ", o" first so "opt, opt" + remove
                     // last "opt" doesn't match "opt, " and splice the wrong one.
@@ -6725,10 +6801,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     if (prev === o) return ''
                     return prev  // user edited — leave text, still unmark below
                   })
-                  setFollowUpPicked(prev => { const next = new Set(prev); next.delete(o); return next })
+                  setFollowUpPicked(next)
                 } else {
+                  const next = new Set(followUpPickedRef.current); next.add(o)
+                  followUpPickedRef.current = next
                   setInput(prev => prev.trim() ? prev.trimEnd() + ', ' + o : o)
-                  setFollowUpPicked(prev => new Set(prev).add(o))
+                  setFollowUpPicked(next)
                 }
               }}
               pasteBlocks={pasteBlocks}
@@ -6904,6 +6982,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               inlinePreviewPath={inlinePreviewPath} onInlinePreviewChange={setInlinePreviewPath}
               expanded={panelMaximized}
               fillWidth={panelFillWidth}
+              canDockBottom={false}
             />
           </motion.div>
         )}
@@ -6920,11 +6999,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           {shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) && (
             <motion.div
               key="side-panel"
-              initial={{ width: 0, opacity: 0 }}
-              animate={{ width: 'auto', opacity: 1 }}
-              exit={{ width: 0, opacity: 0 }}
+              initial={sidePanelDock === 'bottom' ? { height: 0, opacity: 0 } : { width: 0, opacity: 0 }}
+              animate={sidePanelDock === 'bottom' ? { height: 'auto', opacity: 1 } : { width: 'auto', opacity: 1 }}
+              exit={sidePanelDock === 'bottom' ? { height: 0, opacity: 0 } : { width: 0, opacity: 0 }}
               transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-              className="h-full overflow-visible flex justify-end"
+              className={sidePanelDock === 'bottom' ? 'w-full overflow-visible flex flex-col justify-end' : 'h-full overflow-visible flex justify-end'}
               style={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
             >
               <SidePanel

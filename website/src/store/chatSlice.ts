@@ -255,6 +255,48 @@ export const captureStatelessCard = (
   return c && !c.ask_id ? c.cardId ?? null : null
 }
 
+/** Capture a slot's pending BLOCKING card's `ask_id` for send-time capture, the
+ *  `ask_id` counterpart to captureStatelessCard, with the same
+ *  synchronously-at-send-entry contract and for the same reason.
+ *
+ *  A blocking card cannot be retired in the store the way a stateless one is:
+ *  an agent is parked on its HTTP request, so deleting the entry alone leaves
+ *  that agent waiting out its whole window with nothing on screen. Sending a
+ *  composer message instead of using the card therefore has to resolve it
+ *  through the answer endpoint, which is why the send path needs the id rather
+ *  than just "a card was pending".
+ *
+ *  Returns null while the card holds an ANSWER IN PROGRESS — a typed custom
+ *  answer or a pending option selection — because resolving it unmounts the card
+ *  and that work lives only in the component. The same invariant the stateless
+ *  path keeps (dropStaleStatelessQuestion), for the same reason: a send must not
+ *  silently destroy something the user is part-way through. The agent then stays
+ *  blocked, but the card is still on screen with the draft intact, so the user
+ *  keeps both affordances for releasing it. A card the user never touched has no
+ *  draft and is resolved normally. */
+export const capturePendingAskId = (
+  map: ChatState['pendingQuestions'] | undefined,
+  slot: string | null | undefined,
+): string | null => {
+  const c = pendingQuestionFor(map, slot)
+  if (c?.draftActive) return null
+  return c?.ask_id ?? null
+}
+
+/** Whether a send's acceptance should resolve the blocking card captured at its
+ *  entry. Shared by the two send sites so the rule cannot drift between them.
+ *
+ *  `queued` counts, which is the difference from the stateless card's rule and
+ *  the whole point of this helper: a queued message cannot pop until the turn
+ *  ends, and the turn cannot end while the agent is blocked on the card, so
+ *  deferring to queue_pop would hold the two against each other for the entire
+ *  ask window. A rejected send resolves nothing — the card is the user's only
+ *  way to answer, and the session never moved on. */
+export const shouldResolveAskOnSend = (
+  accepted: { ok?: boolean; queued?: boolean } | null | undefined,
+  askAtSend: string | null,
+): boolean => !!askAtSend && !!(accepted?.ok || accepted?.queued)
+
 /** One queued-message entry as normalized by `fetchSlotDetail` from the backend
  *  slot-detail `queue` field. */
 type SlotQueueItem = { content: string; queueId: string; ts: string }
@@ -767,12 +809,36 @@ function applyNonActiveFrame(
     }
     // Reconcile the optimistic user bubble (appendSlotMessage) rather than
     // pushing a 2nd identical one when the server echoes the user frame — same
-    // pattern as sseSideResult. Kills the during-turn duplicate user message.
-    const lastUser = msgs[msgs.length - 1]
-    if (lastUser?.role === 'user' && lastUser.content === content) {
-      if (ts) lastUser.ts = ts
-      if (meta) lastUser.meta = { ...(lastUser.meta || {}), ...meta }
-      return
+    // pattern as sseSideResult / steer reconcile. The bubble is NOT necessarily
+    // the last message: the agent can start streaming (thinking/tool/assistant
+    // frames) before the server echoes the user frame, so a tail-only check
+    // misses the bubble and the echo is pushed as a duplicate — or worse, the
+    // original bubble never receives its `mid`, making it un-pinnable (#2845).
+    // PRIMARY: sendId correlation. FALLBACK: tail content match for paths
+    // that don't generate a sendId (split-pane, queued promotions).
+    const echoSendId = meta?.sendId as string | undefined
+    if (echoSendId && meta?.mid) {
+      const reconcileFloor = Math.max(0, msgs.length - 50)
+      for (let i = msgs.length - 1; i >= reconcileFloor; i--) {
+        const m = msgs[i]
+        if (m.role !== 'user') continue
+        if (m.meta?.steer) break
+        if (m.meta?.sendId === echoSendId) {
+          if (ts) m.ts = ts
+          m.meta = { ...(m.meta || {}), ...meta }
+          delete (m.meta as Record<string, unknown>).optimistic
+          return
+        }
+        break
+      }
+    } else if (meta?.mid) {
+      // Fallback: tail content match (pre-existing behavior).
+      const last = msgs[msgs.length - 1]
+      if (last?.role === 'user' && last.content === content && !last.meta?.mid) {
+        if (ts) last.ts = ts
+        if (meta) last.meta = { ...(last.meta || {}), ...meta }
+        return
+      }
     }
   }
   msgs.push(ensureMsgId({ role, content, cls: cls || '', ts, meta: effectiveMeta, kind }))
@@ -1130,14 +1196,28 @@ export const deleteSlot = createAsyncThunk(
     // backend that emits a distinct `slot.surface` keeps "switch to a peer
     // session" pinned to the same nav destination.
     const deletedSurface = deletedSlot ? slotSurfaceKey(deletedSlot) : ''
-    // Navigate before removeSlotOptimistic to prevent useEffect race
+    // Navigate before removeSlotOptimistic to prevent a useEffect race: the
+    // active slot must already name a surviving peer by the time this slot
+    // leaves the list.
+    //
+    // What that ordering constrains is the STATE transitions, not the I/O.
+    // `switchSlot.pending` assigns `activeSlot` synchronously as it is
+    // dispatched, so the invariant above holds from that call — not from the
+    // moment its history fetch resolves. That fetch is unbounded (the peer's
+    // whole transcript, megabytes on a long session), so it is carried as a
+    // promise rather than awaited here: blocking on it would hold the dismissed
+    // tab on screen for the length of an unrelated conversation's load, which
+    // reads as a dead close control. The peer paints from the `slotMessages`
+    // cache when it has one, or from `slotLoading` behind the already-removed
+    // tab when it does not.
+    let navigation: Promise<unknown> | undefined
     if (root.chat.activeSlot === key) {
       const sameSurface = new Set(root.dashboard.slots.filter(s => slotSurfaceKey(s) === deletedSurface).map(s => s.key))
       const prev = root.chat.slotHistory.filter(k => k !== key && sameSurface.has(k)).pop()
         || root.dashboard.slots.filter(s => s.key !== key && sameSurface.has(s.key)).map(s => s.key)[0]
       dispatch({ type: 'chat/setActiveSlot', payload: null })
       if (prev) {
-        await dispatch(switchSlot(prev)).unwrap().catch(() => dispatch({ type: 'chat/clearSlotState' }))
+        navigation = dispatch(switchSlot(prev)).unwrap().catch(() => dispatch({ type: 'chat/clearSlotState' }))
       } else {
         dispatch({ type: 'chat/clearSlotState' })
       }
@@ -1149,6 +1229,15 @@ export const deleteSlot = createAsyncThunk(
     } catch {
       dispatch(fetchSlots())
       throw new Error('save failed')
+    } finally {
+      // Settle the peer navigation before this thunk reports back, on the
+      // failure path too. Callers that await it treat resolution as "the
+      // dismissal is done" and then read the store (an app agent tearing its
+      // session down, the create-first-then-delete mode switch), so resolving
+      // mid-fetch would hand them a half-loaded peer. Rejection is already
+      // absorbed by the `.catch` above, so this cannot throw and cannot mask
+      // the error being propagated.
+      await navigation
     }
     return key
   },
@@ -1712,6 +1801,13 @@ const chatSlice = createSlice({
       // and the card must survive a failed send. The send path dispatches
       // retireStatelessQuestion after the server confirms delivery.
       if (m.role === 'user' && m.meta?.steer) finalizeTrailingStreaming(state.messages)
+      // Non-steer user bubbles carry a `sendId` in meta (set by ChatPage at
+      // send time) that serves as both the optimistic marker and the correlation
+      // ID for reconciliation. The `optimistic` flag is kept as a simple boolean
+      // so the reconcile scan knows this bubble is pending confirmation (#2845).
+      if (m.role === 'user' && !m.meta?.steer && m.meta?.sendId) {
+        m.meta = { ...(m.meta || {}), optimistic: true }
+      }
       state.messages.push(ensureMsgId(m))
     },
     /** Optimistically append a message to a specific slot's store — global
@@ -1778,6 +1874,11 @@ const chatSlice = createSlice({
       // appendMessage (active-slot) path.
       if (message.role === 'user' && message.meta?.steer && message.meta?.optimistic) {
         finalizeTrailingStreaming(msgs)
+      }
+      // Mark non-steer user bubbles as optimistic so the sseChatMessage
+      // reconcile can distinguish them from channel-replayed messages (#2845).
+      if (message.role === 'user' && !message.meta?.steer && message.meta?.sendId) {
+        message.meta = { ...(message.meta || {}), optimistic: true }
       }
       msgs.push(ensureMsgId(message))
     },
@@ -2763,6 +2864,53 @@ const chatSlice = createSlice({
               if (m.meta) m.meta.resolved = 'rejected'
               else m.meta = { resolved: 'rejected' }
             }
+          }
+        }
+        // Reconcile the optimistic user bubble rather than pushing a duplicate
+        // when the server echoes the user frame. The bubble is NOT necessarily
+        // the last message: the agent can start streaming (thinking/tool/
+        // assistant frames) before the server echoes the user frame, so a
+        // tail-only check misses the bubble and the echo is pushed as a
+        // duplicate — or worse, the original bubble never receives its `mid`,
+        // making it un-pinnable (#2845).
+        //
+        // PRIMARY: match by `sendId` — a client-generated correlation ID
+        // stamped at send time into both the optimistic bubble and the POST
+        // body. The server preserves meta fields, so the echo carries the same
+        // sendId plus the server-minted `mid`. This is a cryptographic-strength
+        // identity match — distinct messages with identical text but different
+        // sendIds are never conflated.
+        //
+        // FALLBACK: for code paths that create optimistic bubbles without a
+        // sendId (split-pane sends, queued message promotions), fall back to
+        // the pre-existing tail-check: if the last user message matches
+        // content and has no mid yet, reconcile it. This preserves the
+        // original behavior for those paths.
+        const echoSendId = meta?.sendId as string | undefined
+        if (echoSendId && meta?.mid) {
+          const reconcileFloor = Math.max(0, state.messages.length - 50)
+          for (let i = state.messages.length - 1; i >= reconcileFloor; i--) {
+            const m = state.messages[i]
+            if (m.role !== 'user') continue
+            if (m.meta?.steer) break
+            if (m.meta?.sendId === echoSendId) {
+              if (ts) m.ts = ts
+              m.meta = { ...(m.meta || {}), ...meta }
+              delete (m.meta as Record<string, unknown>).optimistic
+              return
+            }
+            break
+          }
+        } else if (meta?.mid) {
+          // Fallback: no sendId on the echo — use tail content match (the
+          // pre-existing reconcile that worked when the echo arrived before
+          // any streaming). Only checks the LAST message (not a backward scan)
+          // to limit false-match risk to the original code's window.
+          const last = state.messages[state.messages.length - 1]
+          if (last?.role === 'user' && last.content === content && !last.meta?.mid) {
+            if (ts) last.ts = ts
+            if (meta) last.meta = { ...(last.meta || {}), ...meta }
+            return
           }
         }
       }

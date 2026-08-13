@@ -46,13 +46,14 @@ function themeConsentSha(colorTheme?: string): string | null {
   return stored
 }
 
-export type McpPoolableServer = {
+export type McpManagedServer = {
   name: string
-  poolable: boolean        // effective: stdio AND not denylisted AND (in_allowlist OR entry_poolable)
-  in_allowlist: boolean    // present in config mcp_gateway.poolable_servers
-  entry_poolable: boolean  // some agent entry sets poolable:true (third-party escape hatch)
+  stub: boolean            // effective: can_stub AND in_allowlist
+  can_stub: boolean       // stdio AND not denylisted — a property of the server, not a choice
+  in_allowlist: boolean    // present in config mcp_gateway.stub_servers
+  entry_poolable: boolean  // some agent entry sets poolable:true — RETIRED, informational only
   agents: string[]         // agent configs that declare this server
-  transport: string        // "stdio" (poolable-eligible) or "http"
+  transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
   denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
 }
 
@@ -1065,6 +1066,54 @@ export interface KiroPrerequisiteStatus {
   agent_spec_repair_error: string
 }
 
+export interface KiroBonusCreditGrantPayload {
+  name: string
+  used: number
+  total: number
+  days_left?: number
+}
+
+export interface KiroUsagePayload {
+  available?: boolean
+  credits_used?: number
+  credits_covered?: number
+  credits_overage?: number
+  credits_plan?: number
+  resets?: string
+  plan?: string
+  cost_usd?: number
+  overage_rate?: number | string
+  bonus_credits?: KiroBonusCreditGrantPayload[]
+  stale?: boolean
+  account?: string
+  email?: string
+  account_type?: string
+  start_url?: string
+}
+
+export interface KiroBonusCreditGrant {
+  name: string
+  used: number
+  total: number
+  daysLeft?: number
+}
+
+export interface KiroCreditUsage {
+  used: number
+  limit: number
+  overage: number
+  resets?: string
+  plan?: string
+  costUsd?: number
+  overageRate?: number
+  bonusCredits: KiroBonusCreditGrant[]
+  stale: boolean
+  account?: string
+  email?: string
+  accountType?: string
+  startUrl?: string
+}
+
 export interface AgentImportCategory {
   id: string
   label: string
@@ -1449,12 +1498,9 @@ export const api = {
       rss_mb: number; runtimes: number; host_mb: number | null
       host_pct: number | null; rss_is_upper_bound: boolean
     }
-    unattributed: {
-      procs: number; rss_mb: number | null; oldest_uptime_s: number | null
-    } | null
     history: { t: number; mb: number }[]
   }>,
-  sessionsUsage: () => fetch('/api/sessions/usage').then(j),
+  sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   // Agents
@@ -1611,6 +1657,7 @@ export const api = {
   skillPendingDetail: (slug: string) => fetch('/api/skills/-/pending/' + encodeURIComponent(slug)).then(j),
   approvePendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/approve', {}).then(j),
   dismissPendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/dismiss', {}).then(j),
+  dismissAllPendingSkills: (slugs: string[]) => post('/api/skills/-/pending/-/dismiss-all', { slugs }).then(j),
   pinSkill: (name: string, pinned: boolean) => post('/api/skills/-/pin', { name, pinned }).then(j),
   /** Opt a skill in/out of full-body injection when its triggers match.
    *  `inject: false` reduces the skill to a one-line pointer on a match. */
@@ -1663,15 +1710,14 @@ export const api = {
   mcpOAuthRelay: (server: string, redirectUrl: string) =>
     post('/api/mcp/oauth/relay', { server, redirect_url: redirectUrl }).then(j) as Promise<{ ok: boolean }>,
   // MCP Gateway (shared pool)
-  mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; apps_enabled: boolean; running: boolean; ping_ok: boolean; supported: boolean }>,
+  mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
-  mcpGatewayAppsEnable: (enabled: boolean) => post('/api/mcp-gateway/apps-enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean }>,
   mcpGatewayMetrics: () => fetch('/api/mcp-gateway/metrics').then(j) as Promise<{ running: boolean; size?: number; max_backends?: number; backends: { server: string; agent: string; pid: number | null; sessions: number; idle_s: number; rss_kb: number }[]; warm_pool_hits?: number; warm_pool_misses?: number; warm_pool_hit_rate_pct?: number }>,
-  mcpGatewayServers: () => fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpPoolableServer[] }>,
-  mcpGatewaySetPoolable: (name: string, poolable: boolean) => post('/api/mcp-gateway/servers/poolable', { name, poolable }).then(j) as Promise<{ ok: boolean; name: string; poolable: boolean; enabled?: boolean; applied?: boolean; poolable_servers?: string[] }>,
+  mcpGatewayServers: () => fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
+  mcpGatewaySetStub: (name: string, stub: boolean) => post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
   // Batch form of the above — one config write + one pool re-apply for the whole
   // set, so "toggle all" can't land the allowlist half-flipped.
-  mcpGatewaySetPoolableMany: (names: string[], poolable: boolean) => post('/api/mcp-gateway/servers/poolable', { names, poolable }).then(j) as Promise<{ ok: boolean; names: string[]; poolable: boolean; enabled?: boolean; applied?: boolean; poolable_servers?: string[] }>,
+  mcpGatewaySetStubMany: (names: string[], stub: boolean) => post('/api/mcp-gateway/servers/stub', { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
   // Agent config
   agentConfig: () => fetch('/api/agent/config').then(j),
   saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),

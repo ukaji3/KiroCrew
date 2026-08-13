@@ -299,12 +299,15 @@ async def api_ready(request: web.Request) -> web.Response:
 
 #: Accepted shape for ``dashboard.language`` — a conservative BCP-47 subset
 #: (``en``, ``zh-CN``, ``pt-BR``, ``zh-Hans-CN``). Deliberately validates SHAPE,
-#: not membership in the frontend's shipped-language list: keeping the set of
-#: available languages a pure frontend data change (``SUPPORTED_LANGUAGES`` +
-#: one catalog) means adding a language never needs a backend edit. An
-#: unrecognised-but-well-formed tag is safe because the SPA's
-#: ``resolveLanguage()`` falls back to browser detection for any code it has no
-#: catalog for.
+#: not membership in the frontend's shipped-language list: ``""`` and
+#: not-yet-shipped tags must stay writable (the SPA's ``resolveLanguage()``
+#: falls back to detection for any code it has no catalog for, so a persisted
+#: non-catalog value degrades gracefully client-side). Membership IS enforced,
+#: but at the point of use: ``context.ui_language_tag`` gates the agent-steer
+#: read path on ``_UI_LANGUAGE_CATALOGS`` so a non-catalog tag is never claimed
+#: to the model as the UI language (#1130). A new backend consumer of
+#: ``dashboard.language`` must route through that resolver rather than reading
+#: the raw field.
 _LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
 
 
@@ -492,6 +495,7 @@ _STT_LANGUAGE_CODES: tuple[str, ...] = (
     "it-IT",
     "pt-BR",
     "ja-JP",
+    "ko-KR",
     "zh-CN",
 )
 
@@ -881,9 +885,7 @@ def _build_stt_install_script(provider: str = "whisper") -> str:
     """
     prelude = _stt_install_path_prelude()
     if provider == "mlx":
-        return (
-            prelude
-            + r"""
+        return prelude + r"""
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
 
 if ! command -v brew >/dev/null 2>&1; then
@@ -904,10 +906,7 @@ pipx install --force mlx-whisper 2>&1 || { echo "ERROR: pipx install mlx-whisper
 
 echo "Done. mlx_whisper=$(command -v mlx_whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
-        )
-    return (
-        prelude
-        + r"""
+    return prelude + r"""
 # Pick up ffmpeg from ~/ffmpeg if installed there
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
 
@@ -976,7 +975,6 @@ echo "Installing openai-whisper..."
 
 echo "Done. whisper=$(command -v whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
-    )
 
 
 async def api_stt_transcribe(request: web.Request) -> web.Response:
@@ -1293,8 +1291,7 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         # A startup-read key that was merely re-sent with its existing value did
         # not change the enforced cap, so it must not raise the hint.
         restart_required = any(
-            key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key)
-            for key in applied
+            key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key) for key in applied
         )
         return web.json_response({"ok": True, "restart_required": restart_required})
 
@@ -1584,8 +1581,7 @@ def _tailnet_governance_pinned_off() -> bool:
 
 async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     """PATCH /api/config/kirocrew — update a single config field."""
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
-    from kiro_crew.config.loader import config_path  # noqa: F811
+    from kiro_crew.config.loader import ConfigReadError, config_path, update_config_locked
 
     caller = request.get("user")
     if not caller:
@@ -1746,37 +1742,37 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 403,
             )
 
-    # Read, update, write
+    # Read, update, write — serialized across processes via update_config_locked.
     cfg_path = config_path()
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_config_lock():
+        parts = path_key.split(".")
+
+        def _mutate_config_patch(data: dict) -> dict | None:
+            """Apply a single dotted-key assignment to the raw config dict."""
+            # Walk (creating) intermediate objects, then set the leaf. Handles
+            # arbitrary depth uniformly — 1-level ("auto_update"), 2-level
+            # ("agent.model"), and 3-level ("agent.role_models.background") —
+            # instead of special-cases that would clobber a whole section for a
+            # 3-level key.
+            section = data
+            for part in parts[:-1]:
+                nxt = section.setdefault(part, {})
+                if not isinstance(nxt, dict):
+                    raise ValueError(f"config section '{part}' is not an object")
+                section = nxt
+            section[parts[-1]] = value
+            return data
+
         try:
-            data = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-        except Exception:
+            await asyncio.to_thread(update_config_locked, cfg_path, mutate=_mutate_config_patch)
+        except ConfigReadError:
             _log_sel("error", f"{path_key}=read_failed")
             return web.json_response({"error": "failed to read config file"}, status=500)
-
-        parts = path_key.split(".")
-        # Walk (creating) intermediate objects, then set the leaf. Handles
-        # arbitrary depth uniformly — 1-level ("auto_update"), 2-level
-        # ("agent.model"), and 3-level ("agent.role_models.background") — instead
-        # of the previous special-cases that would clobber a whole section for a
-        # 3-level key.
-        section = data
-        for part in parts[:-1]:
-            nxt = section.setdefault(part, {})
-            if not isinstance(nxt, dict):
-                _log_sel("error", f"{path_key}=section_not_dict")
-                return web.json_response(
-                    {"error": f"config section '{part}' is not an object"}, status=500
-                )
-            section = nxt
-        section[parts[-1]] = value
-
-        try:
-            cfg_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_json_write(cfg_path, data)
+        except ValueError as exc:
+            _log_sel("error", f"{path_key}=section_not_dict")
+            return web.json_response({"error": str(exc)}, status=500)
         except OSError:
             _log_sel("error", f"{path_key}=write_failed")
             return web.json_response({"error": "failed to write config file"}, status=500)

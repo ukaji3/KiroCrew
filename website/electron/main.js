@@ -30,6 +30,14 @@ const { stopGatewayGracefully: _stopGatewayGracefully, forceStopPort, classifyPo
 const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("./gateway-wait");
 const { describeSandboxProfileNeed } = require("./sandbox-profile");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
+const {
+  DEFAULT_GLOBAL_HOTKEY,
+  createSummonHandler,
+  bindGlobalHotkey,
+  unregisterGlobalHotkey,
+  currentGlobalHotkey,
+  setGlobalHotkeyLogger,
+} = require("./global-hotkey");
 const { createLivenessMonitor } = require("./gateway-liveness");
 const { chooseRecoveryStrategy, waitForServiceRebind, waitForProcessExit } = require("./gateway-recovery");
 const { capturePySpyDump } = require("./pyspy-dump");
@@ -80,6 +88,8 @@ const {
 
 const { migrateRemoteHostConfig, getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 
+const { isLocalGatewayEnabled, setLocalGatewayEnabled, classifyStartFailure } = require("./local-gateway");
+
 const store = new Store({
   defaults: {
     remoteHost: "",                        // LEGACY — migrated to remoteHosts
@@ -87,11 +97,22 @@ const store = new Store({
     remoteHosts: {},                       // { [port]: { host, binPath, remotePort?, remotePath? } }
     sshTimeoutMs: 20000,
     windowState: null,                     // persisted main-window geometry (see window-state.js)
+    globalHotkey: null,                    // system-wide summon accelerator: null = platform default, "" = disabled, string = custom (see global-hotkey.js)
     lastNudgedVersion: "",                 // last update version announced via native notification (nudge once per version)
     themeAccent: "",                       // user's resolved theme accent hex; injected into the boot splash
     updateChannel: "",                     // "" = follow build stamp; "insider"|"stable" = user opt-in (Settings > About)
+    runLocalGateway: true,                 // false = act as a pure client; never start a gateway on this machine
   },
 });
+
+// Read ONCE at launch, because the setting takes effect on the next launch.
+// startGateway() is also the recovery path for a gateway that died mid-session,
+// so re-reading the store there would let a flip made minutes ago refuse to
+// replace a gateway this session is still using — stranding the user with no
+// backend and no way back short of a relaunch. The error dialog's
+// "turn it on and retry" action is the one thing that may change this, since
+// that IS the user asking for a gateway right now.
+let runLocalGateway = isLocalGatewayEnabled(store);
 
 // The PRE-SPAWN read home (see home-dir.js for the full contract): whichever
 // directory's config.json governs this launch under the backend's migration
@@ -610,6 +631,25 @@ function startGateway() {
   glog(`launch: port=${PORT} home=${KIROCREW_HOME} packaged=${app.isPackaged} resourcesPath=${process.resourcesPath || "(none)"} log=${gatewayLogPath()}`);
   sendStatus("Checking if gateway is running…");
   return new Promise((resolve) => {
+    // Both branches below funnel through here, so the client-only choice cannot
+    // be honoured on one path and ignored on the other. A takeover reaches it
+    // too: quitting the other channel's app frees the port on this machine, and
+    // that is not a request to run a gateway here.
+    //
+    // With nothing to spawn there is no exit code and no log to wait for, so the
+    // reason is reported as a fail-fast failure rather than left to time out.
+    // The error dialog's Retry re-enters this function, which is what makes
+    // "bring the connection up, then retry" work without a relaunch.
+    const spawnUnlessClientOnly = () => {
+      if (runLocalGateway) {
+        spawnGateway(resolve);
+        return;
+      }
+      glog(`no gateway on :${PORT} and local gateway is off — not starting one`);
+      sendStatus("No gateway is answering…");
+      gatewayStartFailure = { disabled: true, port: PORT };
+      resolve(false);
+    };
     checkBackend()
       .then(async () => {
         // A gateway is already listening on this port. Same-family, dev, and
@@ -623,10 +663,10 @@ function startGateway() {
           resolve(false);
           return;
         }
-        spawnGateway(resolve);
+        spawnUnlessClientOnly();
       })
       .catch(() => {
-        spawnGateway(resolve);
+        spawnUnlessClientOnly();
       });
   });
 }
@@ -1360,6 +1400,15 @@ function setupWindowContents(win, backendUrl) {
     fetchFn: (url, init) => fetch(url, init),
     getGatewayUrl: () => win._mcBackendUrl,
     getSecret: () => readInternalSecret(),
+    // The idle host-presence heartbeat must fire ONLY when the gateway is truly
+    // on this machine. A loopback URL is necessary but NOT sufficient: a REMOTE
+    // gateway reached over a tunnel also presents as localhost, so additionally
+    // require that no remote host is configured for THIS window's port (each
+    // window has its own `port` from its backendUrl; the module-global PORT is
+    // only the primary window's, so a secondary remote window would otherwise
+    // read the wrong config and leak the local secret over its tunnel).
+    isGatewayLocal: () =>
+      isLoopbackUrl(win._mcBackendUrl) && !getRemoteHostConfig(store, port)?.host,
     // Panels that exist PLUS sessions that may host one on demand. Reporting a
     // key is what registers it with the gateway's command bus, so a declared-but-
     // unmounted session must appear here or its first navigate can never arrive.
@@ -1703,8 +1752,32 @@ function createTray() {
   const nightly = identityFamily(app.getVersion()) === "nightly";
   const iconFile = nightly && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
     ? "icon-nightly.png" : "icon.png";
-  const iconPath = path.join(__dirname, iconFile);
-  const icon = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+  let icon;
+  const templatePath = path.join(__dirname, "trayTemplate.png");
+  if (IS_MAC && fs.existsSync(templatePath)) {
+    // macOS menu-bar icons are template images: a monochrome (black +
+    // alpha) glyph the system recolors for light/dark/tinted menu bars.
+    // Passing the full-colour icon here renders it as-is, which clashes
+    // with neighbouring status items and loses contrast on tinted bars.
+    // The asset ships at 18px with an @2x retina variant that
+    // createFromPath picks up via the DPI-suffix convention, so no
+    // resize. setTemplateImage is explicit even though the *Template
+    // filename convention already implies it. The stable and nightly
+    // glyphs share one silhouette (the channels differ only in field
+    // colour), so a single template asset serves both; channel identity
+    // stays on the Dock icon and app.name.
+    icon = nativeImage.createFromPath(templatePath);
+    icon.setTemplateImage(true);
+  } else {
+    // Other platforms render tray icons literally, so keep the
+    // channel-aware full-colour icon (nightly identity stays visible).
+    // Reaching here on macOS means the template asset did not ship;
+    // the menu bar silently regresses to the colour icon, so leave a
+    // signal for whoever debugs the packaging.
+    if (IS_MAC) console.warn("tray: trayTemplate.png missing, falling back to colour icon");
+    icon = nativeImage.createFromPath(path.join(__dirname, iconFile))
+      .resize({ width: 18, height: 18 });
+  }
   tray = new Tray(icon);
   tray.setToolTip(app.name);
   // Each connection opens as its own window on every platform (native window
@@ -1861,7 +1934,7 @@ function fadeLoadingScreen(wc, timeoutMs = 8000) {
  * @returns {Promise<'retry'|'force-retry'|'reveal'|'quit'>}
  */
 function showGatewayErrorDialog(parentWin, opts) {
-  const { title, message, logTail, logPath, portConflict, noRetry = false } = opts;
+  const { title, message, logTail, logPath, portConflict, noRetry = false, localGatewayOff = false } = opts;
   return new Promise((resolve) => {
     const dark = nativeTheme.shouldUseDarkColors;
     const hasParent = parentWin && !parentWin.isDestroyed();
@@ -1883,6 +1956,13 @@ function showGatewayErrorDialog(parentWin, opts) {
     // "Retry" button it would ignore contradicts the dialog's own message.
     const primaryAction = noRetry ? "quit" : (portConflict ? "force-retry" : "retry");
     const primaryLabel = noRetry ? "Quit" : (portConflict ? "Force-stop &amp; Retry" : "Retry");
+    // A client-only install whose remote is unreachable needs an in-app way to
+    // change its mind: Settings lives inside the dashboard, which a gateway has
+    // to serve, so the page holding the switch is exactly what it cannot reach.
+    // Retry stays primary because restoring the remote is the likelier fix.
+    const enableButton = (localGatewayOff && !noRetry)
+      ? `<button class="cancel" onclick="act('enable-retry')">Start Local Gateway</button>`
+      : "";
     const fg = dark ? "#e2e8f0" : "#1e293b";
     const muted = dark ? "#94a3b8" : "#64748b";
     const html = `<!DOCTYPE html><html><head><style>
@@ -1909,6 +1989,7 @@ function showGatewayErrorDialog(parentWin, opts) {
       <pre class="log">${esc(logTail || "(launch log is empty)")}</pre>
       <div class="row">
         <button class="ok" onclick="act('${primaryAction}')">${primaryLabel}</button>
+        ${enableButton}
         <button class="cancel" onclick="act('reveal')">Reveal Log</button>
         ${noRetry ? "" : `<button class="cancel" onclick="act('quit')">Quit</button>`}
       </div>
@@ -2371,10 +2452,25 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     // recoverable case: the spawn dies with "address already in use" and a plain
     // retry can't help (the holder is still there). Detect it and offer to
     // force-stop the stuck KiroCrew process. Only meaningful for OUR own port.
-    const portConflict = failedToStart && backendUrl === BACKEND_URL && isPortInUse(logTail);
+    // Nothing was spawned in the client-only case, so it is classified before
+    // the port-conflict probe — see classifyStartFailure for why the log tail
+    // cannot be trusted to mean "a holder exists right now".
+    const failureKind = classifyStartFailure({
+      failedToStart,
+      failure: err.failure,
+      isOwnPort: backendUrl === BACKEND_URL,
+      portInUseInLog: isPortInUse(logTail),
+    });
+    const localGatewayOff = failureKind === "client-only";
+    const portConflict = failureKind === "port-conflict";
 
     let title, message;
-    if (portConflict) {
+    if (localGatewayOff) {
+      // Nothing failed here — the app was told not to start a gateway and the
+      // port is silent. "Failed to start" would send the user hunting a crash.
+      title = `Kiro Crew — no gateway on port ${PORT}`;
+      message = err.message;
+    } else if (portConflict) {
       title = `Kiro Crew — port ${PORT} already in use`;
       message = `Another Kiro Crew gateway is already using port ${PORT} (it may be wedged). `
         + `Force-stop it and retry, or quit. From a terminal you can also run: `
@@ -2391,12 +2487,20 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     // Loop so "Reveal Log" can re-show the dialog after opening Finder.
     for (;;) {
       const action = await showGatewayErrorDialog(win, {
-        title, message, logTail, logPath, portConflict, port: PORT,
+        title, message, logTail, logPath, portConflict, port: PORT, localGatewayOff,
       });
       if (win.isDestroyed()) return;
       if (action === "reveal") {
         try { shell.showItemInFolder(logPath); } catch { /* best effort */ }
         continue; // re-show the dialog
+      }
+      if (action === "enable-retry") {
+        // The user is asking for a gateway now, from the one surface they can
+        // still reach. Persist it so the next launch agrees, and lift this
+        // session's snapshot so the retry below actually spawns.
+        setLocalGatewayEnabled(store, true);
+        runLocalGateway = true;
+        glog("local gateway turned back on from the error dialog");
       }
       if (action === "force-retry") {
         let freed = true;
@@ -2410,7 +2514,7 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
           return showUnrecoverableGatewayError(win, PORT);
         }
       }
-      if (action === "retry" || action === "force-retry") {
+      if (action === "retry" || action === "force-retry" || action === "enable-retry") {
         gatewayStartFailure = null; // let the retry genuinely re-probe
         // If our own spawned gateway is confirmed gone (or we just force-stopped
         // the port holder), respawn before re-waiting. For a timeout (child may
@@ -2778,6 +2882,39 @@ app.whenReady().then(async () => {
     if (item) item.visible = !!enabled;
   });
 
+  // System-wide summon hotkey: shows + focuses the dashboard from anywhere,
+  // launching a window when none exists. The handler and IPC surface are set
+  // up here; the actual registration happens after the boot path's
+  // createWindow() below, so a keypress cannot race window creation and
+  // produce two windows. Torn down on will-quit; the binding persists in the
+  // store (`globalHotkey`) so the user can rebind or disable it via the
+  // config file (Connection > Open Config File). A stored value that cannot be
+  // bound falls back to the default; a default that another app already owns
+  // degrades to no hotkey — logged, never fatal (see global-hotkey.js).
+  setGlobalHotkeyLogger(glog);
+  const summonDashboard = createSummonHandler({
+    // The focused dashboard window when there is one, else the main window,
+    // else ANY surviving dashboard window (`_mcView` marks the windows that
+    // host a dashboard — see focusedDashboardWindow above). The main window is
+    // hidden, not destroyed, on close, so createWindow() is a last resort.
+    getWindow: () =>
+      [BaseWindow.getFocusedWindow(), mainWindow, ...BaseWindow.getAllWindows()].find(
+        (w) => w && !w.isDestroyed() && w._mcView
+      ) || null,
+    createWindow: () => createWindow(),
+    // A global shortcut fires while ANOTHER app is frontmost; on macOS the
+    // window rises without keyboard focus unless the app steals activation.
+    focusApp: () => {
+      if (IS_MAC) app.focus({ steal: true });
+    },
+  });
+  // The shortcuts UI reads what is ACTUALLY bound (registration can degrade
+  // to the default or to nothing), so it never advertises a dead chord.
+  ipcMain.handle("global-hotkey:get", () => ({
+    accelerator: currentGlobalHotkey(),
+    default: DEFAULT_GLOBAL_HOTKEY,
+  }));
+
   // The renderer reports the user's resolved theme accent whenever it changes
   // (see useTheme.tsx). Persist a validated hex so the NEXT launch's boot splash
   // can paint in the user's colour. Anything not a plain hex is ignored.
@@ -2822,6 +2959,15 @@ app.whenReady().then(async () => {
   ipcMain.on("badge:set", (_event, count) => {
     app.setBadgeCount(clampBadgeCount(count));
   });
+
+  // Local-gateway switch for Settings > Developer. The choice lives in the
+  // app's own electron-store config, which page JS cannot reach, so the
+  // renderer round-trips through these handlers. Both resolve with the stored
+  // value so the toggle renders what was actually written. Reading it at launch
+  // (startGateway) rather than here is what gives the setting its next-launch
+  // semantics: flipping it never touches the gateway currently running.
+  ipcMain.handle("local-gateway:get", () => isLocalGatewayEnabled(store));
+  ipcMain.handle("local-gateway:set", (_event, enabled) => setLocalGatewayEnabled(store, enabled));
 
   // Native zoom bridge for the Settings > Display "Zoom Level" stepper.
   // A renderer cannot touch Chromium's per-origin zoom itself, so it
@@ -2914,6 +3060,12 @@ app.whenReady().then(async () => {
     if (!set || !id) return { ok: false };
     if (tracked) set.add(id);
     else set.delete(id);
+    // The tracked-slot set just changed. Nudge the agent command channel to
+    // re-read it NOW so a freshly declared key is polled (and thus registered on
+    // the gateway bus) within submit's brief wait window, instead of only after
+    // the current long-poll ends (up to ~25s) -- the cold-start race that
+    // dropped a fresh session's first navigate to the Playwright mirror.
+    if (owner._mcAgentChannel) owner._mcAgentChannel.poke();
     return { ok: true };
   });
   ipcMain.handle("browser:set-agent-act", async (event, panelId, enabled) => {
@@ -3035,6 +3187,11 @@ app.whenReady().then(async () => {
 
   createTray();
   const win = createWindow();
+  // Bind the summon hotkey only now that the main window exists: registering
+  // earlier would let a keypress during boot race createWindow() and open a
+  // second window. Still within app ready — the OS-level chord works from the
+  // first frame the user can see.
+  bindGlobalHotkey(store.get("globalHotkey"), summonDashboard);
 
   // Wired BEFORE the awaited gateway boot ON PURPOSE. preload.js exposes
   // window.updateAPI unconditionally, so Settings > About renders a live Check
@@ -3170,7 +3327,7 @@ app.whenReady().then(async () => {
   // be answering before we ask it whether Mochi is on, and the pet page is
   // loaded from the gateway origin. Best-effort -- a failure here must never
   // block the dashboard, so everything is inside a catch that only logs.
-  initMochi({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+  initMochi({ backendUrl: BACKEND_URL, fetchLocalToken, glog, getMainWindow: () => mainWindow });
   // Same shape and the same best-effort contract: the companion's windows follow
   // the app's enabled state, and a failure here must never block the dashboard.
   try {
@@ -3191,6 +3348,12 @@ app.on("before-quit", () => {
   shutdownMochi();
   try { shutdownCrewCompanion(); } catch { /* best effort */ }
   stopGateway();
+});
+
+// Release ONLY our own summon accelerator (never unregisterAll — Mochi's
+// shortcuts are torn down by its own quit path above).
+app.on("will-quit", () => {
+  unregisterGlobalHotkey();
 });
 
 app.on("window-all-closed", () => {

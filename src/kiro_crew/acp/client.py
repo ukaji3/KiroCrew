@@ -31,7 +31,7 @@ import time
 from collections import deque
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Sequence
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Sequence, TypeVar
 
 from kiro_crew import model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
@@ -130,6 +130,7 @@ logger = logging.getLogger(__name__)
 
 CLIENT_NAME = "kirocrew"
 CLIENT_VERSION = "0.1.2"
+_T = TypeVar("_T")
 # kiro-cli uses a date-stamped protocol; claude-agent-acp follows the
 # upstream ACP SDK (numeric integer, currently 1).  See acp.types.
 PROTOCOL_VERSION = "2025-08-22"
@@ -545,6 +546,22 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
             return
 
 
+def _resolve_spawn_env(env: dict[str, str]) -> dict[str, str]:
+    """Repair stale credential pointers in *env* before an agent spawn.
+
+    Bundles :func:`_resolve_ssh_auth_sock` (glob + stat over ``/tmp``) and
+    :func:`resolve_krb5_ccname` (lstat/stat of ``/tmp/krb5cc_<uid>``) so the
+    spawn path pays ONE thread hop for both. Both resolvers issue synchronous
+    filesystem syscalls whose latency scales with the ``/tmp`` entry count, so
+    they must never run on the event loop — call this via
+    ``asyncio.to_thread``. Mutates *env* in place and returns it for
+    convenience.
+    """
+    _resolve_ssh_auth_sock(env)
+    resolve_krb5_ccname(env)
+    return env
+
+
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
 # Ceiling on the bytes discarded while draining ONE oversize line. Per drain call
@@ -871,6 +888,17 @@ _NOT_LOGGED_IN_MESSAGE = (
 # string); throttle, auth, and the 5xx family match the combined
 # `data + message` haystack so a 5xx token in either field is caught.
 _RE_MODEL_UNAVAILABLE = re.compile(r"[Tt]he model '([^']+)' is not available")
+# kiro-cli >= 2.16 rewording of the same capacity/rollout rejection, which
+# names NO model: "The model you've selected is temporarily unavailable.
+# Please use '/model' to select a different model and try again." Without its
+# own pattern this wording fell through to the unknown-shape branch and was
+# classified terminal, so unattended callers (cron, subagents, consolidation)
+# failed fast on a momentary blip their retry ladder exists to absorb — the
+# exact drift hazard the marker-coupling note above warns about. The quote
+# class covers both the straight and typographic apostrophe in "you've".
+_RE_MODEL_TEMP_UNAVAILABLE = re.compile(
+    r"[Tt]he model you['\u2019]ve selected is temporarily unavailable"
+)
 # MPS ValidationException wording for a model the partition/account does not
 # serve — distinct from the "is not available" capacity string above. Covers the
 # ``auto`` sentinel in partitions that do not serve it.
@@ -1043,6 +1071,13 @@ def _is_transient_raw_error(
         # check so limit wording that also reads as rate-limiting stays terminal.
         return False
     if _RE_MODEL_UNAVAILABLE.search(data):
+        return True
+    if _RE_MODEL_TEMP_UNAVAILABLE.search(data):
+        # Nameless capacity rejection (kiro-cli >= 2.16 wording). Matched
+        # against `data` only, like its named sibling above, so a phrase echo
+        # in the JSON-RPC `message` can't flip an otherwise-terminal error.
+        # No entitlement check is possible (the wording names no model), but
+        # the bounded retry budget caps the cost if one ever slips through.
         return True
     if _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
         return True
@@ -1225,6 +1260,21 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 f"different model in the model picker, (2) set agent.model to "
                 f"'auto' in ~/.kiro/crew/config.json, or (3) wait a minute and "
                 f"retry."
+                f"{req_id_suffix}"
+            )
+        elif _RE_MODEL_TEMP_UNAVAILABLE.search(data):
+            # Same capacity/rollout rejection as above in kiro-cli >= 2.16
+            # wording, which names no model. Rewritten for the same reasons as
+            # its named sibling: the provider's advice quotes the '/model' TUI
+            # command, which does nothing in the dashboard, Slack, or a cron —
+            # and the "is unavailable on the backend" prose keeps the
+            # _TRANSIENT_MARKERS string fallback recognising it for free.
+            formatted = (
+                "The selected model is unavailable on the backend right now "
+                "(capacity throttle or region rollout). Try: (1) pick a "
+                "different model in the model picker, (2) set agent.model to "
+                "'auto' in ~/.kiro/crew/config.json, or (3) wait a minute and "
+                "retry."
                 f"{req_id_suffix}"
             )
         elif _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
@@ -1752,6 +1802,10 @@ class AcpClient:
             from kiro_crew.config.paths import config_dir
 
             self._work_dir = config_dir() / "workspace"
+        # Once-per-instance guard for the ensure_ready work-dir check: True
+        # after the first (off-loop) mkdir, so the per-prompt warm path pays
+        # no filesystem syscall at all.
+        self._work_dir_ready = False
         self._model = model or DEFAULT_MODEL
         self._agent = agent
         self._sandbox_mode = sandbox_mode
@@ -2003,6 +2057,12 @@ class AcpClient:
         self._session_key = session_key
         self._channel_id = channel_id
         self._last_activity = time.monotonic()
+        # The prompt stats' context fields describe whatever this runtime did
+        # BEFORE the handoff — carry_over() deliberately preserves them across
+        # turn boundaries, so without this reset a recycled runtime hands its
+        # previous session's context_pct to the new chat and the first
+        # check_context_usage() compacts an empty conversation (#2932).
+        self.last_prompt_stats.reset_context_state()
         # Claim-push: tell gatewayd this runtime PID now belongs to
         # ``session_key`` so every MCP stub connection under it carries the
         # right ``_meta.caller`` immediately — event-driven replacement for
@@ -2279,6 +2339,40 @@ class AcpClient:
 
     # ── Process Management ──
 
+    def _discard_sandbox_cleanup(self) -> None:
+        """Unlink and forget the sandbox temp file allocated by ``wrap_argv``.
+
+        wrap_argv writes a launcher/profile file that the spawned child
+        consumes at exec. Once no child will exec it — the spawn failed, was
+        cancelled, or the process is being reset — it must be removed here, or
+        each attempt leaks one file into the temp dir for the gateway's
+        lifetime (nothing else references the path after ``_spawn`` reassigns
+        ``self._sandbox_cleanup``).
+        """
+        if self._sandbox_cleanup:
+            try:
+                os.remove(self._sandbox_cleanup)
+            except OSError:
+                pass
+            self._sandbox_cleanup = None
+
+    async def _to_thread_guarding_sandbox(
+        self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any
+    ) -> _T:
+        """``asyncio.to_thread`` that discards the sandbox file on failure.
+
+        After ``wrap_argv`` has allocated the sandbox temp file, every
+        suspension point before the exec is a leak window: a cancellation
+        (turn cancel, session close, shutdown) unwinds ``_spawn`` without
+        reaching ``_reset_state``, orphaning the file. Route any offload in
+        that window through here so the file is removed before re-raising.
+        """
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except BaseException:
+            self._discard_sandbox_cleanup()
+            raise
+
     async def _spawn(self) -> None:
         """Start the ACP backend subprocess with stdio pipes.
 
@@ -2288,7 +2382,9 @@ class AcpClient:
         so it is unreachable here, but an internal companion that re-registers
         a Claude backend reuses this same client over the seam.
         """
-        self._work_dir.mkdir(parents=True, exist_ok=True)
+        # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
+        # slow storage; the loop must never wait on the kernel here.
+        await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
 
         if self._is_claude:
             # Dormant seam — see method docstring. Binary resolution only; the
@@ -2351,7 +2447,11 @@ class AcpClient:
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
         # No-op + loud warning where cgroup delegation is unavailable. --scope
         # execs into the target, so self._pid below is still the real child.
-        argv = cgroup_scope_argv(argv)
+        # Off-loop: first call probes /proc + /sys and the config read touches
+        # the config dir (mkdir + file read) — blocking syscalls that must not
+        # run on the loop. Guarded: wrap_argv above allocated the sandbox temp
+        # file, so a cancellation here must not orphan it.
+        argv = await self._to_thread_guarding_sandbox(cgroup_scope_argv, argv)
 
         # Build the child environment (process-group isolation flags are set on
         # the spawn kwargs below, per-platform).
@@ -2392,13 +2492,15 @@ class AcpClient:
             env.pop("KIROCREW_CHANNEL_ID", None)
 
         # Resolve SSH_AUTH_SOCK dynamically — the gateway's env may be stale
-        # after an ssh-agent restart.
-        _resolve_ssh_auth_sock(env)
-        # Resolve KRB5CCNAME to a FILE: ccache — the kernel keyring (the default
-        # on some Linux distros) is invisible to this child, so Kerberos-gated MCP
-        # servers fail without it. Covers the session agent and
-        # all ACP-provider subagents, which spawn through this same path.
-        resolve_krb5_ccname(env)
+        # after an ssh-agent restart — and KRB5CCNAME to a FILE: ccache (the
+        # kernel keyring, the default on some Linux distros, is invisible to
+        # this child, so Kerberos-gated MCP servers fail without it). Covers
+        # the session agent and all ACP-provider subagents, which spawn through
+        # this same path. Both resolvers glob/stat under /tmp, whose entry
+        # count is unbounded, so they run off-loop in ONE thread hop. Guarded:
+        # the sandbox temp file is live, so a cancellation here must not
+        # orphan it.
+        env = await self._to_thread_guarding_sandbox(_resolve_spawn_env, env)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
@@ -2410,7 +2512,11 @@ class AcpClient:
         # it here bounds ONLY auto resolution — explicit ``-n N``, non-xdist
         # runs, and venvs without xdist are unaffected. Respects a value
         # already present in the env; see resource_status.inject_xdist_auto_cap.
-        inject_xdist_auto_cap(env)
+        # Off-loop: resolving the cap reads the raw config, and that read
+        # enters config_dir() (mkdir + file IO + JSON parse) — blocking
+        # syscalls that must not run on the loop. Guarded: the sandbox temp
+        # file is live, so a cancellation here must not orphan it.
+        await self._to_thread_guarding_sandbox(inject_xdist_auto_cap, env)
 
         # Process-group isolation for clean tree-kill. Pass both flags explicitly
         # (NOT via **dict unpack — that breaks mypy's Popen overload resolution on
@@ -2652,12 +2758,7 @@ class AcpClient:
                     except Exception:
                         pass
         # Clean up sandbox temp files (macOS seatbelt profile)
-        if self._sandbox_cleanup:
-            try:
-                os.remove(self._sandbox_cleanup)
-            except OSError:
-                pass
-            self._sandbox_cleanup = None
+        self._discard_sandbox_cleanup()
         # Remove settings.local.json so bypassPermissions doesn't persist after crash
         if self._is_claude:
             _stale = self._work_dir / ".claude" / "settings.local.json"
@@ -2993,9 +3094,18 @@ class AcpClient:
         await self._drain_notifications()
 
     async def ensure_ready(self) -> None:
-        """Ensure process is spawned and session is initialized."""
-        # Re-create cwd in case it was deleted after spawn.
-        self._work_dir.mkdir(parents=True, exist_ok=True)
+        """Ensure process is spawned and session is initialized.
+
+        Runs before EVERY prompt, so the warm path must stay syscall-free:
+        the work dir is created once per instance (off-loop) and remembered —
+        a per-prompt mkdir would tax every prompt with a blocking syscall
+        whose latency scales with the parent directory's entry count.
+        Re-creating the directory later could not repair a live child anyway:
+        a process's cwd is bound to the inode, not the path.
+        """
+        if not self._work_dir_ready:
+            await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+            self._work_dir_ready = True
         if self._process and self._process.returncode is None and self._session_id:
             return
 

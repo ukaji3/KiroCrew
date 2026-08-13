@@ -2788,32 +2788,62 @@ async def _worktree_remove(
     if _POD_AVAILABLE and cfg is None:
         return {"ok": False, "error": "cannot load pod configuration to verify pod state"}
     if _POD_AVAILABLE and cfg:
+        # Pre-gate: verify the pod backend is reachable. If absent
+        # (PodBackendAbsent), pods cannot be supervised — a systemd --user
+        # unit requires a reachable session bus for its lifecycle. Even if
+        # the socket were removed under a running pod, that pod is now
+        # uncontrollable and will terminate on its next watchdog cycle.
+        # As a defense-in-depth measure, we also probe the unit file directly.
         try:
-            loop = asyncio.get_running_loop()
-            active = await loop.run_in_executor(
-                subprocess_executor(), rt.active_names, cfg
-            )
-            if name in active:
-                r = await _pod_down(name)
-                if not r.get("ok"):
-                    return {"ok": False, "error": f"pod shutdown failed: {r.get('error')}"}
-                stopped_pod = True
-                try:
-                    active2 = await loop.run_in_executor(
-                        subprocess_executor(), rt.active_names, cfg
-                    )
-                    if name in active2:
-                        return {"ok": False, "error": "pod still active after shutdown"}
-                except Exception as exc:
+            rt.require_backend()
+        except rt.PodBackendAbsent:
+            # Defense-in-depth: attempt a direct unit-state query. If this
+            # somehow succeeds (bus re-appeared between require_backend and
+            # here), we fall through to the normal active-names path.
+            try:
+                loop = asyncio.get_running_loop()
+                unit_state = await loop.run_in_executor(
+                    subprocess_executor(), rt.unit_state, cfg, name
+                )
+                if unit_state[0] == "active":
                     return {
                         "ok": False,
-                        "error": f"cannot verify pod shutdown: {_redact(str(exc))}",
+                        "error": "pod backend reported absent but unit is active — refusing",
                     }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": f"cannot verify pod state: {_redact(str(exc))}",
-            }
+            except Exception:
+                pass  # unit_state also fails → backend truly gone
+            logger.debug(
+                "dev-fleet worktree_remove: pod backend absent; "
+                "skipping pod-state check for %r",
+                name,
+            )
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+                active = await loop.run_in_executor(
+                    subprocess_executor(), rt.active_names, cfg
+                )
+                if name in active:
+                    r = await _pod_down(name)
+                    if not r.get("ok"):
+                        return {"ok": False, "error": f"pod shutdown failed: {r.get('error')}"}
+                    stopped_pod = True
+                    try:
+                        active2 = await loop.run_in_executor(
+                            subprocess_executor(), rt.active_names, cfg
+                        )
+                        if name in active2:
+                            return {"ok": False, "error": "pod still active after shutdown"}
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "error": f"cannot verify pod shutdown: {_redact(str(exc))}",
+                        }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"cannot verify pod state: {_redact(str(exc))}",
+                }
 
     if progress is not None:
         progress("removing")
@@ -2828,19 +2858,24 @@ async def _worktree_remove(
         # gateway running from deleted files, so re-verify inactivity now.
         if _POD_AVAILABLE and cfg:
             try:
-                loop = asyncio.get_running_loop()
-                active3 = await loop.run_in_executor(
-                    subprocess_executor(), rt.active_names, cfg
-                )
-                if name in active3:
-                    return {"ok": False, "error": (
-                        "pod became active again before removal — refusing"
-                    )}
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "error": f"cannot re-verify pod state before removal: {_redact(str(exc))}",
-                }
+                rt.require_backend()
+            except rt.PodBackendAbsent:
+                pass  # backend provably absent — no pods can exist
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                    active3 = await loop.run_in_executor(
+                        subprocess_executor(), rt.active_names, cfg
+                    )
+                    if name in active3:
+                        return {"ok": False, "error": (
+                            "pod became active again before removal — refusing"
+                        )}
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "error": f"cannot re-verify pod state before removal: {_redact(str(exc))}",
+                    }
         cmd = ["git", "-C", MAIN_REPO, "worktree", "remove", path]
         if force_use_git_force:
             cmd.append("--force")
@@ -4079,7 +4114,19 @@ async def _gateway_service_active() -> bool:
     if _GATEWAY_SERVICE_ACTIVE is not None and (now - _GATEWAY_SERVICE_CHECK_AT) < _GATEWAY_SERVICE_TTL:
         return _GATEWAY_SERVICE_ACTIVE
     svc = _gateway_backend()
-    _GATEWAY_SERVICE_ACTIVE = False if svc is None else await svc.active()
+    active = False if svc is None else await svc.active()
+    if not active:
+        # Foreground backend is the last-resort restart path for hosts without
+        # a drivable service manager. If eligible, the Restart button and the
+        # auto-restart-after-sync flow should still be available — but ONLY
+        # when the backend is not confined (status() == STATUS_OK), mirroring
+        # the _make_live probe at line ~4558.
+        status = await _live_user_unit_status()
+        if _foreground_eligible(status):
+            fg = _foreground_backend()
+            if fg is not None and await fg.status() == gateway_service.STATUS_OK:
+                active = True
+    _GATEWAY_SERVICE_ACTIVE = active
     _GATEWAY_SERVICE_CHECK_AT = now
     return _GATEWAY_SERVICE_ACTIVE
 
@@ -4133,27 +4180,57 @@ def _foreground_eligible(status: str) -> bool:
 
 
 async def _restart_gateway() -> dict:
-    """Restart the gateway service via a detached systemd-run.
+    """Restart the gateway, preferring the service backend with foreground fallback.
 
-    The restart kills the current process, so we use systemd-run --collect
-    to schedule a restart that survives our own death.
+    Tries the platform service manager first (systemd/launchd). When that is
+    unavailable or inactive, falls through to the foreground backend — the same
+    detach-and-respawn path that Make Live uses on hosts without a drivable
+    service manager.
 
-    Returns the pre-restart ``start_id`` (the live unit's start identity
-    captured BEFORE scheduling) so the caller can poll until a DIFFERENT
-    identity appears -- a 200 from this same process still winding down must
-    not read as "recovered". ``start_id`` is None-safe (see _gateway_start_id).
+    Returns the pre-restart ``start_id`` so the frontend can poll until a
+    DIFFERENT identity appears.
     """
-    svc = _gateway_backend()
-    if svc is None or not await svc.active():
-        return {"ok": False, "error": "gateway is not running as a user service"}
-    # Capture identity BEFORE scheduling the restart: afterwards the detached
-    # bounce can tear this process down at any moment, and the whole point is to
-    # hand the frontend the OLD identity to wait past.
-    start_id = await _gateway_start_id()
-    ok, err = await svc.restart_detached()
-    if not ok:
-        return {"ok": False, "error": _redact(err)}
-    return {"ok": True, "start_id": start_id}
+    # Reject while a Make Live cutover is in-flight: restarting mid-staging
+    # would tear the gateway down between the pointer write and the reload,
+    # leaving persisted and loaded targets diverged. Acquire the lock to
+    # prevent a concurrent Make Live from starting while we restart.
+    global _MAKE_LIVE_COMMITTED
+    if _MAKE_LIVE_COMMITTED:
+        return {"ok": False, "error": "a Make Live cutover is in progress — retry after it completes"}
+    if _MAKE_LIVE_LOCK.locked():
+        return {"ok": False, "error": "a Make Live cutover is in progress — retry after it completes"}
+    async with _MAKE_LIVE_LOCK:
+        if _MAKE_LIVE_COMMITTED:
+            return {"ok": False, "error": "a Make Live cutover is in progress — retry after it completes"}
+
+        svc = _gateway_backend()
+        service_active = False if svc is None else await svc.active()
+
+        if service_active:
+            assert svc is not None  # narrowing: service_active implies svc is not None
+            start_id = await _gateway_start_id()
+            ok, err = await svc.restart_detached()
+            if not ok:
+                return {"ok": False, "error": _redact(err)}
+            _MAKE_LIVE_COMMITTED = True
+            return {"ok": True, "start_id": start_id}
+
+        # Foreground fallback: hosts without a drivable service manager (e.g. AL2
+        # with broken sudo, no systemd --user bus) can still restart via the
+        # detach-and-respawn path — but only when not confined (status check
+        # mirrors _make_live and _gateway_service_active).
+        status = await _live_user_unit_status()
+        if _foreground_eligible(status):
+            fg = _foreground_backend()
+            if fg is not None and await fg.status() == gateway_service.STATUS_OK:
+                start_id = await _gateway_start_id()
+                ok, err = await fg.restart_detached()
+                if not ok:
+                    return {"ok": False, "error": _redact(err)}
+                _MAKE_LIVE_COMMITTED = True
+                return {"ok": True, "start_id": start_id}
+
+    return {"ok": False, "error": "gateway is not running as a user service"}
 
 
 @_audited("dev_fleet_restart_gateway")
