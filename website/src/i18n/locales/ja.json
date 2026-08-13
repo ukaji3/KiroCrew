@@ -3884,13 +3884,17 @@
         },
         "settingsModal": {
           "cancel": "キャンセル",
+          "default_keeps_the_model_your_chat_agent_resolves": "デフォルトでは、チャットエージェントが解決するモデルをそのまま使います。選択したモデルは、変更後に開始するスペックセッションに適用されます。進行中のスペックは現在のモデルを使い続けます。",
           "empty_keep_specs_with_each_project_recommended": "空 = 各プロジェクトでスペックを保持（推奨）",
           "leave_this_empty_to_keep_specs_inside_each_proje": "空のままにして、各プロジェクト内にスペックを保持します（コードの横の .kiro/specs フォルダー — Kiro 標準）。\n        または、フォルダーパスを設定してすべてのスペックを一か所に集めてください。",
+          "model_default_inherit": "デフォルト（継承）",
           "save": "保存",
           "saving": "保存中…",
           "settings": "設定",
+          "spec_generation_model": "スペック生成モデル",
           "spec_storage_folder_path": "スペック保存フォルダーのパス",
-          "where_should_specs_be_saved": "スペックはどこに保存しますか？"
+          "where_should_specs_be_saved": "スペックはどこに保存しますか？",
+          "which_model_should_run_spec_generation": "スペック生成にはどのモデルを使いますか？"
         },
         "shimmer": {
           "loading_specs": "スペック読み込み中…",
@@ -4592,6 +4596,9 @@
     "commandPalette": {
       "clear_filter": "フィルタをクリア",
       "close": "閉じる",
+      "min_query_chars": "{{scope}}を検索するには{{min}}文字以上入力してください",
+      "no_matches": "マッチしません",
+      "no_recent_sessions": "最近のセッションはありません",
       "no_scope": "{{scope}}なし",
       "pinned": "ピン留め済み",
       "providers": {
@@ -4630,6 +4637,7 @@
         },
         "recentsProvider": {
           "approve": "承認",
+          "answer": "回答",
           "current": "現在",
           "new_session": "新しいセッション…",
           "older_sessions": "以前のセッション",
@@ -4774,6 +4782,11 @@
     "detailPanel": {
       "close_panel": "パネルを閉じる",
       "resize_panel": "パネルのサイズを変更"
+    },
+    "diagramLightbox": {
+      "close": "閉じる",
+      "diagram_viewer": "図ビューア",
+      "enlarge_diagram": "図を拡大"
     },
     "dialog": {
       "close": "閉じる"
@@ -6361,6 +6374,18 @@
       "verdict_tap_noop": "短く押しました。「{{mode}}」モードでは何も起こりません。もう少し長く押してください。",
       "verdict_toggle": "認識しました。実際のチャットではこの操作で録音が始まり、次に押すと停止します。",
       "verdict_wrong_key": "押されたのは {{got}} で、上で選んだ {{want}} ではありません。お使いのキーボードにそのキーがない場合は、「{{field}}」で別のキーを選んでください。"
+    },
+    "gitPanel": {
+      "changes": "変更",
+      "clean": "クリーン",
+      "commits": "コミット",
+      "empty_state": "表示する変更やコミットはありません。",
+      "just_now": "たった今",
+      "loading": "読み込み中…",
+      "no_project": "このセッションにはプロジェクトフォルダーが設定されていません。",
+      "refresh": "更新",
+      "title": "Git",
+      "uncommitted": "{{count}} 件の未コミット"
     }
   },
   "hooks": {
@@ -6419,7 +6444,8 @@
       "logs": "ログ",
       "side": "サイド",
       "subagents": "サブエージェント",
-      "workflows": "ワークフロー"
+      "workflows": "ワークフロー",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "すべてのスロットが使用中です",
@@ -6758,7 +6784,8 @@
       "update_all": "すべて更新",
       "update_other": "{{count}} 更新",
       "updating_progress": "更新中 {{done}}/{{total}}…",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "{{name}} をインストールしました。下でオンにして有効化してください。"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",
@@ -7312,6 +7339,7 @@
         "steered": "ステアリング済み",
         "switch_to_raw_markdown_view": "生 Markdown ビューに切り替え",
         "switch_to_rendered_view": "レンダリング済みビューに切り替え",
+        "turn_model": "モデル: {{model}}",
         "turn_took": "ターンに {{elapsed}} かかりました",
         "turn_took_cost": "ターンに {{elapsed}} かかりました({{cost}} の API コスト)",
         "turn_took_credits": "ターンに {{elapsed}} かかり {{credits}} クレジットを使用しました",
@@ -7489,7 +7517,9 @@
         "switch_to_split_view": "分割表示に切り替え",
         "switch_to_unified_view": "統合表示に切り替え",
         "this_app_render_is_no_longer_available": "このアプリの表示は利用できなくなりました。もう一度ツールを実行して表示してください。",
-        "turn_diff": "ターンの差分"
+        "turn_diff": "ターンの差分",
+        "menu_git": "Git",
+        "menu_git_desc": "ブランチ、変更、最近のコミット"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "停止に失敗したため、セッションをリセットしました",
@@ -7814,6 +7844,8 @@
       "open_source_link_in_side_panel": "{{url}} をサイドパネルで開く ({{modifier}} するとブラウザーで開く)",
       "move_folder_to": "フォルダーの移動先",
       "needs_approval": "承認が必要です",
+      "needs_your_answer": "回答が必要です",
+      "waiting_on_your_choice": "選択を待機中",
       "new": "新規",
       "new_autopilot_chat": "新しいオートパイロットチャット",
       "new_chat": "新しいチャット",
@@ -10081,9 +10113,16 @@
         "terminal_font_family_desc": "内蔵ターミナルで使用するフォント。コンピューターにインストールされている等幅フォントを入力してください。Powerline やプロンプトテーマのグリフを表示するには Nerd Font を使用します。",
         "terminal_font_size": "フォントサイズ",
         "terminal_font_size_desc": "内蔵ターミナルの文字サイズ（ピクセル単位）。",
+        "terminal_shell": "デフォルトシェル",
+        "terminal_shell_desc": "内蔵ターミナルが起動するシェル。絶対パスまたは PATH 上のコマンドを指定します。空欄の場合はシステムのデフォルト（$SHELL）を使用します。",
+        "terminal_shell_not_executable": "実行可能なシェルではありません。絶対パスまたは PATH 上のコマンドを入力するか、空欄にしてシステムのデフォルトを使用してください。",
+        "terminal_shell_save_failed": "シェル設定を保存できませんでした",
         "theme": "テーマ",
         "theme_source": "テーマソース",
         "theme_source_location": "テーマソースの場所",
+        "theme_styles_ignored_body": "テーマが変更できないCSSを使用しているため、Kiro Crewはそれらをスキップしました。このテーマの作者である場合は、theme.jsonのfontsリストでフォントを宣言し、その他のルールは許可されたサーフェスに限定してから再インストールしてください。",
+        "theme_styles_ignored_link": "テーマ作成ガイド",
+        "theme_styles_ignored_title": "このテーマの一部のスタイルは無視されました",
         "ui_font_family_for_the_dashboard_code_font_follo": "ダッシュボードの UI フォントファミリー。コードのフォントは現在のテーマに従います。",
         "use_your_browser_s_zoom_your_browser_remembers_i": "ブラウザーのズームを使用してください。ブラウザーはこのサイトのズームを記憶します。",
         "view": "表示",
@@ -11004,6 +11043,7 @@
       "per_turn_col": "ターンあたり",
       "phase_col": "フェーズ",
       "priciest_turn": "最も高いターン",
+      "prior_credits_turns": "クレジット {{credits}} · ターン {{turns}}",
       "profile_scaled_per_row": "対数スケール。各プロファイルを自身の min–max に対して表示します — バーはその計器のテールを示すもので、他の計器との規模比較ではありません",
       "range_bar_label": "min {{min}}, p50 {{p50}}, p90 {{p90}}, max {{max}}",
       "sample_count": "n={{count}}",
@@ -11031,6 +11071,7 @@
       "turn_latency_p50": "ターンレイテンシ (p50)",
       "turns_col": "ターン",
       "turns_measured_other": "{{n}} ターンを計測",
+      "turns_to_compaction_other": "{{n}} ターン",
       "untitled_conversation_on": "無題 · {{date}}",
       "used_tokens_col": "使用 (トークン)",
       "vs_previous_period": "前期間比",

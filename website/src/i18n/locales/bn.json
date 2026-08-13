@@ -3946,13 +3946,17 @@
         },
         "settingsModal": {
           "cancel": "বাতিল",
+          "default_keeps_the_model_your_chat_agent_resolves": "ডিফল্ট আপনার চ্যাট এজেন্ট যে মডেল নির্ধারণ করে সেটিই রাখে। বাছাই করা মডেল পরিবর্তনের পরে শুরু হওয়া spec সেশনে প্রযোজ্য হয় — চলমান spec তার বর্তমান মডেল রাখে।",
           "empty_keep_specs_with_each_project_recommended": "ফাঁকা = spec প্রতিটি প্রকল্পের সঙ্গেই রাখুন (প্রস্তাবিত)",
           "leave_this_empty_to_keep_specs_inside_each_proje": "spec প্রতিটি প্রকল্পের ভিতরে রাখতে এটি ফাঁকা রাখুন (আপনার কোডের পাশে .kiro/specs ফোল্ডার — Kiro-র আদর্শ)। অথবা সব spec এক জায়গায় জমা করতে একটি ফোল্ডার পথ দিন।",
+          "model_default_inherit": "ডিফল্ট (উত্তরাধিকার)",
           "save": "সংরক্ষণ করো",
           "saving": "সংরক্ষণ হচ্ছে…",
           "settings": "সেটিংস",
+          "spec_generation_model": "spec তৈরির মডেল",
           "spec_storage_folder_path": "spec সংরক্ষণ ফোল্ডারের পথ",
-          "where_should_specs_be_saved": "spec কোথায় সংরক্ষণ করা হবে?"
+          "where_should_specs_be_saved": "spec কোথায় সংরক্ষণ করা হবে?",
+          "which_model_should_run_spec_generation": "spec তৈরিতে কোন মডেল চলবে?"
         },
         "shimmer": {
           "loading_specs": "spec লোড হচ্ছে…",
@@ -4665,6 +4669,9 @@
     "commandPalette": {
       "clear_filter": "ফিল্টার মুছুন",
       "close": "বন্ধ করুন",
+      "min_query_chars": "{{scope}} খুঁজতে কমপক্ষে {{min}}টি অক্ষর টাইপ করুন",
+      "no_matches": "কোনো মিল নেই",
+      "no_recent_sessions": "কোনো সাম্প্রতিক সেশন নেই",
       "no_scope": "কোনো {{scope}} নেই",
       "pinned": "পিন করা",
       "providers": {
@@ -4703,6 +4710,7 @@
         },
         "recentsProvider": {
           "approve": "অনুমোদন",
+          "answer": "উত্তর দিন",
           "current": "বর্তমান",
           "new_session": "নতুন সেশন…",
           "older_sessions": "পুরোনো সেশন",
@@ -4849,6 +4857,11 @@
     "detailPanel": {
       "close_panel": "প্যানেল বন্ধ করুন",
       "resize_panel": "প্যানেলের আকার বদলান"
+    },
+    "diagramLightbox": {
+      "close": "বন্ধ করুন",
+      "diagram_viewer": "ডায়াগ্রাম ভিউয়ার",
+      "enlarge_diagram": "ডায়াগ্রাম বড় করুন"
     },
     "dialog": {
       "close": "বন্ধ করুন"
@@ -6448,6 +6461,18 @@
       "verdict_tap_noop": "এটি ছিল দ্রুত চাপ — “{{mode}}” মোডে কিছুই হত না। কী-টি আরও বেশি সময় চেপে ধরুন।",
       "verdict_toggle": "শনাক্ত হয়েছে — সত্যিকারের কথাবার্তায় এই চাপ রেকর্ডিং শুরু করত এবং পরের চাপ থামাত।",
       "verdict_wrong_key": "ওটি ছিল {{got}}, উপরে বেছে নেওয়া {{want}} নয়। এই কীবোর্ডে সেটি না থাকলে “{{field}}”-এ অন্য একটি বেছে নিন।"
+    },
+    "gitPanel": {
+      "changes": "পরিবর্তন",
+      "clean": "পরিষ্কার",
+      "commits": "কমিট",
+      "empty_state": "দেখানোর মতো কোনো পরিবর্তন বা কমিট নেই।",
+      "just_now": "এইমাত্র",
+      "loading": "লোড হচ্ছে...",
+      "no_project": "এই সেশনের জন্য কোনো প্রজেক্ট ফোল্ডার সেট করা নেই।",
+      "refresh": "রিফ্রেশ",
+      "title": "Git",
+      "uncommitted": "{{count}}টি আনকমিটেড"
     }
   },
   "hooks": {
@@ -6506,7 +6531,8 @@
       "logs": "লগ",
       "side": "সাইড",
       "subagents": "সাবএজেন্ট",
-      "workflows": "ওয়ার্কফ্লো"
+      "workflows": "ওয়ার্কফ্লো",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "সব স্লট ভর্তি",
@@ -6852,7 +6878,8 @@
       "update_one": "{{count}}টি আপডেট",
       "update_other": "{{count}}টি আপডেট",
       "updating_progress": "আপডেট হচ্ছে {{done}}/{{total}}…",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "{{name}} ইনস্টল হয়েছে। সক্রিয় করতে নিচে এটি চালু করুন।"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/মাস",
@@ -7411,6 +7438,7 @@
         "steered": "স্টিয়ার করা হয়েছে",
         "switch_to_raw_markdown_view": "মূল markdown ভিউতে যাও",
         "switch_to_rendered_view": "রেন্ডার করা ভিউতে যাও",
+        "turn_model": "মডেল: {{model}}",
         "turn_took": "টার্নে সময় লেগেছে {{elapsed}}",
         "turn_took_cost": "টার্নে সময় লেগেছে {{elapsed}} ({{cost}} API ব্যয়)",
         "turn_took_credits": "টার্নে সময় লেগেছে {{elapsed}} এবং খরচ হয়েছে {{credits}} ক্রেডিট",
@@ -7590,7 +7618,9 @@
         "switch_to_split_view": "স্প্লিট ভিউতে যাও",
         "switch_to_unified_view": "ইউনিফায়েড ভিউতে যাও",
         "this_app_render_is_no_longer_available": "এই অ্যাপ রেন্ডার আর উপলব্ধ নেই। এটি দেখতে টুলটি আবার চালান।",
-        "turn_diff": "টার্ন ডিফ"
+        "turn_diff": "টার্ন ডিফ",
+        "menu_git": "Git",
+        "menu_git_desc": "ব্রাঞ্চ, পরিবর্তন এবং সাম্প্রতিক কমিট"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "থামানো ব্যর্থ, সেশন রিসেট হয়েছে",
@@ -7918,6 +7948,8 @@
       "more_pull_request_or_issue_in_this_session_other": "এই সেশনে আরও {{count}}টি পুল রিকোয়েস্ট বা ইস্যু",
       "move_folder_to": "ফোল্ডার সরান",
       "needs_approval": "অনুমোদন প্রয়োজন",
+      "needs_your_answer": "আপনার উত্তর দরকার",
+      "waiting_on_your_choice": "আপনার পছন্দের অপেক্ষায়",
       "new": "নতুন",
       "new_autopilot_chat": "নতুন অটোপাইলট চ্যাট",
       "new_chat": "নতুন চ্যাট",
@@ -10201,9 +10233,16 @@
         "terminal_font_family_desc": "বিল্ট-ইন টার্মিনালের ফন্ট। তোমার কম্পিউটারে ইনস্টল করা কোনও monospace ফন্ট লেখো — Powerline ও প্রম্পট-থিমের গ্লিফ রেন্ডার করতে একটি Nerd Font ব্যবহার করো।",
         "terminal_font_size": "ফন্টের আকার",
         "terminal_font_size_desc": "বিল্ট-ইন টার্মিনালে টেক্সটের আকার, পিক্সেলে পরিমাপ করা।",
+        "terminal_shell": "ডিফল্ট শেল",
+        "terminal_shell_desc": "বিল্ট-ইন টার্মিনাল যে শেল চালু করে — একটি সম্পূর্ণ পাথ বা PATH-এ থাকা কমান্ড। সিস্টেম ডিফল্ট ($SHELL) ব্যবহার করতে খালি রাখুন।",
+        "terminal_shell_not_executable": "এটি একটি এক্সিকিউটেবল শেল নয় — একটি সম্পূর্ণ পাথ বা PATH-এ থাকা কমান্ড লিখুন, অথবা সিস্টেম ডিফল্টের জন্য খালি রাখুন।",
+        "terminal_shell_save_failed": "শেল সেটিং সংরক্ষণ করা যায়নি",
         "theme": "থিম",
         "theme_source": "থিমের সোর্স",
         "theme_source_location": "থিম সোর্সের অবস্থান",
+        "theme_styles_ignored_body": "সেগুলি এমন CSS ব্যবহার করে যা থিম পরিবর্তন করতে পারে না, তাই Kiro Crew সেগুলি বাদ দিয়েছে। এই থিমটি আপনার তৈরি হলে theme.json-এর fonts তালিকায় ফন্ট ঘোষণা করুন, বাকি নিয়মগুলি অনুমোদিত পৃষ্ঠতলে সীমাবদ্ধ রাখুন, তারপর আবার ইনস্টল করুন।",
+        "theme_styles_ignored_link": "থিমিং নির্দেশিকা",
+        "theme_styles_ignored_title": "এই থিমের কিছু স্টাইল উপেক্ষা করা হয়েছে",
         "ui_font_family_for_the_dashboard_code_font_follo": "ড্যাশবোর্ডের UI ফন্ট ফ্যামিলি। কোড ফন্ট সক্রিয় থিম অনুসরণ করে।",
         "use_your_browser_s_zoom_your_browser_remembers_i": "আপনার ব্রাউজারের জুম ব্যবহার করুন। ব্রাউজার এই সাইটের জন্য তা মনে রাখে।",
         "view": "ভিউ",
@@ -11125,6 +11164,7 @@
       "per_turn_col": "প্রতি টার্ন",
       "phase_col": "ফেজ",
       "priciest_turn": "সবচেয়ে ব্যয়বহুল টার্ন",
+      "prior_credits_turns": "ক্রেডিট {{credits}} · টার্ন {{turns}}",
       "profile_scaled_per_row": "লগ স্কেল, প্রতিটি প্রোফাইল নিজের min–max অনুসারে — বার সেই ইনস্ট্রুমেন্টের টেল দেখায়, অন্যদের তুলনায় তার আকার নয়",
       "range_bar_label": "min {{min}}, p50 {{p50}}, p90 {{p90}}, max {{max}}",
       "sample_count": "n={{count}}",
@@ -11155,6 +11195,8 @@
       "turns_col": "টার্ন",
       "turns_measured_one": "{{n}} টার্ন পরিমাপ করা হয়েছে",
       "turns_measured_other": "{{n}} টার্ন পরিমাপ করা হয়েছে",
+      "turns_to_compaction_one": "{{n}} টার্ন",
+      "turns_to_compaction_other": "{{n}} টার্ন",
       "untitled_conversation_on": "শিরোনামহীন · {{date}}",
       "used_tokens_col": "ব্যবহৃত (টোকেন)",
       "vs_previous_period": "পূর্ববর্তী সময়ের তুলনায়",

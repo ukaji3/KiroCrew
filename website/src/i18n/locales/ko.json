@@ -3884,13 +3884,17 @@
         },
         "settingsModal": {
           "cancel": "취소",
+          "default_keeps_the_model_your_chat_agent_resolves": "기본값은 채팅 에이전트가 해석하는 모델을 그대로 사용합니다. 선택한 모델은 변경 이후 시작되는 스펙 세션에 적용되며, 진행 중인 스펙은 현재 모델을 유지합니다.",
           "empty_keep_specs_with_each_project_recommended": "비움 = 각 프로젝트에 스펙 보관(권장)",
           "leave_this_empty_to_keep_specs_inside_each_proje": "비워 두면 각 프로젝트 안에 스펙을 보관합니다(코드 옆의 .kiro/specs 폴더 — Kiro 표준).\n 또는 폴더 경로를 설정해 모든 스펙을 한곳에 모을 수 있습니다.",
+          "model_default_inherit": "기본값(상속)",
           "save": "저장",
           "saving": "저장 중…",
           "settings": "설정",
+          "spec_generation_model": "스펙 생성 모델",
           "spec_storage_folder_path": "스펙 저장 폴더 경로",
-          "where_should_specs_be_saved": "스펙을 어디에 저장할까요?"
+          "where_should_specs_be_saved": "스펙을 어디에 저장할까요?",
+          "which_model_should_run_spec_generation": "스펙 생성에 어떤 모델을 사용할까요?"
         },
         "shimmer": {
           "loading_specs": "스펙 불러오는 중…",
@@ -4592,6 +4596,9 @@
     "commandPalette": {
       "clear_filter": "필터 지우기",
       "close": "닫기",
+      "min_query_chars": "{{scope}}을(를) 검색하려면 {{min}}자 이상 입력하세요",
+      "no_matches": "일치 항목 없음",
+      "no_recent_sessions": "최근 세션 없음",
       "no_scope": "{{scope}} 없음",
       "pinned": "고정됨",
       "providers": {
@@ -4630,6 +4637,7 @@
         },
         "recentsProvider": {
           "approve": "승인",
+          "answer": "답변",
           "current": "현재",
           "new_session": "새 세션…",
           "older_sessions": "이전 세션",
@@ -4774,6 +4782,11 @@
     "detailPanel": {
       "close_panel": "패널 닫기",
       "resize_panel": "패널 크기 조절"
+    },
+    "diagramLightbox": {
+      "close": "닫기",
+      "diagram_viewer": "다이어그램 뷰어",
+      "enlarge_diagram": "다이어그램 확대"
     },
     "dialog": {
       "close": "닫기"
@@ -6361,6 +6374,18 @@
       "verdict_tap_noop": "짧게 누르셨습니다. ‘{{mode}}’ 모드에서는 아무 일도 일어나지 않습니다. 키를 더 길게 누르세요.",
       "verdict_toggle": "인식되었습니다. 실제 대화에서는 이 입력으로 녹음이 시작되고, 다음에 누르면 중지됩니다.",
       "verdict_wrong_key": "{{got}} 이(가) 입력되었습니다. 위에서 선택한 {{want}} 이(가) 아닙니다. 사용 중인 키보드에 해당 키가 없다면 ‘{{field}}’에서 다른 키를 선택하세요."
+    },
+    "gitPanel": {
+      "changes": "변경 사항",
+      "clean": "깨끗함",
+      "commits": "커밋",
+      "empty_state": "표시할 변경 사항이나 커밋이 없습니다.",
+      "just_now": "방금 전",
+      "loading": "로드 중…",
+      "no_project": "이 세션에 설정된 프로젝트 폴더가 없습니다.",
+      "refresh": "새로 고침",
+      "title": "Git",
+      "uncommitted": "커밋되지 않음 {{count}}개"
     }
   },
   "hooks": {
@@ -6419,7 +6444,8 @@
       "logs": "로그",
       "side": "사이드",
       "subagents": "서브에이전트",
-      "workflows": "워크플로"
+      "workflows": "워크플로",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "모든 슬롯이 사용 중입니다",
@@ -6758,7 +6784,8 @@
       "update_all": "모두 업데이트",
       "update_other": "업데이트 {{count}}개",
       "updating_progress": "업데이트 중 {{done}}/{{total}}…",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "{{name}} 설치됨. 아래에서 켜서 활성화하세요."
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/월",
@@ -7312,6 +7339,7 @@
         "steered": "스티어링됨",
         "switch_to_raw_markdown_view": "Markdown 원문 보기로 전환",
         "switch_to_rendered_view": "렌더링 보기로 전환",
+        "turn_model": "모델: {{model}}",
         "turn_took": "턴에 {{elapsed}} 걸렸습니다",
         "turn_took_cost": "턴에 {{elapsed}} 걸렸습니다(API 비용 {{cost}})",
         "turn_took_credits": "턴에 {{elapsed}} 걸렸고 크레딧 {{credits}}을(를) 사용했습니다",
@@ -7489,7 +7517,9 @@
         "switch_to_split_view": "분할 보기로 전환",
         "switch_to_unified_view": "통합 보기로 전환",
         "this_app_render_is_no_longer_available": "이 앱 렌더링은 더 이상 사용할 수 없습니다. 도구를 다시 실행해 확인하세요.",
-        "turn_diff": "턴 차이"
+        "turn_diff": "턴 차이",
+        "menu_git": "Git",
+        "menu_git_desc": "브랜치·변경 사항·최근 커밋"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "중지에 실패하여 세션을 초기화했습니다",
@@ -7813,6 +7843,8 @@
       "more_pull_request_or_issue_in_this_session_other": "이 세션에 풀 리퀘스트 또는 이슈 {{count}}개가 더 있습니다",
       "move_folder_to": "폴더 이동 위치",
       "needs_approval": "승인 필요",
+      "needs_your_answer": "답변이 필요합니다",
+      "waiting_on_your_choice": "선택을 기다리는 중",
       "new": "새 채팅",
       "new_autopilot_chat": "새 오토파일럿 채팅",
       "new_chat": "새 채팅",
@@ -10081,9 +10113,16 @@
         "terminal_font_family_desc": "내장 터미널에 사용할 글꼴입니다. 컴퓨터에 설치된 고정폭 글꼴을 입력하세요 — Powerline과 프롬프트 테마 글리프를 표시하려면 Nerd Font를 사용하세요.",
         "terminal_font_size": "글꼴 크기",
         "terminal_font_size_desc": "내장 터미널의 글자 크기입니다(픽셀 단위).",
+        "terminal_shell": "기본 셸",
+        "terminal_shell_desc": "내장 터미널이 실행하는 셸입니다. 절대 경로 또는 PATH에 있는 명령을 입력하세요. 비워 두면 시스템 기본값($SHELL)을 사용합니다.",
+        "terminal_shell_not_executable": "실행 가능한 셸이 아닙니다. 절대 경로 또는 PATH에 있는 명령을 입력하거나, 비워 두면 시스템 기본값을 사용합니다.",
+        "terminal_shell_save_failed": "셸 설정을 저장하지 못했습니다",
         "theme": "테마",
         "theme_source": "테마 소스",
         "theme_source_location": "테마 소스 위치",
+        "theme_styles_ignored_body": "테마가 변경할 수 없는 CSS를 사용하므로 Kiro Crew가 해당 규칙을 건너뛰었습니다. 이 테마를 직접 만들었다면 theme.json의 fonts 목록에 글꼴을 선언하고 나머지 규칙은 허용된 표면으로 제한한 뒤 다시 설치하세요.",
+        "theme_styles_ignored_link": "테마 제작 가이드",
+        "theme_styles_ignored_title": "이 테마의 일부 스타일이 무시되었습니다",
         "ui_font_family_for_the_dashboard_code_font_follo": "대시보드의 UI 글꼴. 코드 글꼴은 활성 테마를 따릅니다.",
         "use_your_browser_s_zoom_your_browser_remembers_i": "브라우저의 확대/축소를 사용하세요. 브라우저가 이 사이트의 값을 기억합니다.",
         "view": "보기",
@@ -11004,6 +11043,7 @@
       "per_turn_col": "턴당",
       "phase_col": "단계",
       "priciest_turn": "가장 비싼 턴",
+      "prior_credits_turns": "크레딧 {{credits}} · 턴 {{turns}}",
       "profile_scaled_per_row": "로그 스케일, 각 프로필을 자체 min–max 기준으로 표시 — 바는 해당 계측기의 테일을 나타내며 다른 계측기와의 규모 비교가 아닙니다",
       "range_bar_label": "최소 {{min}}, p50 {{p50}}, p90 {{p90}}, 최대 {{max}}",
       "sample_count": "n={{count}}",
@@ -11031,6 +11071,7 @@
       "turn_latency_p50": "턴 지연 시간(p50)",
       "turns_col": "턴",
       "turns_measured_other": "{{n}}턴 측정됨",
+      "turns_to_compaction_other": "{{n}}턴",
       "untitled_conversation_on": "제목 없음 · {{date}}",
       "used_tokens_col": "사용량(토큰)",
       "vs_previous_period": "이전 기간 대비",

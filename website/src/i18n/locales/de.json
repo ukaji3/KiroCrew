@@ -3946,13 +3946,17 @@
         },
         "settingsModal": {
           "cancel": "Abbrechen",
+          "default_keeps_the_model_your_chat_agent_resolves": "Standard übernimmt das Modell, das dein Chat-Agent ohnehin auflöst. Eine Auswahl gilt für Spec-Sitzungen, die nach der Änderung starten — eine bereits laufende Spec behält ihr aktuelles Modell.",
           "empty_keep_specs_with_each_project_recommended": "Leer = Specs beim jeweiligen Projekt behalten (empfohlen)",
           "leave_this_empty_to_keep_specs_inside_each_proje": "Lassen Sie dies leer, um Specs in jedem Projekt zu behalten (ein Ordner .kiro/specs neben Ihrem Code — der Kiro-Standard). Oder geben Sie einen Ordnerpfad an, um alle Specs an einem Ort zu sammeln.",
+          "model_default_inherit": "Standard (übernehmen)",
           "save": "Speichern",
           "saving": "Wird gespeichert…",
           "settings": "Einstellungen",
+          "spec_generation_model": "Modell für die Spec-Erstellung",
           "spec_storage_folder_path": "Ordnerpfad für die Spec-Ablage",
-          "where_should_specs_be_saved": "Wo sollen Specs gespeichert werden?"
+          "where_should_specs_be_saved": "Wo sollen Specs gespeichert werden?",
+          "which_model_should_run_spec_generation": "Welches Modell soll die Spec-Erstellung ausführen?"
         },
         "shimmer": {
           "loading_specs": "Specs werden geladen…",
@@ -4665,6 +4669,9 @@
     "commandPalette": {
       "clear_filter": "Filter zurücksetzen",
       "close": "Schließen",
+      "min_query_chars": "Geben Sie mindestens {{min}} Zeichen ein, um {{scope}} zu durchsuchen",
+      "no_matches": "Keine Treffer",
+      "no_recent_sessions": "Keine kürzlichen Sitzungen",
       "no_scope": "Keine {{scope}}",
       "pinned": "Angepinnt",
       "providers": {
@@ -4703,6 +4710,7 @@
         },
         "recentsProvider": {
           "approve": "Genehmigen",
+          "answer": "Antworten",
           "current": "Aktuell",
           "new_session": "Neue Sitzung…",
           "older_sessions": "Ältere Sitzungen",
@@ -4849,6 +4857,11 @@
     "detailPanel": {
       "close_panel": "Panel schließen",
       "resize_panel": "Größe des Panels ändern"
+    },
+    "diagramLightbox": {
+      "close": "Schließen",
+      "diagram_viewer": "Diagrammansicht",
+      "enlarge_diagram": "Diagramm vergrößern"
     },
     "dialog": {
       "close": "Schließen"
@@ -6448,6 +6461,18 @@
       "verdict_tap_noop": "Das war ein kurzes Tippen — im Modus „{{mode}}“ würde nichts passieren. Halte die Taste länger.",
       "verdict_toggle": "Erkannt — in einem echten Chat würde dieser Druck die Aufnahme starten und der nächste sie beenden.",
       "verdict_wrong_key": "Das war {{got}}, nicht die oben gewählte Taste {{want}}. Hat diese Tastatur sie nicht, wähle unter „{{field}}“ eine andere."
+    },
+    "gitPanel": {
+      "changes": "Änderungen",
+      "clean": "sauber",
+      "commits": "Commits",
+      "empty_state": "Keine Änderungen oder Commits vorhanden.",
+      "just_now": "gerade eben",
+      "loading": "wird geladen...",
+      "no_project": "Kein Projektordner für diese Sitzung festgelegt.",
+      "refresh": "Aktualisieren",
+      "title": "Git",
+      "uncommitted": "{{count}} nicht committet"
     }
   },
   "hooks": {
@@ -6506,7 +6531,8 @@
       "logs": "Protokolle",
       "side": "Nebenchat",
       "subagents": "Subagenten",
-      "workflows": "Workflows"
+      "workflows": "Workflows",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "Alle Slots sind belegt",
@@ -6852,7 +6878,8 @@
       "update_one": "{{count}} Aktualisierung",
       "update_other": "{{count}} Aktualisierungen",
       "updating_progress": "Aktualisierung {{done}}/{{total}}…",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "{{name}} installiert. Schalten Sie es unten ein, um es zu aktivieren."
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/Mon.",
@@ -7411,6 +7438,7 @@
         "steered": "Gesteuert",
         "switch_to_raw_markdown_view": "Zur Roh-Markdown-Ansicht wechseln",
         "switch_to_rendered_view": "Zur gerenderten Ansicht wechseln",
+        "turn_model": "Modell: {{model}}",
         "turn_took": "Zug dauerte {{elapsed}}",
         "turn_took_cost": "Zug dauerte {{elapsed}} ({{cost}} API-Kosten)",
         "turn_took_credits": "Zug dauerte {{elapsed}} und verbrauchte {{credits}} Credits",
@@ -7590,7 +7618,9 @@
         "switch_to_split_view": "Zur geteilten Ansicht wechseln",
         "switch_to_unified_view": "Zur einheitlichen Ansicht wechseln",
         "this_app_render_is_no_longer_available": "Diese App-Darstellung ist nicht mehr verfügbar. Führen Sie das Tool erneut aus, um sie anzuzeigen.",
-        "turn_diff": "Zug-Diff"
+        "turn_diff": "Zug-Diff",
+        "menu_git": "Git",
+        "menu_git_desc": "Branch, Änderungen und letzte Commits"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "Stoppen fehlgeschlagen, Sitzung zurückgesetzt",
@@ -7918,6 +7948,8 @@
       "more_pull_request_or_issue_in_this_session_other": "{{count}} weitere Pull Requests oder Issues in dieser Sitzung",
       "move_folder_to": "Ordner verschieben nach",
       "needs_approval": "Benötigt Genehmigung",
+      "needs_your_answer": "Benötigt deine Antwort",
+      "waiting_on_your_choice": "Wartet auf deine Auswahl",
       "new": "Neu",
       "new_autopilot_chat": "Neuer Autopilot-Chat",
       "new_chat": "Neuer Chat",
@@ -10200,9 +10232,16 @@
         "terminal_font_family_desc": "Schriftart für das integrierte Terminal. Gib eine auf deinem Computer installierte monospace-Schriftart ein – verwende eine Nerd Font, um Powerline- und Prompt-Theme-Glyphen darzustellen.",
         "terminal_font_size": "Schriftgröße",
         "terminal_font_size_desc": "Textgröße im integrierten Terminal, gemessen in Pixeln.",
+        "terminal_shell": "Standard-Shell",
+        "terminal_shell_desc": "Shell, die das integrierte Terminal startet – ein absoluter Pfad oder ein Befehl im PATH. Leer lassen, um den Systemstandard ($SHELL) zu verwenden.",
+        "terminal_shell_not_executable": "Keine ausführbare Shell – gib einen absoluten Pfad oder einen Befehl im PATH ein, oder lasse das Feld leer für den Systemstandard.",
+        "terminal_shell_save_failed": "Shell-Einstellung konnte nicht gespeichert werden",
         "theme": "Theme",
         "theme_source": "Theme-Quelle",
         "theme_source_location": "Speicherort der Theme-Quelle",
+        "theme_styles_ignored_body": "Sie verwenden CSS, das Themes nicht ändern dürfen, daher hat Kiro Crew sie übersprungen. Wenn dieses Theme von dir stammt, deklariere Schriften in der fonts-Liste von theme.json, beschränke andere Regeln auf die erlaubten Flächen und installiere es erneut.",
+        "theme_styles_ignored_link": "Theming-Leitfaden",
+        "theme_styles_ignored_title": "Einige Stile dieses Themes wurden ignoriert",
         "ui_font_family_for_the_dashboard_code_font_follo": "UI-Schriftfamilie für das Dashboard. Die Codeschrift folgt dem aktiven Theme.",
         "use_your_browser_s_zoom_your_browser_remembers_i": "Verwenden Sie den Zoom Ihres Browsers. Ihr Browser merkt sich ihn für diese Site.",
         "view": "Ansicht",
@@ -11124,6 +11163,7 @@
       "per_turn_col": "Pro Zug",
       "phase_col": "Phase",
       "priciest_turn": "Teuerster Zug",
+      "prior_credits_turns": "Guthaben {{credits}} · Züge {{turns}}",
       "profile_scaled_per_row": "Logarithmisch, jedes Profil gegen sein eigenes min–max — der Balken zeigt den Ausläufer dieses Instruments, nicht seine Größe gegenüber den anderen",
       "range_bar_label": "min {{min}}, p50 {{p50}}, p90 {{p90}}, max {{max}}",
       "sample_count": "n={{count}}",
@@ -11154,6 +11194,8 @@
       "turns_col": "Züge",
       "turns_measured_one": "{{n}} Zug gemessen",
       "turns_measured_other": "{{n}} Züge gemessen",
+      "turns_to_compaction_one": "{{n}} Zug",
+      "turns_to_compaction_other": "{{n}} Züge",
       "untitled_conversation_on": "Ohne Titel · {{date}}",
       "used_tokens_col": "Genutzt (Token)",
       "vs_previous_period": "vs. Vorperiode",

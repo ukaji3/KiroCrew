@@ -4070,13 +4070,17 @@
         },
         "settingsModal": {
           "cancel": "Отмена",
+          "default_keeps_the_model_your_chat_agent_resolves": "По умолчанию используется модель, которую уже выбирает ваш чат-агент. Выбор применяется к сессиям спеков, начатым после изменения — спек в работе сохраняет текущую модель.",
           "empty_keep_specs_with_each_project_recommended": "Пусто = хранить спеки вместе с каждым проектом (рекомендуется)",
           "leave_this_empty_to_keep_specs_inside_each_proje": "Оставьте поле пустым, чтобы хранить спеки внутри каждого проекта (папка .kiro/specs рядом с кодом — стандарт Kiro). Либо укажите путь к папке, чтобы собирать все спеки в одном месте.",
+          "model_default_inherit": "По умолчанию (наследовать)",
           "save": "Сохранить",
           "saving": "Сохранение…",
           "settings": "Настройки",
+          "spec_generation_model": "Модель генерации спеков",
           "spec_storage_folder_path": "Путь к папке хранения спеков",
-          "where_should_specs_be_saved": "Где сохранять спеки?"
+          "where_should_specs_be_saved": "Где сохранять спеки?",
+          "which_model_should_run_spec_generation": "Какая модель должна выполнять генерацию спеков?"
         },
         "shimmer": {
           "loading_specs": "Загрузка спеков…",
@@ -4811,6 +4815,9 @@
     "commandPalette": {
       "clear_filter": "Очистить фильтр",
       "close": "Закрыть",
+      "min_query_chars": "Введите не менее {{min}} символов для поиска {{scope}}",
+      "no_matches": "Совпадений нет",
+      "no_recent_sessions": "Нет недавних сессий",
       "no_scope": "Нет {{scope}}",
       "pinned": "Закреплённые",
       "providers": {
@@ -4849,6 +4856,7 @@
         },
         "recentsProvider": {
           "approve": "Разрешить",
+          "answer": "Ответить",
           "current": "Текущая",
           "new_session": "Новая сессия…",
           "older_sessions": "Более старые сессии",
@@ -4999,6 +5007,11 @@
     "detailPanel": {
       "close_panel": "Закрыть панель",
       "resize_panel": "Изменить размер панели"
+    },
+    "diagramLightbox": {
+      "close": "Закрыть",
+      "diagram_viewer": "Просмотр диаграммы",
+      "enlarge_diagram": "Увеличить диаграмму"
     },
     "dialog": {
       "close": "Закрыть"
@@ -6622,6 +6635,18 @@
       "verdict_tap_noop": "Это было короткое нажатие — в режиме «{{mode}}» ничего бы не произошло. Держите клавишу дольше.",
       "verdict_toggle": "Распознано — в реальном чате это нажатие начало бы запись, а следующее остановило бы её.",
       "verdict_wrong_key": "Это была {{got}}, а не выбранная выше {{want}}. Если на этой клавиатуре её нет, выберите другую в «{{field}}»."
+    },
+    "gitPanel": {
+      "changes": "Изменения",
+      "clean": "чисто",
+      "commits": "Коммиты",
+      "empty_state": "Нет изменений или коммитов для отображения.",
+      "just_now": "только что",
+      "loading": "загрузка...",
+      "no_project": "Для этого сеанса не задана папка проекта.",
+      "refresh": "Обновить",
+      "title": "Git",
+      "uncommitted": "{{count}} незакоммичено"
     }
   },
   "hooks": {
@@ -6680,7 +6705,8 @@
       "logs": "Логи",
       "side": "Параллельный чат",
       "subagents": "Субагенты",
-      "workflows": "Рабочие процессы"
+      "workflows": "Рабочие процессы",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "Все слоты заняты",
@@ -7040,7 +7066,8 @@
       "update_one": "{{count}} обновление",
       "update_other": "{{count}} обновления",
       "updating_progress": "Обновление {{done}}/{{total}}...",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "{{name}} установлено. Включите его ниже, чтобы активировать."
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/мес",
@@ -7609,6 +7636,7 @@
         "steered": "Скорректировано",
         "switch_to_raw_markdown_view": "Переключиться на исходный markdown",
         "switch_to_rendered_view": "Переключиться на отрисованный вид",
+        "turn_model": "модель: {{model}}",
         "turn_took": "Ход занял {{elapsed}}",
         "turn_took_cost": "Ход занял {{elapsed}} (стоимость API: {{cost}})",
         "turn_took_credits": "Ход занял {{elapsed}} и израсходовал {{credits}} кредитов",
@@ -7792,7 +7820,9 @@
         "switch_to_split_view": "Переключиться на раздельный вид",
         "switch_to_unified_view": "Переключиться на единый вид",
         "this_app_render_is_no_longer_available": "Этот рендер приложения больше недоступен. Запустите инструмент снова, чтобы посмотреть его.",
-        "turn_diff": "Изменения за ход"
+        "turn_diff": "Изменения за ход",
+        "menu_git": "Git",
+        "menu_git_desc": "Ветка, изменения и последние коммиты"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "Не удалось остановить, сессия сброшена",
@@ -8128,6 +8158,8 @@
       "more_pull_request_or_issue_in_this_session_other": "ещё {{count}} пул-реквеста или задачи в этой сессии",
       "move_folder_to": "Переместить папку в",
       "needs_approval": "Требует подтверждения",
+      "needs_your_answer": "Нужен ваш ответ",
+      "waiting_on_your_choice": "Ожидает вашего выбора",
       "new": "Создать",
       "new_autopilot_chat": "Новый чат с автопилотом",
       "new_chat": "Новый чат",
@@ -10439,9 +10471,16 @@
         "terminal_font_family_desc": "Шрифт для встроенного терминала. Укажи monospace-шрифт, установленный на твоём компьютере; используй Nerd Font, чтобы отображались глифы Powerline и глифы тем оформления приглашения.",
         "terminal_font_size": "Размер шрифта",
         "terminal_font_size_desc": "Размер текста во встроенном терминале в пикселях.",
+        "terminal_shell": "Оболочка по умолчанию",
+        "terminal_shell_desc": "Оболочка, которую запускает встроенный терминал — абсолютный путь или команда из PATH. Оставьте пустым, чтобы использовать системную по умолчанию ($SHELL).",
+        "terminal_shell_not_executable": "Это не исполняемая оболочка — укажите абсолютный путь или команду из PATH, либо оставьте поле пустым для системного значения по умолчанию.",
+        "terminal_shell_save_failed": "Не удалось сохранить настройку оболочки",
         "theme": "Тема",
         "theme_source": "Источник темы",
         "theme_source_location": "Расположение источника темы",
+        "theme_styles_ignored_body": "Они используют CSS, который темам менять нельзя, поэтому Kiro Crew их пропустил. Если это ваша тема, объявите шрифты в списке fonts в theme.json, ограничьте остальные правила разрешёнными поверхностями и установите её заново.",
+        "theme_styles_ignored_link": "Руководство по темам",
+        "theme_styles_ignored_title": "Некоторые стили этой темы были проигнорированы",
         "ui_font_family_for_the_dashboard_code_font_follo": "Шрифт интерфейса панели управления. Шрифт кода следует активной теме.",
         "use_your_browser_s_zoom_your_browser_remembers_i": "Используйте масштаб браузера. Браузер запомнит его для этого сайта.",
         "view": "Вид",
@@ -11365,6 +11404,7 @@
       "per_turn_col": "За ход",
       "phase_col": "Фаза",
       "priciest_turn": "Самый дорогой ход",
+      "prior_credits_turns": "кредиты {{credits}} · ходы {{turns}}",
       "profile_scaled_per_row": "Логарифмическая шкала, каждый профиль в своих min–max — полоса показывает хвост этого инструмента, а не его величину относительно других",
       "range_bar_label": "мин {{min}}, p50 {{p50}}, p90 {{p90}}, макс {{max}}",
       "sample_count": "n={{count}}",
@@ -11401,6 +11441,10 @@
       "turns_measured_many": "измерено {{n}} ходов",
       "turns_measured_one": "измерен {{n}} ход",
       "turns_measured_other": "измерено {{n}} хода",
+      "turns_to_compaction_few": "{{n}} хода",
+      "turns_to_compaction_many": "{{n}} ходов",
+      "turns_to_compaction_one": "{{n}} ход",
+      "turns_to_compaction_other": "{{n}} хода",
       "untitled_conversation_on": "Без названия · {{date}}",
       "used_tokens_col": "Исп. (токены)",
       "vs_previous_period": "к предыдущему периоду",

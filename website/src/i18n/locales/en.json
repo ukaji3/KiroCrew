@@ -3090,13 +3090,17 @@
         },
         "settingsModal": {
           "cancel": "Cancel",
+          "default_keeps_the_model_your_chat_agent_resolves": "Default keeps whatever model your chat agent already resolves to. A pick applies to spec sessions that start after the change — a spec already in progress keeps its current model.",
           "empty_keep_specs_with_each_project_recommended": "Empty = keep specs with each project (recommended)",
           "leave_this_empty_to_keep_specs_inside_each_proje": "Leave this empty to keep specs inside each project (a .kiro/specs folder next to your code — the Kiro standard).\n        Or set a folder path to collect all specs in one place instead.",
+          "model_default_inherit": "Default (inherit)",
           "save": "Save",
           "saving": "Saving…",
           "settings": "Settings",
+          "spec_generation_model": "Spec generation model",
           "spec_storage_folder_path": "Spec storage folder path",
-          "where_should_specs_be_saved": "Where should specs be saved?"
+          "where_should_specs_be_saved": "Where should specs be saved?",
+          "which_model_should_run_spec_generation": "Which model should run spec generation?"
         },
         "shimmer": {
           "loading_specs": "Loading specs…",
@@ -3227,6 +3231,18 @@
   "components": {
     "agentDropdownList": {
       "no_matches": "No matches"
+    },
+    "gitPanel": {
+      "changes": "Changes",
+      "clean": "clean",
+      "commits": "Commits",
+      "empty_state": "No changes or commits to display.",
+      "just_now": "just now",
+      "loading": "loading...",
+      "refresh": "Refresh",
+      "title": "Git",
+      "uncommitted": "{{count}} uncommitted",
+      "no_project": "No project folder set for this session."
     },
     "agentImportFlow": {
       "back": "Back",
@@ -3617,6 +3633,11 @@
     "detailPanel": {
       "close_panel": "Close panel",
       "resize_panel": "Resize panel"
+    },
+    "diagramLightbox": {
+      "close": "Close",
+      "diagram_viewer": "Diagram viewer",
+      "enlarge_diagram": "Enlarge diagram"
     },
     "dialog": {
       "close": "Close"
@@ -4567,6 +4588,9 @@
     }
   },
   "hooks": {
+    "usePanelTabs": {
+      "git": "Git"
+    },
     "useSceneInteraction": {
       "approve": "Approve",
       "click_for_thread": "click for thread",
@@ -4795,7 +4819,8 @@
       "uninstall": "Uninstall",
       "update_one": "{{count}} update",
       "update_other": "{{count}} updates",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "Installed {{name}}. Turn it on below to enable it."
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mo",
@@ -5148,6 +5173,7 @@
         "speak": "Speak",
         "speak_message": "Speak message",
         "steered": "Steered",
+        "turn_model": "model: {{model}}",
         "turn_took": "Turn took {{elapsed}}",
         "turn_took_cost": "Turn took {{elapsed}} ({{cost}} API cost)",
         "turn_took_credits": "Turn took {{elapsed}} and used {{credits}} credits",
@@ -5267,6 +5293,8 @@
       "sidePanel": {
         "close_panel": "Close panel",
         "close_tab": "Close tab",
+        "menu_git": "Git",
+        "menu_git_desc": "Branch, changes, and recent commits",
         "move_to_bottom_panel": "Move to bottom panel",
         "open_in_editor": "Open in Editor",
         "open_side_panel_tab": "Open side panel tab",
@@ -5468,6 +5496,8 @@
       "more_options": "More options",
       "move_folder_to": "Move folder to",
       "needs_approval": "Needs approval",
+      "needs_your_answer": "Needs your answer",
+      "waiting_on_your_choice": "Waiting on your choice",
       "new_autopilot_chat": "New autopilot chat",
       "new_crew_chat": "New Crew Mode chat",
       "new_chat_in_folder": "New chat in folder",
@@ -6901,6 +6931,9 @@
         "theme": "Theme",
         "theme_source": "Theme source",
         "theme_source_location": "Theme source location",
+        "theme_styles_ignored_body": "They use CSS that themes aren't allowed to change, so Kiro Crew skipped them. If you made this theme, declare fonts in theme.json's fonts list and keep other rules on the allowed surfaces, then install it again.",
+        "theme_styles_ignored_link": "Theming guide",
+        "theme_styles_ignored_title": "Some of this theme's styles were ignored",
         "ui_font_family_for_the_dashboard_code_font_follo": "UI font family for the dashboard. Code font follows the active theme.",
         "use_your_browser_s_zoom_your_browser_remembers_i": "Use your browser's zoom. Your browser remembers it for this site.",
         "view": "View",
@@ -7471,6 +7504,7 @@
       "per_turn_col": "Per turn",
       "phase_col": "Phase",
       "priciest_turn": "Priciest turn",
+      "prior_credits_turns": "credits {{credits}} · turns {{turns}}",
       "profile_scaled_per_row": "Log scale, each profile against its own min–max — the bar shows that instrument’s tail, not its size against the others",
       "range_bar_label": "min {{min}}, p50 {{p50}}, p90 {{p90}}, max {{max}}",
       "sample_count": "n={{count}}",
@@ -7501,6 +7535,8 @@
       "turns_col": "Turns",
       "turns_measured_one": "{{n}} turn measured",
       "turns_measured_other": "{{n}} turns measured",
+      "turns_to_compaction_one": "{{n}} turn",
+      "turns_to_compaction_other": "{{n}} turns",
       "untitled_conversation_on": "Untitled · {{date}}",
       "used_tokens_col": "Used (tokens)",
       "vs_previous_period": "vs previous period",

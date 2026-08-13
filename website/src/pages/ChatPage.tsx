@@ -25,6 +25,7 @@ import {
   setActiveSlot, truncateAfterIndex, replaceMessages,
   requestStop, pendingQuestionFor, captureStatelessCard, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion,
   retireStatelessQuestion, capturePendingAskId,
+  requestSlotReveal,
   mcpAppKey,
 } from '../store/chatSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
@@ -55,7 +56,9 @@ import { deriveLoadedMcpTools } from '../lib/mcpLoadedTools'
 import type { McpServer } from '../types'
 import { useScrollManager } from './chat/useScrollManager'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
-import { parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment } from '../utils/fileTokens'
+import { parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment, spliceDirTokens } from '../utils/fileTokens'
+import { classifyDrop } from '../utils/dropClassify'
+import { makeRelative } from '../components/FilePickerMenu'
 import { type PasteBlock, expandAll as expandPasteTokens, findTokenRanges, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste, recollapsePastes } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
 /** Delay (ms) before scrolling to bottom after a state update, giving React time to commit. */
@@ -2908,7 +2911,30 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault(); e.stopPropagation(); setDragOver(false)
-    const files = Array.from(e.dataTransfer.files)
+    // Classify BEFORE acting (issue #743): a dropped folder inserts its path
+    // into the composer as an `@rel/` token — the same reference the @-picker
+    // stages — instead of taking the upload route, which cannot ingest a
+    // directory. Files keep uploading; a mixed drop takes both routes. In a
+    // plain browser no real path is visible, so classifyDrop leaves folders
+    // on the upload route there (today's behaviour) rather than inserting a
+    // misleading bare name.
+    const { files, dirPaths } = classifyDrop(e.dataTransfer)
+    if (dirPaths.length) {
+      // Short relative form when the folder lies inside the project root,
+      // absolute otherwise — exactly the picker's own fallback convention.
+      const rels = dirPaths.map(p => makeRelative(p, currentProjectRef.current || ''))
+      const spliced = spliceDirTokens(inputRef.current, voiceCaretRef.current?.start ?? null, rels)
+      if (spliced.changed) {
+        // Arm the caret restore the same way the dictation splice does, so the
+        // cursor lands just past the inserted tokens once the value commits.
+        // Only on a real change: an all-duplicates drop leaves the value
+        // identical, React bails out of the no-op setInput, the restore effect
+        // never fires, and the armed offset would fire stale on the next
+        // unrelated edit, yanking the user's cursor.
+        voicePendingCaretRef.current = spliced.caret
+        setInput(spliced.value)
+      }
+    }
     if (files.length) {
       uploadFiles(files)
     }
@@ -4636,6 +4662,31 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const projectBranch = projectGitError
     ? ''
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
+
+  // Auto-open the Git panel when the slot has a project dir that is a git repo.
+  // Once per slot+path (dismissed via localStorage marker if the user closes it).
+  useEffect(() => {
+    if (!activeSlot || !_slotProject || projectGitError) return
+    if (!projectGit?.repo) return
+    const key = `mc-git-panel-opened:${activeSlot}:${_slotProject}`
+    if (localStorage.getItem(key)) return
+    // If the marker cannot be persisted (quota), skip the auto-open entirely:
+    // opening changes tabsCtl, which re-runs this effect, and an absent marker
+    // would make it open again forever.
+    try { localStorage.setItem(key, '1') } catch { return }
+    tabsCtl.openView('git')
+    dispatch(openActivityPanel())
+  }, [activeSlot, _slotProject, projectGit?.repo, projectGitError, tabsCtl, dispatch])
+
+  // Auto-open the folder tab for the project dir once per slot+path.
+  useEffect(() => {
+    if (!activeSlot || !_slotProject) return
+    const key = `mc-folder-panel-opened:${activeSlot}:${_slotProject}`
+    if (localStorage.getItem(key)) return
+    // Same quota guard as the git-panel effect above.
+    try { localStorage.setItem(key, '1') } catch { return }
+    tabsCtl.openFolder(_slotProject, activeSlot)
+  }, [activeSlot, _slotProject, tabsCtl])
   const [sidebarPinned, setSidebarPinned] = useState(() => localStorage.getItem('mc-sidebar-pinned') !== 'false')
   const sidebarPinnedRef = useRef(sidebarPinned)
   sidebarPinnedRef.current = sidebarPinned
@@ -4809,8 +4860,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // selection, WITHOUT touching the main chat context (unlike handleQuote, which
   // injects into the main composer). Mirrors the /side slash command's
   // openActivityToTab('side') bridge, then hands the selection to SideChat via a
-  // `side-seed` CustomEvent (same event-bridge pattern as openActivityToTab /
-  // reveal-slot — no new prop-drilling, no backend change). No transit
+  // `side-seed` CustomEvent (same event-bridge pattern as openActivityToTab —
+  // no new prop-drilling, no backend change). No transit
   // animation: the popup routes the selection straight to the Side panel
   // (matches Codex's "Ask in side chat" behavior).
   const handleAsk = useCallback((text: string) => {
@@ -6133,7 +6184,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 <ChatHeaderMenu
                   activeSlot={activeSlot}
                   agent={currentSlot?.agent}
-                  onReveal={activeSlot ? () => { sidebarAutoHidden.current = null; if (!sidebarPinned) setSidebarPinned(true); window.dispatchEvent(new CustomEvent('reveal-slot', { detail: activeSlot })) } : undefined}
+                  onReveal={activeSlot && embedMode !== 'chat' ? () => {
+                    // The request rides the store, not a window event: with the
+                    // drawer collapsed ChatSidebar is unmounted, so an event
+                    // dispatched here (before the mount that setSidebarPinned
+                    // schedules commits) had no listener and was dropped —
+                    // the store entry survives until the sidebar consumes it
+                    // (#912). Mobile drives its own drawer state. Embed-chat
+                    // never mounts a sidebar, so the item is not offered there:
+                    // a stored request would outlive the view and fire on
+                    // whichever sidebar mounts next.
+                    sidebarAutoHidden.current = null
+                    if (isMobile) setMobileSessions(true)
+                    else if (!sidebarPinned) setSidebarPinned(true)
+                    dispatch(requestSlotReveal(activeSlot))
+                  } : undefined}
                   onRename={activeSlot ? () => { setEditingTitle(true); setTitleDraft(title) } : undefined}
                   mode={effectiveMode}
                 />

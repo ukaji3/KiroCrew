@@ -2,6 +2,25 @@
 
 All notable changes to KiroCrew are documented in this file.
 
+## [Unreleased]
+
+- **MCP gateway daemons no longer leak when their launcher dies.** A `gatewayd`
+  whose launcher exited without signalling it (a torn-down `pytest` run, for
+  example) used to stay resident forever — invisible to every sweep, ~27 MB
+  each, accumulating without bound. The daemon now watches its own listening
+  socket path and gracefully self-exits once the path is gone (three
+  consecutive checks, POSIX only), and the untracked-orphan sweep reaps any
+  gatewayd whose `--socket` path no longer exists on disk, TERM-first so
+  pooled backends drain cleanly. (#3315)
+
+- **Slack manifest: private channels now work out of the box.** The shipped app
+  manifest adds the `groups:history` and `users:read` bot scopes and subscribes
+  to the `message.groups` event, so a tracked private channel actually delivers
+  messages and profile lookups resolve real names. **Existing installs are not
+  fixed by upgrading alone**: Slack only grants new scopes on reinstall — update
+  the app's manifest (or re-import it), then reinstall the app to the workspace
+  and copy the new bot token. (#3206)
+
 ## [0.2.0] — 2026-08-09
 
 The first feature release after launch: a real browser for the agent, four new

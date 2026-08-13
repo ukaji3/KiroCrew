@@ -833,6 +833,77 @@ def stamp_config_meta(data: dict) -> dict:
     }
 
 
+def refresh_config_meta_stamp() -> bool:
+    """Re-stamp ``config.json``'s ``meta`` block when it names another build.
+
+    The stamp is only ever written as a side effect of a config write, so an
+    upgrade that never touches ``config.json`` leaves ``lastTouchedVersion``
+    naming the *previous* build indefinitely. That contradicts the field's
+    documented meaning ("the build that wrote the bytes now on disk") and
+    sends anyone debugging a version question chasing a build that is no
+    longer installed (#3102). Called once per gateway start, off the boot
+    path: a version check on one small file, a rewrite only when it differs.
+
+    Deliberately a plain field refresh, not a migration hook: the stamp is
+    replaced, every other key is preserved, and nothing else changes. When
+    the stored version already matches, the file is not rewritten at all
+    (no mtime churn, no ``lastTouchedAt`` bump).
+
+    The read-modify-write goes through :func:`update_config_locked` — the
+    required path for new ``config.json`` mutations — so the refresh holds
+    the sidecar advisory lock and can never revert a concurrent settings
+    write with its own earlier snapshot. Callers that run while the
+    dashboard serves requests must ALSO hold the in-process asyncio config
+    lock (``_get_config_lock``) around the call, because the legacy writers
+    serialize on that lock alone.
+
+    Best-effort by design — a stale stamp is a diagnostic blemish, never
+    worth failing a boot over. Returns ``True`` when a refresh was written,
+    ``False`` when nothing needed doing (absent/empty file, current stamp)
+    or the file could not be safely read (an unreadable/torn config must
+    never be replaced with a stamped-but-empty one).
+    """
+    path = config_path()
+    if not path.exists():
+        return False
+
+    wrote = False
+
+    def _stamp_if_stale(data: dict) -> dict | None:
+        nonlocal wrote
+        if not data:
+            # Absent or emptied between the exists() check and the lock hold:
+            # there is nothing to refresh, and writing would CREATE a config
+            # holding only a meta block.
+            return None
+        meta = data.get("meta")
+        stored = meta.get("lastTouchedVersion") if isinstance(meta, dict) else None
+        if stored == __version__:
+            return None  # current: skip the write entirely
+        wrote = True
+        return data  # update_config_locked stamps the meta block itself
+
+    try:
+        update_config_locked(path, mutate=_stamp_if_stale)
+    except ConfigReadError:
+        logger.debug(
+            "config meta stamp refresh skipped: %s unreadable; leaving it untouched",
+            path,
+            exc_info=True,
+        )
+        return False
+    except OSError:
+        logger.debug(
+            "config meta stamp refresh failed: could not lock or write %s",
+            path,
+            exc_info=True,
+        )
+        return False
+    if wrote:
+        _invalidate_config_cache()
+    return wrote
+
+
 def workspace_dir_for(workspace: str | None = None) -> Path:
     """Resolve a named workspace to its directory path.
 
@@ -1012,6 +1083,15 @@ class AgentConfig:
     provider: str = field(
         default="acp",
         metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
+    )
+    acp_backend: str = field(
+        default="",
+        metadata=_meta(
+            "ACP Backend",
+            "Which ACP agent to drive. Only '' (kiro-cli) is selectable; the "
+            "'kas' plumbing is present but not yet usable.",
+            enum=[""],
+        ),
     )
     default_agent: str = field(
         default="",
@@ -1229,11 +1309,12 @@ class AgentConfig:
         metadata=_meta(
             "Chat Turn Timeout (secs)",
             "Wall-clock ceiling for one chat turn. This is a runaway backstop, "
-            "so it is clamped to 300s..7200s (2h) and can never be disabled. "
-            "Long babysit and monitoring turns approach the default, so hitting "
-            "it is no longer silent: the turn ends with a visible card naming "
-            "the limit. Values above the ACP transport's own prompt timeout are "
-            "clamped, because the transport bounds the turn first.",
+            "so it is clamped to 300s..86400s (24h) and can never be disabled. "
+            "Raise it above the 2h default for long unattended turns (full test "
+            "suites, long builds); the ACP transport's prompt wait follows it. "
+            "Hitting the ceiling is visible: the turn ends with a card naming "
+            "the limit. For work spanning days, prefer monitor/goal loops — "
+            "they end the turn between cycles and survive restarts.",
         ),
     )
     tool_approval_timeout_secs: int = field(
@@ -1608,6 +1689,18 @@ class MemoryConfig:
     embedding_dim: int = field(
         default=1024,
         metadata=_meta("Embedding Dimension", "Dimensionality of embedding vectors."),
+    )
+    embedding_threads: int = field(
+        default=4,
+        metadata=_meta(
+            "Embedding Threads",
+            "CPU threads llama.cpp may use per embedding call. Left unset, llama.cpp "
+            "sizes its batch pool from the host core count, so even a few-token embed "
+            "fans out across every core and competes with the rest of the gateway. "
+            "Embedding a short query does not need many threads; raise this only if "
+            "bulk re-embedding throughput matters more than interactive latency. "
+            "Clamped to the machine's core count.",
+        ),
     )
     embed_model_url: str = field(
         default="",
@@ -2410,6 +2503,24 @@ class DashboardConfig:
         metadata=_meta(
             "Terminal",
             "Terminal panel configuration. Set enabled=false to hide the CLI panel in the dashboard.",
+            # Declared sub-keys become first-class schema entries
+            # (dashboard.terminal.<key>) so Settings controls can reference
+            # them by configKey. The field stays a plain dict — undeclared
+            # keys (max_sessions, completion.commands, cwd) remain valid via
+            # additionalProperties and round-trip untouched.
+            properties={
+                "shell": {
+                    "type": "string",
+                    "default": "",
+                    "x-meta": {
+                        "label": "Default shell",
+                        "help": (
+                            "Shell the built-in terminal launches — an absolute path or a "
+                            "command on PATH. Empty = the system default ($SHELL)."
+                        ),
+                    },
+                },
+            },
         ),
     )
     default_project: str = field(
@@ -3146,22 +3257,31 @@ SUBAGENT_AUTO_MAX_CEILING = 64  # agent.subagent_auto_max — concurrent subagen
 SUBAGENT_MAX_TURNS_CEILING = 200  # agent.subagent_max_turns — per-subagent turn budget
 POOL_SIZE_MAX = 10  # session.pool_size — pre-warmed process pool
 
-# agent.chat_turn_timeout_secs — wall-clock ceiling for one chat turn. The max
-# matches the ACP transport's own per-prompt timeout (acp/client.py
-# ``_DEFAULT_PROMPT_TIMEOUT``): above it the transport bounds the turn first, so
-# a larger value would advertise a limit the system does not honour. The floor
-# keeps a runaway backstop from being set so low it cuts ordinary work.
+# agent.chat_turn_timeout_secs — wall-clock ceiling for one chat turn. The ACP
+# transport's per-prompt wait follows this value (acp/client.py
+# ``resolve_prompt_timeout``, which adds a margin so the dashboard's visible
+# card fires before the transport cut), so the max is no longer pinned to the
+# transport's 2h default. It is bounded at 24h because the ceiling is a runaway
+# backstop, not a scheduler: a single prompt→response turn longer than a day is
+# pathological, and multi-day unattended operation belongs to the loop
+# mechanisms (monitor/goal loops, crons), which end the turn between cycles and
+# survive restarts — a marathon turn does not. The floor keeps the backstop
+# from being set so low it cuts ordinary work.
 CHAT_TURN_TIMEOUT_MIN = 300
-CHAT_TURN_TIMEOUT_MAX = 7200
+CHAT_TURN_TIMEOUT_MAX = 86400
 
 # agent.tool_approval_timeout_secs — how long a chat turn parks waiting for a
 # human to answer a tool-approval prompt. The floor keeps the window long enough
-# for a human who is actually present to reach the dashboard; the ceiling is the
-# turn ceiling, but the binding limit is the cross-field clamp in
+# for a human who is actually present to reach the dashboard. The max is pinned
+# at 7200 and deliberately DECOUPLED from CHAT_TURN_TIMEOUT_MAX (24h): the
+# approval suites hold their own flat 2h runtime window
+# (``DashboardState._APPROVAL_TIMEOUT``), so a larger configured window would
+# pass validation here and then silently never be honoured at runtime. The
+# binding limit below the static max is the cross-field clamp in
 # ``_clamp_security_bounds``, which pulls the window APPROVAL_TURN_MARGIN_SECS
 # under the configured turn ceiling.
 TOOL_APPROVAL_TIMEOUT_MIN = 30
-TOOL_APPROVAL_TIMEOUT_MAX = CHAT_TURN_TIMEOUT_MAX
+TOOL_APPROVAL_TIMEOUT_MAX = 7200
 
 # The turn ceiling assumed when config omits ``agent.chat_turn_timeout_secs``.
 # Read from the dataclass default so the two cannot drift apart.
@@ -3531,6 +3651,41 @@ def _normalize_jail(value: object) -> str:
     if isinstance(value, str) and value in _VALID_JAIL_MODES:
         return value
     return JAIL_MODE_AUTO
+
+
+def _normalize_acp_backend(value: object) -> str:
+    """Coerce a persisted ``agent.acp_backend`` to a selectable backend.
+
+    Anything not selectable — an unknown value, or a backend the code understands
+    but cannot yet serve a session with — normalizes to the default (kiro-cli)
+    with a warning rather than propagating: ``AcpProvider`` rejects an unknown
+    backend by raising, and a value that is merely incomplete would instead fail
+    on the operator's first message. Both must degrade to the working default at
+    startup, with the reason in the log.
+
+    The import is deferred because it cannot be done at module scope: reaching
+    ``kiro_crew.acp.types`` executes the ``kiro_crew.acp`` package init, which
+    imports the ACP client and runtime, which import this module — and this
+    module is imported first by the gateway and desktop entrypoints.
+    """
+    from kiro_crew.acp.types import (
+        ACP_BACKEND_KIRO,
+        ACP_BACKENDS_KNOWN,
+        ACP_BACKENDS_SELECTABLE,
+    )
+
+    if isinstance(value, str) and value in ACP_BACKENDS_SELECTABLE:
+        return value
+    if value not in (None, ""):
+        known_but_unusable = isinstance(value, str) and value in ACP_BACKENDS_KNOWN
+        logger.warning(
+            "Ignoring agent.acp_backend %r (%s); using the default backend. "
+            "Selectable values: %s",
+            value,
+            "not usable yet" if known_but_unusable else "unknown",
+            ", ".join(repr(b) for b in sorted(ACP_BACKENDS_SELECTABLE)),
+        )
+    return ACP_BACKEND_KIRO
 
 
 def _validate_activation(value: str) -> str:
@@ -5433,6 +5588,7 @@ class KiroCrewConfig:
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
+                acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
@@ -5597,6 +5753,7 @@ class KiroCrewConfig:
                     memory_data.get("embedding_provider", "llama_cpp")
                 ),
                 embedding_dim=memory_data.get("embedding_dim", 1024),
+                embedding_threads=_safe_int(memory_data.get("embedding_threads", 4), 4, 1, 256),
                 embed_model_url=memory_data.get("embed_model_url", ""),
                 embed_model_path=memory_data.get("embed_model_path", ""),
                 embed_model_id=memory_data.get("embed_model_id", ""),
@@ -6479,6 +6636,7 @@ class KiroCrewConfig:
                 session_key=session_key,
                 channel_id=channel_id,
                 extra_env=extra_env,
+                acp_backend=self.agent.acp_backend,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
                 mcp_gateway_overlay=_gw_overlay,

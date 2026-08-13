@@ -3884,13 +3884,17 @@
         },
         "settingsModal": {
           "cancel": "取消",
+          "default_keeps_the_model_your_chat_agent_resolves": "默认沿用聊天代理当前解析到的模型。所选模型对更改后启动的 spec 会话生效——进行中的 spec 会继续使用其当前模型。",
           "empty_keep_specs_with_each_project_recommended": "留空 = 将 spec 保存在各自的项目中（推荐）",
           "leave_this_empty_to_keep_specs_inside_each_proje": "留空即可将 spec 保存在每个项目内部（代码旁的 .kiro/specs 文件夹，这是 Kiro 的标准做法）。或者设置一个文件夹路径，把所有 spec 集中存放。",
+          "model_default_inherit": "默认（继承）",
           "save": "保存",
           "saving": "正在保存…",
           "settings": "设置",
+          "spec_generation_model": "spec 生成模型",
           "spec_storage_folder_path": "spec 存放文件夹路径",
-          "where_should_specs_be_saved": "spec 应保存在哪里？"
+          "where_should_specs_be_saved": "spec 应保存在哪里？",
+          "which_model_should_run_spec_generation": "应由哪个模型运行 spec 生成？"
         },
         "shimmer": {
           "loading_specs": "正在加载 spec…",
@@ -4592,6 +4596,9 @@
     "commandPalette": {
       "clear_filter": "清除筛选",
       "close": "关闭",
+      "min_query_chars": "输入至少 {{min}} 个字符以搜索{{scope}}",
+      "no_matches": "无匹配项",
+      "no_recent_sessions": "无最近会话",
       "no_scope": "无{{scope}}",
       "pinned": "已置顶",
       "providers": {
@@ -4630,6 +4637,7 @@
         },
         "recentsProvider": {
           "approve": "批准",
+          "answer": "回答",
           "current": "当前",
           "new_session": "新建会话…",
           "older_sessions": "较早的会话",
@@ -4774,6 +4782,11 @@
     "detailPanel": {
       "close_panel": "关闭面板",
       "resize_panel": "调整面板大小"
+    },
+    "diagramLightbox": {
+      "close": "关闭",
+      "diagram_viewer": "图表查看器",
+      "enlarge_diagram": "放大图表"
     },
     "dialog": {
       "close": "关闭"
@@ -6361,6 +6374,18 @@
       "verdict_tap_noop": "这是一次快速点按 —— 在“{{mode}}”模式下不会发生任何事。请按住久一点。",
       "verdict_toggle": "识别正确 —— 在真实对话里，这次按下会开始录音，下一次按下会停止。",
       "verdict_wrong_key": "刚才那个是 {{got}}，不是你在上面选的 {{want}}。如果这块键盘没有那颗键，就在“{{field}}”里换一个。"
+    },
+    "gitPanel": {
+      "changes": "更改",
+      "clean": "干净",
+      "commits": "提交",
+      "empty_state": "没有可显示的更改或提交。",
+      "just_now": "刚刚",
+      "loading": "加载中…",
+      "no_project": "此会话未设置项目文件夹。",
+      "refresh": "刷新",
+      "title": "Git",
+      "uncommitted": "{{count}} 个未提交"
     }
   },
   "hooks": {
@@ -6419,7 +6444,8 @@
       "logs": "日志",
       "side": "旁支",
       "subagents": "子代理",
-      "workflows": "工作流"
+      "workflows": "工作流",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "所有槽位都已占用",
@@ -6758,7 +6784,8 @@
       "update_all": "全部更新",
       "update_other": "{{count}} 项更新",
       "updating_progress": "正在更新 {{done}}/{{total}}…",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "已安装 {{name}}。在下方打开开关即可启用。"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",
@@ -7312,6 +7339,7 @@
         "steered": "已引导",
         "switch_to_raw_markdown_view": "切换到原始 Markdown 视图",
         "switch_to_rendered_view": "切换到渲染视图",
+        "turn_model": "模型：{{model}}",
         "turn_took": "本轮次耗时 {{elapsed}}",
         "turn_took_cost": "本轮次耗时 {{elapsed}}（API 成本 {{cost}}）",
         "turn_took_credits": "本轮次耗时 {{elapsed}}，消耗 {{credits}} 额度",
@@ -7489,7 +7517,9 @@
         "switch_to_split_view": "切换到并排视图",
         "switch_to_unified_view": "切换到统一视图",
         "this_app_render_is_no_longer_available": "此应用渲染已不可用。请重新运行工具以查看。",
-        "turn_diff": "本轮差异"
+        "turn_diff": "本轮差异",
+        "menu_git": "Git",
+        "menu_git_desc": "分支、更改和最近的提交"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "停止失败，会话已重置",
@@ -7813,6 +7843,8 @@
       "more_pull_request_or_issue_in_this_session_other": "此会话中还有 {{count}} 个拉取请求或 issue",
       "move_folder_to": "将文件夹移到",
       "needs_approval": "需要审批",
+      "needs_your_answer": "需要你回答",
+      "waiting_on_your_choice": "等待你选择",
       "new": "新建",
       "new_autopilot_chat": "新建自动驾驶聊天",
       "new_chat": "新建对话",
@@ -10081,9 +10113,16 @@
         "terminal_font_family_desc": "内置终端的字体。请输入你电脑上已安装的 monospace 字体——使用 Nerd Font 可渲染 Powerline 和提示符主题字形。",
         "terminal_font_size": "字号",
         "terminal_font_size_desc": "内置终端中的文字大小，以像素为单位。",
+        "terminal_shell": "默认 Shell",
+        "terminal_shell_desc": "内置终端启动的 Shell——绝对路径或 PATH 中的命令。留空则使用系统默认值（$SHELL）。",
+        "terminal_shell_not_executable": "不是可执行的 Shell——请输入绝对路径或 PATH 中的命令，或留空以使用系统默认值。",
+        "terminal_shell_save_failed": "无法保存 Shell 设置",
         "theme": "主题",
         "theme_source": "主题来源",
         "theme_source_location": "主题来源位置",
+        "theme_styles_ignored_body": "它们使用了主题不允许修改的 CSS，因此 Kiro Crew 跳过了这些规则。如果这个主题由你制作，请在 theme.json 的 fonts 列表中声明字体，让其余规则仅作用于允许区域，然后重新安装。",
+        "theme_styles_ignored_link": "主题制作指南",
+        "theme_styles_ignored_title": "此主题的部分样式已被忽略",
         "ui_font_family_for_the_dashboard_code_font_follo": "仪表板的界面字体。代码字体跟随当前主题。",
         "use_your_browser_s_zoom_your_browser_remembers_i": "使用浏览器自带的缩放，浏览器会为本站点记住此设置。浏览器会为此站点记住此设置。",
         "view": "视图",
@@ -11004,6 +11043,7 @@
       "per_turn_col": "每轮",
       "phase_col": "阶段",
       "priciest_turn": "最贵的一轮",
+      "prior_credits_turns": "额度 {{credits}} · 轮次 {{turns}}",
       "profile_scaled_per_row": "对数刻度，每条按自身 min–max 归一化 —— 条形显示该仪表的长尾，而非它与其他仪表的量级对比",
       "range_bar_label": "min {{min}}，p50 {{p50}}，p90 {{p90}}，max {{max}}",
       "sample_count": "n={{count}}",
@@ -11031,6 +11071,7 @@
       "turn_latency_p50": "轮次延迟（p50）",
       "turns_col": "轮次",
       "turns_measured_other": "已统计 {{n}} 个轮次",
+      "turns_to_compaction_other": "{{n}} 个轮次",
       "untitled_conversation_on": "未命名 · {{date}}",
       "used_tokens_col": "已用（tokens）",
       "vs_previous_period": "对比上一周期",

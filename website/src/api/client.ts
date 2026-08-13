@@ -1561,6 +1561,8 @@ export const api = {
   browseDirs: (path?: string) => fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
   browseFiles: (path?: string) => fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string; mtime: number }[]; files: { name: string; path: string; mtime: number }[] }>,
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
+  projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
+  projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -1922,14 +1924,23 @@ export const api = {
   approvals: (): Promise<{ id: string; source?: string; tool?: string; tool_input?: string; tool_call_id?: string; slot?: string; ts?: number }[]> => fetch('/api/approvals').then(j),
   resolveApproval: (id: string, action: 'approve' | 'reject') => post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
   /** Question cards still awaiting an answer, for rehydration after a reload or
-   *  websocket reconnect (`question_card` is a one-shot broadcast). */
-  pendingQuestions: (): Promise<{ ask_id: string; slot: string; questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[]; ts?: number }[]> =>
+   *  websocket reconnect (`question_card` is a one-shot broadcast). A blocking
+   *  ask carries `ask_id`; a stateless card carries `card_id` instead. */
+  pendingQuestions: (): Promise<{ ask_id?: string; card_id?: string; slot: string; questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[]; ts?: number }[]> =>
     fetch('/api/ask-question/pending').then(j),
   /** Resolve a pending agent question (ask_question MCP tool). Pass no answers
    *  to dismiss, which unblocks the agent with a timeout-equivalent result. */
   answerQuestion: (askId: string, answers?: Record<string, string>) =>
     post('/api/ask-question/' + encodeURIComponent(askId) + '/answer',
       answers ? { answers } : { dismissed: true }).then(j),
+  /** Retire the slot's needs-input status for a STATELESS card (no `ask_id`),
+   *  which blocks nothing and is otherwise removed client-side only — leaving
+   *  the sidebar and sessions board claiming the agent is still waiting.
+   *  `cardId` is the server-minted identity from the `question_card` payload:
+   *  the dismissal is a round-trip, so a newer card can replace this one before
+   *  it lands, and the server refuses rather than retiring the wrong ask. */
+  dismissQuestionCard: (slot: string, cardId: string) =>
+    post('/api/ask-question/dismiss', { slot, card_id: cardId }).then(j),
   // Logs
   logLevel: () => fetch('/api/logs/level').then(j),
   setLogLevel: (level: string) => post('/api/logs/level', { level }).then(j),
@@ -2125,7 +2136,7 @@ export const api = {
   // narrows it to its own local RegistryApp shape at the call site. Typing it as
   // unknown[] here would break those structural assignments across files.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string } }>,
+  listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
   listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string }[] }>,
   updateRegistries: (registries: { name: string; repo: string; branch: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string }[]; newlyTrustedHosts: string[] }>,
   refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean }[]; apps: number; lastSyncedAt: string }>,

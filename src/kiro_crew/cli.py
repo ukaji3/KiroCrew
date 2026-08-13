@@ -331,7 +331,7 @@ def _install_child_watcher() -> None:
     for tens of seconds.  PidfdChildWatcher uses a single epoll fd (no extra
     threads) and is immune to this.  On macOS (no pidfd syscall) we install
     SafeChildWatcher instead -- a single SIGCHLD handler, also free of the
-    thread-per-child storm (the _node_version_manager_bins lru_cache only
+    thread-per-child storm (the node_all_bin_dirs lru_cache only
     shrank the surface; the reaper storm itself remained on the default
     watcher).
 
@@ -1155,6 +1155,13 @@ Examples:
     cron_update.add_argument("--name", help="New job name")
     cron_update.add_argument("--message", help="New message")
     cron_update.add_argument("--every", type=int, dest="every_secs", help="New interval in seconds")
+    cron_update.add_argument(
+        "--timeout-secs",
+        type=int,
+        dest="timeout_secs",
+        default=None,
+        help="Per-wake execution budget in seconds (1..86400, default 1800)",
+    )
     cron_update.add_argument("--cron", dest="cron_expr", help="New cron expression")
     cron_update.add_argument("--channel", help="New channel ID")
     cron_update.add_argument(

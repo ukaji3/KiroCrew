@@ -4008,13 +4008,17 @@
         },
         "settingsModal": {
           "cancel": "Annulla",
+          "default_keeps_the_model_your_chat_agent_resolves": "Predefinito mantiene il modello già risolto dal tuo agente di chat. Una scelta vale per le sessioni di spec avviate dopo la modifica — una spec in corso mantiene il modello attuale.",
           "empty_keep_specs_with_each_project_recommended": "Vuoto = mantieni le spec insieme a ciascun progetto (consigliato)",
           "leave_this_empty_to_keep_specs_inside_each_proje": "Lascia vuoto per mantenere le spec all'interno di ciascun progetto (una cartella .kiro/specs accanto al codice: lo standard di Kiro). Oppure indica il percorso di una cartella per raccogliere tutte le spec in un unico posto.",
+          "model_default_inherit": "Predefinito (eredita)",
           "save": "Salva",
           "saving": "Salvataggio…",
           "settings": "Impostazioni",
+          "spec_generation_model": "Modello per la generazione delle spec",
           "spec_storage_folder_path": "Percorso della cartella di archiviazione delle spec",
-          "where_should_specs_be_saved": "Dove salvare le spec?"
+          "where_should_specs_be_saved": "Dove salvare le spec?",
+          "which_model_should_run_spec_generation": "Quale modello deve eseguire la generazione delle spec?"
         },
         "shimmer": {
           "loading_specs": "Caricamento delle spec…",
@@ -4738,6 +4742,9 @@
     "commandPalette": {
       "clear_filter": "Cancella filtro",
       "close": "Chiudi",
+      "min_query_chars": "Digita almeno {{min}} caratteri per cercare {{scope}}",
+      "no_matches": "Nessuna corrispondenza",
+      "no_recent_sessions": "Nessuna sessione recente",
       "no_scope": "Nessun {{scope}}",
       "pinned": "Fissata",
       "providers": {
@@ -4776,6 +4783,7 @@
         },
         "recentsProvider": {
           "approve": "Approva",
+          "answer": "Rispondi",
           "current": "Corrente",
           "new_session": "Nuova sessione…",
           "older_sessions": "Sessioni più vecchie",
@@ -4924,6 +4932,11 @@
     "detailPanel": {
       "close_panel": "Chiudi il pannello",
       "resize_panel": "Ridimensiona il pannello"
+    },
+    "diagramLightbox": {
+      "close": "Chiudi",
+      "diagram_viewer": "Visualizzatore di diagrammi",
+      "enlarge_diagram": "Ingrandisci diagramma"
     },
     "dialog": {
       "close": "Chiudi"
@@ -6535,6 +6548,18 @@
       "verdict_tap_noop": "Questo è stato un tocco rapido — in modalità «{{mode}}» non succederebbe nulla. Tieni premuto più a lungo.",
       "verdict_toggle": "Riconosciuto — in una chat reale questa pressione avvierebbe la registrazione e la successiva la fermerebbe.",
       "verdict_wrong_key": "Quello era {{got}}, non il {{want}} scelto sopra. Se questa tastiera non lo ha, scegline un altro in «{{field}}»."
+    },
+    "gitPanel": {
+      "changes": "Modifiche",
+      "clean": "pulito",
+      "commits": "Commit",
+      "empty_state": "Nessuna modifica o commit da mostrare.",
+      "just_now": "proprio ora",
+      "loading": "caricamento...",
+      "no_project": "Nessuna cartella di progetto impostata per questa sessione.",
+      "refresh": "Aggiorna",
+      "title": "Git",
+      "uncommitted": "{{count}} non committati"
     }
   },
   "hooks": {
@@ -6593,7 +6618,8 @@
       "logs": "Log",
       "side": "Laterale",
       "subagents": "Subagenti",
-      "workflows": "Workflow"
+      "workflows": "Workflow",
+      "git": "Git"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "Tutti gli slot sono occupati",
@@ -6946,7 +6972,8 @@
       "update_one": "{{count}} aggiornamento",
       "update_other": "{{count}} aggiornamenti",
       "updating_progress": "Aggiornamento {{done}}/{{total}}…",
-      "v": "v"
+      "v": "v",
+      "installed_app_find_in_library_and_enable": "{{name}} installato. Attivalo qui sotto per abilitarlo."
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/mese",
@@ -7510,6 +7537,7 @@
         "steered": "Indirizzato",
         "switch_to_raw_markdown_view": "Passa alla vista del Markdown grezzo",
         "switch_to_rendered_view": "Passa alla vista formattata",
+        "turn_model": "modello: {{model}}",
         "turn_took": "Il turno ha richiesto {{elapsed}}",
         "turn_took_cost": "Il turno ha richiesto {{elapsed}} ({{cost}} di costo API)",
         "turn_took_credits": "Il turno ha richiesto {{elapsed}} e ha consumato {{credits}} crediti",
@@ -7691,7 +7719,9 @@
         "switch_to_split_view": "Passa alla vista divisa",
         "switch_to_unified_view": "Passa alla vista unificata",
         "this_app_render_is_no_longer_available": "Questo rendering dell'app non è più disponibile. Esegui di nuovo lo strumento per visualizzarlo.",
-        "turn_diff": "Diff del turno"
+        "turn_diff": "Diff del turno",
+        "menu_git": "Git",
+        "menu_git_desc": "Branch, modifiche e commit recenti"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "Arresto non riuscito, sessione reimpostata",
@@ -8023,6 +8053,8 @@
       "more_pull_request_or_issue_in_this_session_other": "{{count}} altre pull request o issue in questa sessione",
       "move_folder_to": "Sposta la cartella in",
       "needs_approval": "Richiede approvazione",
+      "needs_your_answer": "Richiede la tua risposta",
+      "waiting_on_your_choice": "In attesa della tua scelta",
       "new": "Nuova",
       "new_autopilot_chat": "Nuova chat con pilota automatico",
       "new_chat": "Nuova chat",
@@ -10319,9 +10351,16 @@
         "terminal_font_family_desc": "Carattere del terminale integrato. Inserisci un carattere monospace installato sul tuo computer; usa una Nerd Font per visualizzare i glifi di Powerline e dei temi del prompt.",
         "terminal_font_size": "Dimensione del carattere",
         "terminal_font_size_desc": "Dimensione del testo nel terminale integrato, misurata in pixel.",
+        "terminal_shell": "Shell predefinita",
+        "terminal_shell_desc": "Shell avviata dal terminale integrato: un percorso assoluto o un comando nel PATH. Lascia vuoto per usare il valore predefinito di sistema ($SHELL).",
+        "terminal_shell_not_executable": "Non è una shell eseguibile: inserisci un percorso assoluto o un comando nel PATH, oppure lascia vuoto per il valore predefinito di sistema.",
+        "terminal_shell_save_failed": "Impossibile salvare l'impostazione della shell",
         "theme": "Tema",
         "theme_source": "Origine del tema",
         "theme_source_location": "Posizione dell'origine del tema",
+        "theme_styles_ignored_body": "Usano CSS che i temi non possono modificare, quindi Kiro Crew li ha saltati. Se questo tema è tuo, dichiara i font nell'elenco fonts di theme.json, limita le altre regole alle superfici consentite e reinstallalo.",
+        "theme_styles_ignored_link": "Guida ai temi",
+        "theme_styles_ignored_title": "Alcuni stili di questo tema sono stati ignorati",
         "ui_font_family_for_the_dashboard_code_font_follo": "Famiglia di caratteri dell'interfaccia per la dashboard. Il carattere del codice segue il tema attivo.",
         "use_your_browser_s_zoom_your_browser_remembers_i": "Usa lo zoom del browser. Il browser lo ricorda per questo sito.",
         "view": "Vista",
@@ -11244,6 +11283,7 @@
       "per_turn_col": "Per turno",
       "phase_col": "Fase",
       "priciest_turn": "Turno più costoso",
+      "prior_credits_turns": "crediti {{credits}} · turni {{turns}}",
       "profile_scaled_per_row": "Scala logaritmica, ogni profilo sul proprio min–max: la barra mostra la coda di quello strumento, non la sua dimensione rispetto agli altri",
       "range_bar_label": "min {{min}}, p50 {{p50}}, p90 {{p90}}, max {{max}}",
       "sample_count": "n={{count}}",
@@ -11277,6 +11317,9 @@
       "turns_measured_many": "{{n}} turni misurati",
       "turns_measured_one": "{{n}} turno misurato",
       "turns_measured_other": "{{n}} turni misurati",
+      "turns_to_compaction_many": "{{n}} turni",
+      "turns_to_compaction_one": "{{n}} turno",
+      "turns_to_compaction_other": "{{n}} turni",
       "untitled_conversation_on": "Senza titolo · {{date}}",
       "used_tokens_col": "Usati (token)",
       "vs_previous_period": "rispetto al periodo precedente",

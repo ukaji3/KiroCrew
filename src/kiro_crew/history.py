@@ -27,6 +27,7 @@ from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect, stream_and_collect_json
 from kiro_crew.messaging.link import legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
@@ -385,6 +386,19 @@ def _on_loop_persist_strict() -> bool:
 
 _ON_LOOP_TRUTHY = frozenset({"1", "true", "yes", "on"})
 _ON_LOOP_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def on_loop_persist_strict() -> bool:
+    """Public alias of :func:`_on_loop_persist_strict` for other modules.
+
+    The strictness knob (``KIROCREW_STRICT_ON_LOOP_PERSIST`` /
+    ``KIROCREW_DEV_MODE``) governs the on-loop persistence discipline for every
+    store, not just this module's conversation log; consumers that enforce the
+    same offload rule on their own SQLite databases (e.g. the auto_research
+    campaigns DB) read the shared setting through this alias instead of
+    importing a private name.
+    """
+    return _on_loop_persist_strict()
 
 
 def _check_on_loop_persist_discipline(key: str) -> None:
@@ -4069,16 +4083,22 @@ _TOOL_ROLES: frozenset[str] = frozenset({"tool", "tool_call", "tool_result"})
 
 
 def _frontmatter_value(text: str | None, key: str) -> str:
-    """Return a single-line frontmatter value from a SKILL.md body, or ""."""
+    """Return *key*'s frontmatter value from a SKILL.md body, or "".
+
+    Values resolve the way ``SkillsLoader._parse_frontmatter`` resolves them:
+    only a column-0 key is a field, and a bare block-scalar indicator
+    (``>``/``|``, optionally chomped) folds the indented lines that follow.
+    The auto-skill update path carries the live skill's ``description`` and
+    ``triggers`` through this reader into a staged candidate that overwrites
+    the live skill on approval — reading the indicator verbatim would collapse
+    a block-scalar description to ``""`` and inject a bogus ``>`` trigger on
+    that round-trip. The grammar (plus the leading-whitespace opener
+    tolerance, verbatim plain values, and first-duplicate-wins lookup) is
+    pinned as ``frontmatter.SKILL_UPDATE``.
+    """
     if not text:
         return ""
-    m = re.match(r"^\s*---\n(.*?)\n---", text, re.DOTALL)
-    if not m:
-        return ""
-    for ln in m.group(1).split("\n"):
-        if ":" in ln and ln.split(":", 1)[0].strip() == key:
-            return ln.split(":", 1)[1].strip()
-    return ""
+    return frontmatter_value(text, key, SKILL_UPDATE)
 
 
 def _merge_trigger_lists(live: str, candidate: str, *, cap: int = 12) -> str:
@@ -4113,7 +4133,9 @@ def _strip_skill_frontmatter(text: str | None) -> str:
     A skill body read off disk carries its frontmatter header; only the prose
     below it may be fed to (or accepted from) the update-merge turn, because
     ``stage_skill_candidate`` re-emits frontmatter of its own. Text without a
-    leading block is returned unchanged (stripped).
+    leading block is returned unchanged (stripped). A fence LOCATOR, not a
+    field parser — deliberately outside ``kiro_crew.frontmatter``; editing
+    its grammar means revisiting ``_frontmatter_value``'s dialect too.
     """
     if not text:
         return ""

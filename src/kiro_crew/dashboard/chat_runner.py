@@ -104,6 +104,7 @@ from kiro_crew.dashboard.handlers.usage import (
     persist_token_record_async,
     read_context_tokens,
     read_effective_agent,
+    read_effective_model,
 )
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.dashboard.state import (
@@ -947,6 +948,7 @@ def _attach_turn_stats(
     credits: float,
     cost_usd: float,
     turn_boundary: int = 0,
+    model: str = "",
 ) -> None:
     """Attach per-turn stats to the last assistant message's meta.
 
@@ -956,8 +958,11 @@ def _attach_turn_stats(
 
     ``elapsed_ms`` is the turn wall clock (or the provider-reported duration
     when available); ``credits`` is kiro-cli's per-turn ``meteringUsage`` sum;
-    ``cost_usd`` is claude_code's API-reported cost. Zero fields are omitted so
-    the frontend renders only what the provider actually bills in.
+    ``cost_usd`` is claude_code's API-reported cost. ``model`` is the id the
+    backend actually served this turn (``read_effective_model``) — on the
+    ``auto`` path this is the disclosure of what auto resolved to, on a pinned
+    session it is confirmation. Zero/empty fields are omitted so the frontend
+    renders only what the provider actually reported.
 
     ``turn_boundary`` is ``len(slot.messages)`` captured at turn start: only
     messages appended DURING this turn are candidates. Without it, an
@@ -973,6 +978,8 @@ def _attach_turn_stats(
         stats["credits"] = round(credits, 4)
     if cost_usd > 0:
         stats["cost_usd"] = round(cost_usd, 6)
+    if model:
+        stats["model"] = model
     boundary = max(0, turn_boundary)
     for m in reversed(slot.messages[boundary:]):
         if m.get("role") == "assistant":
@@ -2897,6 +2904,11 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     # (they drain one at a time and break any user-message merge), so this only
     # fires on the shape it was computed for.
     _row_meta = consumed[0].get("meta") if (is_subagent and len(consumed) == 1) else None
+    # When synthesis is pending, mark the completion so the frontend can collapse
+    # the per-completion assistant response that follows (it will be restated by
+    # the synthesis turn).
+    if is_subagent and slot._pending_synthesis and isinstance(_row_meta, dict):
+        _row_meta = {**_row_meta, "synthesisPending": True}
     slot.append(
         "subagent" if is_subagent else "inject" if (is_cron or is_recovery) else "user",
         next_msg,
@@ -4171,6 +4183,7 @@ async def _run_chat(
         _turn_elapsed_ms = 0
         _turn_credits = 0.0
         _turn_cost_usd = 0.0
+        _turn_model = ""
         _turn_msg_boundary = len(slot.messages)
 
         # Lease-dispatch race gate: this session's semaphore lease
@@ -5582,6 +5595,12 @@ async def _run_chat(
                     _turn_cost_usd = float(_u.cost_usd or 0.0)
                 except (TypeError, ValueError):
                     _turn_elapsed_ms = int((time.monotonic() - _turn_t0) * 1000)
+                # Resolved model for the footer: the id the backend actually
+                # served this turn. read_effective_model prefers
+                # _resolved_model_id over _model, skips the "auto" sentinel,
+                # and never raises — an unresolved auto turn stays "" and the
+                # footer omits the field rather than guessing.
+                _turn_model = read_effective_model(client)
                 if _u.input_tokens or _u.output_tokens or _u.credits:
                     try:
                         _provider_name = cfg.agent.provider  # type: ignore[possibly-undefined]
@@ -6035,6 +6054,7 @@ async def _run_chat(
                 _turn_credits,
                 _turn_cost_usd,
                 turn_boundary=_turn_msg_boundary,
+                model=_turn_model,
             )
             # Attach accumulated file changes to last assistant message before persist
             _flush_file_changes(slot)
