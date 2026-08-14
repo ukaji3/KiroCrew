@@ -437,12 +437,12 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # ── Sweep orphaned permissions from prior turns ──
     _sweep_stale_permissions(slot)
 
-    # No per-message browse marker: Browser Mode is a capability, not a per-turn
-    # gate. When it is on the `browser_*` MCP tools are registered and present in
-    # the agent's tool list; when it is off they are not. The agent itself decides
-    # whether to operate a browser or read with web_fetch (the system prompt and
-    # the kirocrew-commands / web-browse skills tell it how), so the backend
-    # injects nothing here.
+    # No per-message browse marker: browsing is a capability, not a per-turn
+    # gate. The agent drives a browser by running `playwright-cli` shell
+    # commands, so the capability is simply whether that binary is on PATH. The
+    # agent itself decides whether to operate a browser or read with web_fetch
+    # (the system prompt and the kirocrew-commands / web-browse skills tell it
+    # how), so the backend injects nothing here.
     slot.append("user", message, "msg msg-u", meta=_redact_meta(user_meta) if user_meta else None)
 
     # Note: untitled slots display as "New Session…" via _ChatSlot.display_title
@@ -1930,10 +1930,13 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         raise
     queue_id = body.get("queue_id")
     if queue_id:
-        for i, item in enumerate(slot._queue):
-            if item.get("queue_id") == queue_id:
-                slot._queue.insert(0, slot._queue.pop(i))
-                break
+        # Wire-side field is `queue_id`; stored items carry `id` (the key
+        # queue_append/queue_insert write and every *_by_id helper matches).
+        # The previous inline loop compared item.get("queue_id"), which is
+        # None on every production item — a silent no-op that made the
+        # "run this next" click land on whatever happened to be at the
+        # front of the queue instead of the selected message.
+        slot.queue_promote_by_id(queue_id)
 
     # Stop current turn but preserve the queue so dequeue loop fires
     # (soft_pending already claimed above, before the request-body await)
@@ -2583,10 +2586,16 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         _sync_dashboard_slots(state)
         state.push_slots_update()
         state.push_refresh("history")
+    if not failed:
+        cleanup_outcome = "ok"
+    elif archived:
+        cleanup_outcome = "partial"
+    else:
+        cleanup_outcome = "error"
     sel().log_api_access(
         caller="dashboard",
         operation="chat.slots_cleanup",
-        outcome="ok" if not failed else ("partial" if archived else "error"),
+        outcome=cleanup_outcome,
         source="dashboard",
         resources=f"archived={len(archived)} failed={len(failed)} threshold={max_days}d keys={','.join(archived[:10])}",
     )

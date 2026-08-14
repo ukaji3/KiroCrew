@@ -26,6 +26,8 @@ from kiro_crew.cron import CronJob, CronSchedule, CronStoreBusy
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import NO_EXPIRY_TEXT, fmt_grant_duration
 from kiro_crew.slack import handler as h
+from kiro_crew.task_models import Project, Task, TaskStatus
+from kiro_crew.task_reporter import build_status
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -84,6 +86,7 @@ def sessions():
     sm = MagicMock()
     sm.remove = AsyncMock()
     sm.destroy = AsyncMock()
+    sm.discard_conversation = AsyncMock()
     sm.stop_turn = AsyncMock(return_value="soft")
     sm.try_acquire = AsyncMock(return_value=False)
     sm.has_session = MagicMock(return_value=False)
@@ -106,6 +109,39 @@ def _reply(value: str | None) -> str:
     """Assert a handler returned a reply and narrow it to ``str``."""
     assert value is not None
     return value
+
+
+class _LiveTask:
+    """Stand-in for an in-flight asyncio task; ``build_status`` only calls done()."""
+
+    @staticmethod
+    def done() -> bool:
+        return False
+
+
+def _running_status(*, completed: int = 2, total: int = 5, current: int = 3) -> dict:
+    """A real ``build_status()`` payload for one in-flight run.
+
+    Built from real ``Project``/``Task`` objects instead of hand-written keys:
+    progress lives per run inside ``runs``, and there is no top-level
+    ``completed``/``steps``/``current_step``. Asserting against an invented
+    top-level shape is what let a renderer read fields the payload never
+    carries.
+    """
+    statuses = [TaskStatus.PASSED] * completed + [TaskStatus.PENDING] * (total - completed)
+    run = Project(
+        spec_path="/tmp/spec.md",
+        spec_content="",
+        task_id="live",
+        name="Live Task",
+        status="executing",
+        current_task=current,
+        tasks=[
+            Task(index=i + 1, title=f"t{i + 1}", description="", status=s)
+            for i, s in enumerate(statuses)
+        ],
+    )
+    return build_status({"live": run}, {"live": _LiveTask()}, "kirocrew")
 
 
 async def _slash(cmd, slack_client, sessions_double, *, user="U1", log=None, session="t1"):
@@ -841,13 +877,7 @@ class TestRunHelper:
     @pytest.mark.asyncio
     async def test_status_when_running(self, slack):
         runner = MagicMock(running=True)
-        runner.status.return_value = {
-            "running": True,
-            "status": "executing",
-            "completed": 2,
-            "steps": 5,
-            "current_step": 3,
-        }
+        runner.status.return_value = _running_status()
         out = _reply(await h._handle_run_command("task run status", runner, slack, "C", "t"))
         assert "2/5" in out and "executing" in out
 
@@ -1980,11 +2010,18 @@ class TestCompactCommand:
         assert "Compaction timed out." in _texts(slack)
 
     @pytest.mark.asyncio
-    async def test_exception_destroys_the_session(self, slack, sessions):
+    async def test_exception_discards_the_conversation(self, slack, sessions):
+        """The wedged conversation goes; the session's channel identity stays.
+
+        ``discard_conversation`` shuts the provider down and drops the resume
+        sid exactly like ``destroy``, but keeps the session-map entry that
+        carries the thread linkage.
+        """
         provider = MagicMock()
         provider.compact = AsyncMock(side_effect=RuntimeError("stdio died"))
         sessions.try_acquire = AsyncMock(return_value=True)
         sessions.get_provider = MagicMock(return_value=provider)
         await h._handle_compact_command(slack, sessions, "C1", "t1", "msg1", "t1")
         assert "Compaction failed unexpectedly." in _texts(slack)
-        sessions.destroy.assert_awaited_once_with("t1")
+        sessions.discard_conversation.assert_awaited_once_with("t1")
+        sessions.destroy.assert_not_awaited()

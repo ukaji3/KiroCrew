@@ -375,11 +375,9 @@ interface Slot {
   // `pending_approval` rides on every ChatSlot payload; the sidebar reads it to
   // suppress the "your turn" dot and show the yellow "Needs approval" subtitle.
   pending_approval?: boolean
-  // The agent asked something and is waiting on the answer — an unanswered
-  // question card, or a turn that ended with an [OPTIONS:] tag. Its own subtitle,
-  // and it suppresses the "your turn" dot for the same reason an approval does.
+  // An unanswered question card the turn is parked on. Its own subtitle, and it
+  // suppresses the "your turn" dot for the same reason an approval does.
   needs_input?: boolean
-  needs_input_reason?: '' | 'question' | 'options'
   mode?: string
   agent?: string
   model?: string  // '' / absent = provider-default ("auto")
@@ -2343,13 +2341,10 @@ function ChatSidebar({
       ? '1 sub-agent needs approval'
       : `${subagentAwaiting} sub-agents need approval`
     const wfActive = workflowActive[s.key]
-    // The agent's own ask, labelled by WHICH ask it is: a question card the user
-    // can still answer in the transcript, versus a turn that ended offering
-    // options. Both mean the session cannot advance until the user replies, so
-    // they share one row and differ only in wording.
-    const needsInputLabel = s.needs_input_reason === 'question'
-      ? i18nT('pages.chatSidebar.needs_your_answer')
-      : i18nT('pages.chatSidebar.waiting_on_your_choice')
+    // The agent's own ask: a question card the user has not answered yet. The
+    // turn is parked on it, so this replaces a "Thinking…" that would otherwise
+    // never change rather than annotating a finished turn.
+    const needsInputLabel = i18nT('pages.chatSidebar.needs_your_answer')
     // Goal loop (auto-nudge). A loop is a MODE, not a turn state, so it is not
     // gated on `s.running` — a looping session spends most of its life mid-turn,
     // and hiding the indicator then would hide it almost always.
@@ -2493,7 +2488,7 @@ function ChatSidebar({
             // A goal loop suppresses it too: the loop appends a turn every cycle,
             // so the dot would light permanently and stop meaning "your turn".
             // The "Loop N/M" subtitle carries the state instead.
-            // An unanswered agent question suppresses it on the same grounds —
+            // An unanswered question card suppresses it on the same grounds —
             // its own info-coloured subtitle says more than a bare dot, and two
             // markers for one state read as two separate things to do.
             <span className="absolute right-1.5 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full pointer-events-none" style={{ background: 'var(--accent)' }} title={i18nT('pages.chatSidebar.agent_finished_your_turn')} />
@@ -2506,20 +2501,21 @@ function ChatSidebar({
               </AnimatePresence>
               {isOut && <span className="text-accent" title={i18nT('pages.chatSidebar.popped_out_to_a_separate_window')}><ExternalLink size={10} /></span>}
               {slotChannelNamespace(s.key) && (() => {
-                // Where this conversation started — and, since the session IS the
-                // conversation rather than a copy of it, still where it is two-way
-                // with: what you type here is delivered to that channel, and what
-                // is sent there arrives here. Same wording as the inbound-link
-                // chip (`components.inboundLinkChip.tooltip`), which states the
-                // same relationship for a session driven from a channel.
+                // PROVENANCE ONLY: where this conversation started. That is
+                // history, so it stays true after the channel is disconnected —
+                // which is exactly why this glyph must not describe delivery.
+                // It previously said the session was "two-way" with the channel
+                // and that replies "are delivered there", a claim the disconnect
+                // makes false while this glyph still renders. Current delivery is
+                // the separate set of glyphs below, which filter on `paused`.
                 //
                 // `unified` gets its own key rather than an interpolated label:
                 // it has no proper noun, and an English article fragment inside
                 // a translated sentence is not something a locale can repair.
                 const ns = slotChannelNamespace(s.key)
                 const label = ns === 'unified'
-                  ? i18nT('pages.chatSidebar.two_way_with_direct_message')
-                  : i18nT('pages.chatSidebar.two_way_with_channel', { channel: slotChannelLabel(s.key) })
+                  ? i18nT('pages.chatSidebar.started_in_direct_message')
+                  : i18nT('pages.chatSidebar.started_in_channel', { channel: slotChannelLabel(s.key) })
                 // Brand mark rather than a generic bubble: the row already tells
                 // you a chat happened, so the only new information this glyph can
                 // carry is WHICH app it came from. Namespaces with no mark of
@@ -2534,17 +2530,26 @@ function ChatSidebar({
               })()}
               {/* Live mirroring, per channel. The origin glyph above is derived
                *  from the slot KEY (channelOrigin.ts) and already says where the
-               *  conversation STARTED, so this renders only `out` links — a real
-               *  mirror target — and never double-badges an origin. It replaces a
+               *  conversation STARTED, so this renders only channels currently
+               *  DELIVERING and never double-badges an origin. It replaces a
                *  `linked_to_slack` Link glyph that fired for ANY channel, because
-               *  every non-Slack transport writes its id into slack_channel_id. */}
+               *  every non-Slack transport writes its id into slack_channel_id.
+               *
+               *  `both` counts as delivering: a two-way binding is strictly MORE
+               *  connected than a one-way mirror, and filtering on `out` alone left
+               *  a session with messages flowing both ways looking unlinked. A
+               *  disconnected channel is excluded — it keeps its direction, so
+               *  without the `paused` check the sidebar promised delivery for a
+               *  session whose own menu one row away reads "Connect to X". */}
               {(s.links ?? [])
-                .filter(link => link.direction === 'out')
+                .filter(link => link.direction !== 'origin' && !link.paused)
                 .map((link, index) => (
                   <span
                     key={`${link.channel}:${link.direction}:${index}`}
                     className="inline-flex text-[10px]"
-                    title={i18nT('pages.chatSidebar.mirroring_to', { label: link.label })}
+                    role="img"
+                    aria-label={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
+                    title={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
                   >
                     <ChannelBrandIcon channel={link.channel} size={10} />
                   </span>
@@ -2604,16 +2609,22 @@ function ChatSidebar({
                 <span className="truncate font-medium" style={{ color: 'var(--warn)' }}>{subagentApprovalLabel}</span>
               </div>
             ) : s.needs_input ? (
-              // The agent asked something and is waiting on the answer. Ranked
-              // above every "working" signal for the same reason the approval
-              // branches are: an owed reply must not read as work in progress —
-              // and a BLOCKING card keeps `s.running` true, so without this the
-              // row would show "Thinking…" while nothing can advance until the
-              // user answers. Info-coloured and static-glyphed to stay distinct
-              // from the warn-coloured approval rows above.
+              // An unanswered question card. Ranked above every "working" signal
+              // for the same reason the approval branches are: an owed reply must
+              // not read as work in progress — and a blocking card keeps
+              // `s.running` true, so without this the row would show "Thinking…"
+              // while nothing can advance until the user answers. Info-coloured
+              // and static-glyphed to stay distinct from the warn-coloured
+              // approval rows above.
+              //
+              // A card is a websocket broadcast with no transcript row, so
+              // `last_message` is whatever the agent last said BEFORE the ask —
+              // not the question. Trailing it after "Needs your answer ·" reads
+              // as the question itself, so the label stands alone and the
+              // transcript carries the card.
               <div className="text-[12px] leading-snug mt-0.5 flex items-center gap-1.5 min-w-0" title={needsInputLabel}>
                 <MessageSquare size={11} className="shrink-0" style={{ color: 'var(--info)' }} aria-hidden />
-                <span className="truncate"><span className="font-medium" style={{ color: 'var(--info)' }}>{needsInputLabel}</span>{s.last_message ? <span className="text-muted"> · {s.last_message}</span> : null}</span>
+                <span className="truncate font-medium" style={{ color: 'var(--info)' }}>{needsInputLabel}</span>
               </div>
             ) : goalLoop ? (
               // An active goal loop outranks every "working" signal below it but

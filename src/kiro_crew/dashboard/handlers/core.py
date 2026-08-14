@@ -1146,6 +1146,9 @@ _STARTUP_READ_AGENT_KEYS = frozenset(
 
 async def api_kirocrew_config(request: web.Request) -> web.Response:
     """GET/PUT /api/config/kirocrew — read or update KiroCrew config."""
+    # Re-imported at call time (not reused from the module-level binding) so a
+    # test that redirects ``kiro_crew.config.loader.config_path`` at a temp path
+    # is observed by this handler.
     from kiro_crew.config.loader import config_path  # noqa: F811
 
     if request.method == "PUT":
@@ -1310,7 +1313,7 @@ def _agent_values() -> set[str]:
 def _active_advertised_ids(request: web.Request) -> list[str] | None:
     """Advertised model ids from the first active provider, or None if unknown.
 
-    Uses the shared :func:`advertised_model_ids` shape parser (#1596) so this
+    Uses the shared :func:`advertised_model_ids` shape parser so this
     validation sees exactly what the session-init withhold check sees. Returns
     ``None`` when no session has initialized / nothing was advertised, so callers
     treat entitlement as UNKNOWN rather than denying on no evidence.
@@ -1427,6 +1430,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": 0, "max": 7200},
+    # Intent-level session summaries in the chat right panel. Only the boolean
+    # enable is editable here: it spends tokens on turns the user did not ask to
+    # pay for, so it is off by default and the Settings toggle is the single
+    # opt-in. The cadence/cap fields (min_user_turns, max_intents, …) stay
+    # config-file-only — they are power-user knobs, not first-run choices.
+    "session_summary.enabled": {"type": "bool"},
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {"type": "int", "min": 5, "max": 120},
     "dashboard.recent_tint_count": {"type": "int", "min": 0, "max": 10},
@@ -2030,8 +2039,6 @@ async def api_session_agent_stream(request: web.Request) -> web.StreamResponse:
     await resp.prepare(request)
 
     last_pos = 0
-    import asyncio  # noqa: F811
-
     from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
 
     for _ in range(1200):  # 20 min max

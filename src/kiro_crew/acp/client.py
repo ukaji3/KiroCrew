@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import functools
 import glob
 import json
 import logging
@@ -45,6 +46,8 @@ from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOra
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -555,7 +558,7 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
             return
 
 
-def _resolve_spawn_env(env: dict[str, str]) -> dict[str, str]:
+def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> dict[str, str]:
     """Repair stale credential pointers in *env* before an agent spawn.
 
     Bundles :func:`_resolve_ssh_auth_sock` (glob + stat over ``/tmp``) and
@@ -565,9 +568,27 @@ def _resolve_spawn_env(env: dict[str, str]) -> dict[str, str]:
     they must never run on the event loop — call this via
     ``asyncio.to_thread``. Mutates *env* in place and returns it for
     convenience.
+
+    With ``kiro_api_key=True`` (the kiro-cli backend), also re-injects the
+    CLI's own model credential from the data home's ``.env`` when the Docker
+    entrypoint scrubbed it out of the parent environ — the child authenticates
+    from its environment, so without this an API-key container loses model
+    auth. With ``kiro_api_key=False`` (a foreign backend) the credential is
+    actively STRIPPED instead: it is kiro-cli's alone, and the deny scrub
+    deliberately exempts it, so an inherited copy would otherwise ride into a
+    foreign agent process. The file read is IO, which is why both branches
+    ride this same off-loop hop.
     """
     _resolve_ssh_auth_sock(env)
     resolve_krb5_ccname(env)
+    # Deferred import: this module keeps config.loader off its import graph
+    # (in-file convention; see the _prompt_timeout lazy-import note).
+    from kiro_crew.config.loader import inject_kiro_cli_api_key, strip_kiro_cli_api_key
+
+    if kiro_api_key:
+        inject_kiro_cli_api_key(env)
+    else:
+        strip_kiro_cli_api_key(env)
     return env
 
 
@@ -997,15 +1018,15 @@ _RE_5XX_NAMED = re.compile(
     r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
 )
 _RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
-# Genuine retry hint only. "response stream" USED TO BE matched here, which made
-# this branch a catch-all: kiro-cli wraps EVERY mid-stream provider failure as
-# "Encountered an error in the response stream: <real cause>", so the wrapper
-# prefix alone — present on quota exhaustion, validation errors, anything —
-# classified the error as a momentary 5xx, told the user to retry, and DISCARDED
-# the real cause. A monthly-usage-limit rejection surfaced as "The model backend
-# hit a transient error (HTTP 5xx)" and burned the retry ladder. The wrapper is
-# a transport envelope, not a signal about the failure inside it; classification
-# now reads the inner detail (see _provider_detail).
+# Genuine retry hint only. "response stream" is deliberately NOT matched here,
+# because that would make this branch a catch-all: kiro-cli wraps EVERY mid-stream
+# provider failure as "Encountered an error in the response stream: <real cause>",
+# so the wrapper prefix alone — present on quota exhaustion, validation errors,
+# anything — would classify the error as a momentary 5xx, tell the user to retry,
+# and DISCARD the real cause. A monthly-usage-limit rejection would surface as
+# "The model backend hit a transient error (HTTP 5xx)" and burn the retry ladder.
+# The wrapper is a transport envelope, not a signal about the failure inside it;
+# classification reads the inner detail (see _provider_detail).
 _RE_5XX_HINT = re.compile(r"(please try again)", re.IGNORECASE)
 # Session expiry, by HTTP status. An expired session is rejected with 401/403,
 # and nothing else in this module recognised those codes: the error fell through
@@ -1444,9 +1465,9 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
             # Unrecognised failure mode. Show the PROVIDER'S OWN message when
             # there is one — it is the true error, and the same words the CLI
             # prints, so the two surfaces agree. This is the path every provider
-            # failure without a curated branch above now takes; previously such
-            # errors were swallowed by an over-broad 5xx match and reported as a
-            # momentary blip, so the real cause never reached the user at all.
+            # failure without a curated branch above takes; an over-broad 5xx
+            # match would swallow such an error and report a momentary blip, so
+            # the real cause would never reach the user at all.
             #
             # Falls back to the raw dict only when there is no usable detail
             # (empty/odd data), so a genuinely opaque shape still loses nothing.
@@ -2518,11 +2539,16 @@ class AcpClient:
         # OS-level sandbox: wrap the command to hide sensitive paths.
         # strip_python_env keeps the host PYTHONPATH/PYTHONHOME out of kiro-cli's
         # foreign MCP subprocesses (which bundle their own interpreter + deps).
+        # is_kiro_cli is membership in ACP_BACKENDS_INTERNAL_SANDBOX
+        # (harness-parity H7), not "not claude": the flag makes wrap_argv SKIP
+        # Crew's seatbelt on macOS in favour of the harness's own internal
+        # sandbox, so a harness without one must never be granted it by the
+        # absence of another harness.
         argv, self._sandbox_cleanup = wrap_argv(
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            is_kiro_cli=not self._is_claude,
+            is_kiro_cli=self.backend in ACP_BACKENDS_INTERNAL_SANDBOX,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
@@ -2577,11 +2603,16 @@ class AcpClient:
         # kernel keyring, the default on some Linux distros, is invisible to
         # this child, so Kerberos-gated MCP servers fail without it). Covers
         # the session agent and all ACP-provider subagents, which spawn through
-        # this same path. Both resolvers glob/stat under /tmp, whose entry
-        # count is unbounded, so they run off-loop in ONE thread hop. Guarded:
-        # the sandbox temp file is live, so a cancellation here must not
-        # orphan it.
-        env = await self._to_thread_guarding_sandbox(_resolve_spawn_env, env)
+        # this same path. The same hop settles the CLI's own KIRO_API_KEY:
+        # re-injected from .env for the kiro-cli backend (post-scrub Docker),
+        # actively stripped for a foreign backend, which must never receive it
+        # (see config.loader.inject/strip_kiro_cli_api_key). All of this
+        # glob/stat/reads under /tmp and the data home, so it runs off-loop in
+        # ONE thread hop. Guarded: the sandbox temp file is live, so a
+        # cancellation here must not orphan it.
+        env = await self._to_thread_guarding_sandbox(
+            functools.partial(_resolve_spawn_env, kiro_api_key=not self._is_claude), env
+        )
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
@@ -2640,10 +2671,17 @@ class AcpClient:
             _track_session_pid,
         )
 
-        _track_pid(self._pid)
-        _track_session_pid(self._pid)  # separate file for startup cleanup
-        await asyncio.sleep(0.3)
+        # The PID-file trackers each take an exclusive file lock and do a
+        # read-modify-append under it — blocking syscalls that must not run
+        # on the event loop: ensure_ready() awaits _spawn() from the loop on
+        # every cold start, so a contended or wedged lock holder here would
+        # stall every task including the liveness heartbeat. Ride the same
+        # executor as the descendant scans below.
         _loop = asyncio.get_running_loop()
+        await _loop.run_in_executor(subprocess_executor(), _track_pid, self._pid)
+        # Separate file for startup cleanup.
+        await _loop.run_in_executor(subprocess_executor(), _track_session_pid, self._pid)
+        await asyncio.sleep(0.3)
         early_descendants = await _loop.run_in_executor(
             subprocess_executor(), _get_child_pids, self._pid
         )
@@ -2651,7 +2689,9 @@ class AcpClient:
             self._child_pids = await _loop.run_in_executor(
                 subprocess_executor(), _capture_child_records, early_descendants
             )
-            _track_child_pids(self._child_pids, parent_pid=self._pid or 0)
+            await _loop.run_in_executor(
+                subprocess_executor(), _track_child_pids, self._child_pids, self._pid or 0
+            )
             logger.info("Early tracking %d descendants of PID %d", len(self._child_pids), self._pid)
 
         if self._process.stderr:
@@ -3325,15 +3365,15 @@ class AcpClient:
             return None
         except (ValueError, asyncio.LimitOverrunError) as exc:
             # A single JSON-RPC line exceeded the stdout StreamReader buffer
-            # (_STDOUT_BUFFER_LIMIT). This does NOT corrupt the stream, contrary
-            # to what this call site used to assume: before raising ValueError,
-            # readline() deletes the oversize line through its terminating
-            # newline when one is already buffered, else clears the buffer, then
-            # resumes the transport (CPython asyncio.streams.StreamReader
-            # .readline — its docstring states this). So drop the frame and let
-            # the caller read the next one, exactly like the blank-line and
-            # non-JSON paths below; raising AcpProcessDied here ended a healthy
-            # live turn over one unreadably large frame.
+            # (_STDOUT_BUFFER_LIMIT). This does NOT corrupt the stream: before
+            # raising ValueError, readline() deletes the oversize line through
+            # its terminating newline when one is already buffered, else clears
+            # the buffer, then resumes the transport (CPython
+            # asyncio.streams.StreamReader.readline — its docstring states this).
+            # So drop the frame and let the caller read the next one, exactly
+            # like the blank-line and non-JSON paths below; raising
+            # AcpProcessDied here would end a healthy live turn over one
+            # unreadably large frame.
             #
             # NOTE the deliberate asymmetry with AcpRuntime._reader_loop, which
             # additionally enforces a drain budget: that reader is a standalone
@@ -4375,9 +4415,8 @@ class AcpClient:
             raw = result.get("text", "") or result.get("message", "")
             if raw:
                 # Two-pass redaction (URLs + credentials) to match the shared
-                # AcpSessionHandle.send_command path; a URL-only pass previously
-                # leaked tokens/keys in slash-command output on the legacy path.
-                # (redact_* imported at module top.)
+                # AcpSessionHandle.send_command path: a URL-only pass leaves
+                # tokens/keys in slash-command output.
                 raw, _ = redact_exfiltration_urls(raw)
                 raw, _ = redact_credentials(raw)
             return raw
@@ -4501,9 +4540,12 @@ class AcpClient:
 
     @property
     def supports_steer(self) -> bool:
-        """True when the backend supports mid-turn steer (kiro-cli only;
-        claude-agent-acp has no ``_session/steer``)."""
-        return not self._is_claude
+        """True when the backend implements ``_session/steer`` (mid-turn steer).
+
+        Membership in ``ACP_BACKENDS_STEER`` (harness-parity H6), so a harness
+        added later does not inherit the extension from ``not _is_claude``.
+        """
+        return self.backend in ACP_BACKENDS_STEER
 
     async def wait_turn_done(self, timeout: float) -> str:
         """Wait for the current prompt to finish. Returns stop_reason or raises TimeoutError."""
@@ -4944,6 +4986,9 @@ class AcpClient:
             "kiro-cli cancelled tool use(s) [site=%s session=%s]", site, self._session_id
         )
         try:
+            # Re-imported at call time on purpose: the module-level binding is
+            # captured at import time, so only this rebind resolves the CURRENT
+            # ``kiro_crew.sel.sel`` and lets a substituted emitter be observed.
             from kiro_crew.sel import sel
 
             sel().log_tool_invocation(
@@ -5222,6 +5267,16 @@ class AcpClient:
         if isinstance(kind, str) and kind:
             kind_str, _ = redact_exfiltration_urls(kind)
             kind_str, _ = redact_credentials(kind_str)
+        # The refinement's rawInput is the COMPLETE params object, so it carries
+        # the reserved purpose argument too. Read it here or the purpose is lost
+        # whenever the initial tool_call streamed an empty rawInput — and
+        # consumers that treat an empty purpose as "fall back to the raw title"
+        # (the session list's running-status line) would replace a good purpose
+        # with a command. Mirrors `_dispatch._build_tool_refinement_event`.
+        purpose = extract_tool_purpose(raw_input)
+        if purpose:
+            purpose, _ = redact_exfiltration_urls(purpose)
+            purpose, _ = redact_credentials(purpose)
         # Refresh the cached shell signal only when this refinement carries a
         # kind. A refinement that omits kind must NOT clobber a True cached by
         # the initial tool_call notification (kind is optional on updates).
@@ -5233,6 +5288,7 @@ class AcpClient:
             kind=EVENT_TOOL_CALL_UPDATE,
             title=title_str,
             tool_kind=kind_str,
+            tool_purpose=purpose,
             tool_input=input_str,
             tool_call_id=tool_use_id,
             raw_tool_params=raw_input if isinstance(raw_input, dict) else None,

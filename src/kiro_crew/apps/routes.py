@@ -308,34 +308,51 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
     Returns enabled apps' publish providers plus the core deploy provider (folded
     from the former deploy_web app), each with a ``configured`` flag. Built-in
     providers (the internal registry) are registered frontend-side and are not returned here.
+
+    The core deploy row is omitted when the platform's ``external_access`` policy
+    withholds cloud deployment. Because this list is what the Publish panel
+    renders, that single omission is also what makes the panel correct — a
+    deployment that registers only an internal destination shows only that one,
+    with no frontend change.
     """
     # Both the apps-dir walk (list_apps) and the per-provider configured-state
     # probe (_provider_is_configured reads each app's persisted config file)
     # touch disk, so the whole collection runs off the loop — same shape as the
     # deploy registry read below.
     providers = await asyncio.to_thread(lambda: collect_publish_providers(list_apps()))
-    # Core deploy provider (always present, regardless of any app install state)
-    try:
-        from kiro_crew.deploy import profiles as _deploy_profiles
+    # Core deploy provider — present unless the platform withholds cloud
+    # deployment, in which case advertising it would offer a destination whose
+    # every mutating route refuses. Omitting the ROW is what makes the Publish
+    # panel correct without a frontend change: the panel is data-driven, so a
+    # deployment that only registers an internal destination shows only that one.
+    # circular import: apps.routes is imported by the dashboard handler layer, so
+    # reaching back into it must be a function-local downward import.
+    from kiro_crew.dashboard.handlers._shared import admits_cloud_deployment
 
-        # Align with deploy/handlers.py: registry reads go through to_thread.
-        reg = await asyncio.to_thread(_deploy_profiles.load_registry)
-        configured = bool(reg["profiles"])
-    except Exception:
-        configured = False
-    providers.append(
-        {
-            "id": "deploy-web-aws",
-            "label": "Publish to public web (your AWS)",
-            "icon": "Globe",
-            "endpoint": "/api/deploy/deploy",
-            "kinds": ["widget", "html", "markdown"],
-            "setupRoute": "/artifacts/deploy",
-            "app": "",
-            "origin": "core",
-            "configured": configured,
-        }
-    )
+    # In a worker thread with the registry read below: the admission path can
+    # initialize the SEL audit log, which shells out on a fresh Windows gateway.
+    if await asyncio.to_thread(admits_cloud_deployment, "aws"):
+        try:
+            from kiro_crew.deploy import profiles as _deploy_profiles
+
+            # Align with deploy/handlers.py: registry reads go through to_thread.
+            reg = await asyncio.to_thread(_deploy_profiles.load_registry)
+            configured = bool(reg["profiles"])
+        except Exception:
+            configured = False
+        providers.append(
+            {
+                "id": "deploy-web-aws",
+                "label": "Publish to public web (your AWS)",
+                "icon": "Globe",
+                "endpoint": "/api/deploy/deploy",
+                "kinds": ["widget", "html", "markdown"],
+                "setupRoute": "/artifacts/deploy",
+                "app": "",
+                "origin": "core",
+                "configured": configured,
+            }
+        )
     return web.json_response({"providers": providers})
 
 
@@ -764,29 +781,28 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    # Per-app lifecycle lock, WIDENED to wrap the ENTIRE uninstall sequence:
+    # Per-app lifecycle lock, wrapping the ENTIRE uninstall sequence:
     # cron-cleanup precondition → onUninstall script → backend stop →
-    # deregistration → dependency cleanup → file removal. Previously the lock
-    # was taken only AFTER the onUninstall script had already run. It is now
-    # taken FIRST, deliberately, because:
+    # deregistration → dependency cleanup → file removal. The lock is taken
+    # FIRST, deliberately, because:
     #   (a) the cron-cleanup precondition below must be able to abort BEFORE
     #       any destructive action (see its comment), which requires it — and
     #       therefore the lock — to precede the onUninstall script; and
     #   (b) the onUninstall script may itself be destructive (it can wipe app
     #       data), so holding the lock across it stops a racing enable/update
     #       of the same app from starting a backend mid-teardown.
-    # Cost: a concurrent same-app lifecycle op now waits up to the onUninstall
+    # Cost: a concurrent same-app lifecycle op waits up to the onUninstall
     # timeout — acceptable, since those ops genuinely conflict and the lock is
     # per-app (other apps are unaffected).
     async with app_lifecycle_lock(name):
         # Step 0: the execution grant must be removable before anything is
         # destroyed. A grant is keyed on the app NAME alone, so one left behind
         # admits a DIFFERENT app later installed under this name — code execution
-        # with no consent prompt. That check used to live inside uninstall_app
-        # (Step 5), which made it unreachable as an abort: by then the cron
-        # manifest, the onUninstall script, the backend and the dependencies had
-        # all already been torn down, so the refusal stranded a half-removed app
-        # and every retry re-ran the non-idempotent script. Asking here keeps the
+        # with no consent prompt. Checking it inside uninstall_app (Step 5)
+        # instead would make it unreachable as an abort: by then the cron
+        # manifest, the onUninstall script, the backend and the dependencies have
+        # all already been torn down, so the refusal strands a half-removed app
+        # and every retry re-runs the non-idempotent script. Asking here keeps the
         # refusal free and the retry safe, exactly like the cron precondition.
         # Offloaded: the precondition reads config.json and config.local.json from
         # disk, and this is an async handler — the same reason `uninstall_app` below
@@ -1273,11 +1289,11 @@ async def handle_disable_app(request: web.Request) -> web.Response:
     # resources — must not interleave with a concurrent install/update/
     # uninstall/enable of the same app.
     async with app_lifecycle_lock(name):
-        # `onDisable` is NOT run here any more: it moved INTO
-        # `teardown_app_runtime` below, so that revoking an app's execution grant
-        # runs it too. It used to be handler-only, which made revoke weaker than
-        # disable — see the ordering rationale in apps/teardown.py. Running it here
-        # as well would run the app's script twice per disable.
+        # `onDisable` is NOT run here: it runs inside `teardown_app_runtime`
+        # below, so that revoking an app's execution grant runs it too. Keeping it
+        # handler-only would make revoke weaker than disable — see the ordering
+        # rationale in apps/teardown.py. Running it here as well would run the
+        # app's script twice per disable.
         #
         # Invoke Python lifecycle hooks, stop the backend PROCESS, and deregister
         # resources through the ONE shared teardown that revoking an app's
@@ -1804,8 +1820,8 @@ async def handle_app_ui_file(request: web.Request) -> web.Response:
     # revalidate each load. FileResponse answers conditional requests
     # (If-Modified-Since / If-None-Match from its Last-Modified/ETag) with a
     # body-less 304, so unchanged files stay cheap while app updates are picked
-    # up on a plain refresh. The previous public,max-age=3600 served every
-    # app's UI stale for up to an hour after an update.
+    # up on a plain refresh. A long ``public,max-age=...`` instead would serve an
+    # app's UI stale for that whole window after an update.
     from kiro_crew.apps.dev_mode import is_dev_mode_cached
 
     cache = "no-store" if is_dev_mode_cached(name) else "no-cache"

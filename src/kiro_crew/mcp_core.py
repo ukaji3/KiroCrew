@@ -44,7 +44,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.context_management import summarize_result
 from kiro_crew.dashboard.origin import dashboard_socket_path
 from kiro_crew.history import _SEARCH_SCAN_WINDOW as SEARCH_SCAN_WINDOW
-from kiro_crew.history import INCOGNITO_MEMORY_MODES, ConversationLog, search_query_tokens
+from kiro_crew.history import ConversationLog, is_incognito_transcript, search_query_tokens
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.embedder import create_embedder_from_config
 from kiro_crew.knowledge.retrieval import HybridRetriever
@@ -579,6 +579,8 @@ def _deny_channel_agent_messaging(caller_session: str, tool_name: str) -> str | 
     if not caller_session.startswith("channel:"):
         return None
     try:
+        # Resolved from ``kiro_crew.sel`` at call time, not through the
+        # module-level binding, so a substituted SEL factory is observed.
         from kiro_crew.sel import sel
 
         sel().log_tool_invocation(
@@ -729,6 +731,8 @@ def _audit_governance_deny(session_key: str, tool_name: str, scope: str, decisio
     """Best-effort SEL audit of a governance denial (writes to the JSONL file,
     NOT stdout — safe in the stdio MCP server). Never raises."""
     try:
+        # Resolved from ``kiro_crew.sel`` at call time, not through the
+        # module-level binding, so a substituted SEL factory is observed.
         from kiro_crew.sel import sel
 
         sel().log_governance_decision(
@@ -1246,7 +1250,6 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
 
 # ── Chat-history search helpers (Phase 1: search_chat_history / get_chat_session) ──
 
-_HISTORY_INCOGNITO_MODES = INCOGNITO_MEMORY_MODES  # canonical set (single source of truth in history.py)
 _SNIPPET_RADIUS = 120  # chars of context kept on each side of a match
 _SNIPPET_MAX_LEN = 320  # hard cap on a returned snippet
 # Upper bound on ranked candidates pulled from the backend per search. Bound to
@@ -1257,8 +1260,12 @@ _SEARCH_HISTORY_SCAN = SEARCH_SCAN_WINDOW
 
 
 def _history_is_incognito(meta: dict) -> bool:
-    """True if a session's memory_mode marks it private (never searchable)."""
-    return str(meta.get("memory_mode", "")).lower() in _HISTORY_INCOGNITO_MODES
+    """True if a session's memory_mode marks it private (never searchable).
+
+    Dict-shaped convenience over :func:`kiro_crew.history.is_incognito_transcript`,
+    the shared classifier — the predicate itself lives in history.py.
+    """
+    return is_incognito_transcript(meta.get("memory_mode"))
 
 
 def _redact_history_output(text: str) -> str:

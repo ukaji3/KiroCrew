@@ -76,10 +76,6 @@ def _sel():
 
 async def api_reveal_path(request: web.Request) -> web.Response:
     """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
-    import shutil  # noqa: F811
-    import subprocess  # noqa: F811
-    import sys  # noqa: F811
-
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -94,26 +90,28 @@ async def api_reveal_path(request: web.Request) -> web.Response:
             outcome="denied", error="sensitive_path",
             resources=path, metadata={"action": action})
         return web.json_response({"error": "access denied"}, status=403)
+    # Every ALLOWED outcome leaves through the single audited return below —
+    # including the clipboard answer, which is a granted decision whose host
+    # simply had no file manager. An early return here would drop that decision
+    # from the SEL log, so the branches record what happened instead of exiting.
+    #
+    # Both spawns live in platform_compat, which owns the safety properties:
+    # absolute trusted launchers rather than bare argv names, a folder rather
+    # than the file on the platforms where handing a file to the file manager
+    # would launch it, and Windows refused outright for the launch-by-association
+    # verb. They answer False both for a host with no launcher and for one that
+    # refuses to start, and either way this degrades to the clipboard rather than
+    # failing a click in the file viewer.
     if action == "open":
         if not os.path.isfile(path):
             return web.json_response({"error": "not a regular file"}, status=400)
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        elif shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", path])
-        else:
-            return web.json_response({"ok": True, "copy": path})
+        copied = not platform_compat.open_with_default_app(path)
     else:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        elif shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", str(Path(path).parent)])
-        else:
-            return web.json_response({"ok": True, "copy": path})
+        copied = not platform_compat.reveal_in_file_manager(path)
     _sel().log_tool_invocation(
         session_key="api", source="api", tool_name="reveal_path",
         outcome="success", resources=path, metadata={"action": action})
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "copy": path} if copied else {"ok": True})
 
 
 async def api_outbox_notify(request: web.Request) -> web.Response:
@@ -281,8 +279,6 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
 
 async def api_outbox_download(request: web.Request) -> web.StreamResponse:
     """GET /api/outbox/{filename} — download a file from the outbox."""
-    import urllib.parse  # noqa: F811
-
     from kiro_crew.config.loader import outbox_dir  # noqa: F811
     from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
 
@@ -1086,7 +1082,6 @@ async def api_workspaces(request: web.Request) -> web.Response:
 
 async def api_workspaces_create(request: web.Request) -> web.Response:
     """POST /api/workspaces — create a new workspace."""
-    import asyncio  # noqa: F811
     import shutil  # noqa: F811
 
     from kiro_crew.validation import WORKSPACE_NAME_RE  # noqa: F811
@@ -1451,9 +1446,6 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
 
 async def api_file_read(request: web.Request) -> web.Response:
     """GET /api/file-read?path=... — read file content for the markdown panel."""
-    import logging  # noqa: F811
-    import os  # noqa: F811
-
     from kiro_crew.validation import (  # noqa: F811
         FILE_READ_SCHEMA,
         ValidationError,
@@ -1717,8 +1709,6 @@ async def api_file_download(request: web.Request) -> web.Response:
 
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
-    import os  # noqa: F811
-
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
     def _log(outcome: str, res: str) -> None:
@@ -1798,9 +1788,6 @@ async def api_file_raw(request: web.Request) -> web.Response:
 
 async def api_file_write(request: web.Request) -> web.Response:
     """POST /api/file-write — write file content from the markdown panel."""
-    import logging  # noqa: F811
-    import os  # noqa: F811
-
     from kiro_crew.validation import (  # noqa: F811
         FILE_WRITE_SCHEMA,
         ValidationError,
@@ -1843,7 +1830,6 @@ async def api_file_write(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "not found"}, status=404)
     try:
-        import os  # noqa: F811
         import shutil  # noqa: F811
         import tempfile  # noqa: F811
 
@@ -1930,9 +1916,9 @@ def _fuzzy_score(q: str, name: str, rel: str) -> float:
 
 async def api_file_search(request: web.Request) -> web.Response:
     """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker."""
-    import os  # noqa: F811
-    import time  # noqa: F811
-
+    # Re-imported at call time (not reused from the module-level binding) so a
+    # test that stubs ``kiro_crew.security.is_sensitive_path`` is observed by the
+    # project-root rejection below.
     from kiro_crew.security import is_sensitive_path  # noqa: F811
 
     caller = request.get("user", "dashboard")
@@ -2248,8 +2234,6 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
 
 async def api_browse_dirs(request: web.Request) -> web.Response:
     """GET /api/browse-dirs?path=... — list subdirectories for directory browser."""
-    import os  # noqa: F811
-
     from kiro_crew.security import is_sensitive_path  # noqa: F811
 
     caller = request.get("user", "dashboard")
@@ -2531,9 +2515,9 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
 
     # Offloaded: KiroCrewConfig.load() stats, reads, parses, and validates config
-    # files. The client now polls this endpoint on an interval to pick up
-    # externally edited dashboard.gitlab_hosts, so a slow or network-backed config
-    # directory would otherwise stall the sole event loop on every poll.
+    # files. The client polls this endpoint on an interval to pick up externally
+    # edited dashboard.gitlab_hosts, so a slow or network-backed config directory
+    # would otherwise stall the sole event loop on every poll.
     try:
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
     except asyncio.CancelledError:

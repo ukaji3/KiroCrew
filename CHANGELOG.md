@@ -4,6 +4,88 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [Unreleased]
 
+- **`kirocrew` commands start up to ~0.8 s faster, and each MCP stdio server
+  drops ~58 MB of resident memory.** `cli.py` imported its full 132-subcommand
+  dispatch table at module scope — including the Slack gateway, the dashboard
+  state module and (through it) numpy — so every CLI invocation and every
+  long-lived MCP backend process (`mcp-core`, `mcp-cron`, `mcp-computer`) paid
+  ~1.3 s and ~112 MB for subcommands that never run. The four heavy import
+  statements now execute inside the one dispatch branch that uses each name,
+  cutting a fresh `import kiro_crew.cli` to ~0.5 s / ~54 MB. Each command now
+  pays only for the modules its own branch uses: the MCP stdio servers and
+  most verbs save the full ~0.8 s / ~58 MB, while commands that dispatch into
+  the deferred modules (e.g. `gateway`, `cron`) save the portion they don't
+  touch. A ratchet test keeps the deferred modules out of module scope and
+  verifies every deferred import still resolves. Behavior is unchanged: the
+  entry point, the fail-closed security prelude, and all subcommand dispatch
+  are untouched. (#3504)
+
+- **A managed deployment can now withhold the external services the core offers
+  unconditionally.**
+  Three surfaces had no composition point. Two are installable-content registries
+  — skill discovery (skills.sh) and MCP server discovery (the official MCP
+  registry) — which fetch from the public internet and then offer to install what
+  they return, but hardcoded their public provider at registration time. The third
+  is cloud deployment: `kiro_crew/deploy/` provisions S3, CloudFront, IAM roles and
+  a reaper Lambda in the operator's own account and carried no capability gate at
+  all, so `capabilities.publish` (which bounds publish-provider destinations) did
+  not reach it. Together that made "source installable code only from our own
+  registry, and never provision cloud infrastructure" impossible to express without
+  patching the core — a hard blocker for any deployment where third-party code must
+  be reviewed first, or where provisioning is centrally controlled. A new
+  `external_access` platform slot adds `admits_registry(kind, name, api_base)` and
+  `admits_cloud_deployment(target)`. A refused registry is never registered, so it
+  is absent rather than failing per request; a refused cloud deployment makes the
+  deploy surface report itself disabled — so the UI hides the console instead of
+  rendering one whose every button 403s — and refuses every mutating route, wrapped
+  at registration so a new endpoint is gated by being listed rather than by
+  remembering an in-handler check. Both decisions take the concrete target as well
+  as a label, because a name is self-chosen while the URL or target determines
+  where bytes go, so an allowlist stops admitting a provider that later repoints at
+  a different host instead of letting it inherit trust from its name. Both outcomes
+  are SEL-audited: a log carrying only denials cannot show whether the permitted
+  path was ever taken. The public default admits everything, so an ordinary install
+  is unchanged.
+
+- **A lesson from a previous embedding-model generation could no longer get
+  silently deleted or offered as a false contradiction.** `write_lesson`'s
+  semantic dedup and `find_contradiction_candidates` compared raw embeddings
+  with a cosine helper that silently truncated a dimension mismatch to the
+  shorter vector instead of rejecting it, so a row embedded at a different
+  dimensionality (e.g. left over from an old embedding model) could score a
+  plausible-looking ~0.5 similarity against an unrelated new rule — landing
+  either past the 0.85 dedup line (deleting the old lesson as a "duplicate")
+  or inside the [0.4, 0.85) contradiction band (offered as a false
+  contradiction candidate). Both paths now converge onto the same
+  dimension-checked, float64-precision scorer the ranking paths already use,
+  which also removes a per-row query re-derivation from both loops. (#3466)
+
+- **Side-panel oversize-question refusal now reports an accurate character
+  target for every script, not just emoji.** The refusal derived its
+  character count from a fixed worst-case floor (4 bytes/char, the emoji
+  case), so an ASCII user over the byte budget was told to cut to ~8,192
+  characters when trimming a single character would do (4x over-deletion),
+  and a zh-CN user (3 bytes/char) was told 8,192 when ~10,922 actually fit.
+  The target is now derived from the submitted question's own byte density,
+  so it's accurate per script — the all-emoji case is unaffected (it already
+  sat at the 4-byte floor). (#3432)
+
+- **The skill browser no longer serves a different skill than the one you asked
+  for.** Three `package/` lookups compared a bare leaf name and returned the
+  first hit, so a request for `package/<name>` could answer with a file under
+  `<root>/<Pkg>/<name>`, or with whichever of two identically named files the
+  filesystem happened to yield. Exact keys now decide first, leaf matching
+  survives only where it is unambiguous, and a real collision resolves to
+  nothing — a 404, with the competing candidates logged — because the
+  `package/<path>` key cannot express which of the two files was meant. Every
+  lookup that previously resolved correctly still resolves to the same file.
+  **Edition maintainers:** roots the core already keys itself (`~/.kiro/skills`,
+  the data home, configured extra paths) are no longer *also* enumerated under
+  `package/`, which previously presented an editable skill as a read-only
+  package one. A stored reference to one of those duplicate `package/` keys
+  stops resolving; the file itself is untouched and still reachable under its
+  canonical key, but the stored reference has to be re-pointed. (#3369)
+
 - **MCP gateway daemons no longer leak when their launcher dies.** A `gatewayd`
   whose launcher exited without signalling it (a torn-down `pytest` run, for
   example) used to stay resident forever — invisible to every sweep, ~27 MB
@@ -12,6 +94,15 @@ All notable changes to KiroCrew are documented in this file.
   consecutive checks, POSIX only), and the untracked-orphan sweep reaps any
   gatewayd whose `--socket` path no longer exists on disk, TERM-first so
   pooled backends drain cleanly. (#3315)
+
+- **Aggregate memory ceiling across all concurrent agent spawns.** The cgroup
+  memory limit was per-spawn only (65% of RAM each), so many concurrent
+  subagents could collectively request several times host RAM without any
+  single limit breaching. The gateway now also caps their shared parent slice
+  (`kirocrew-agents.slice`) at 80% of RAM plus an aggregate task ceiling —
+  override via `resource_limits.max_total_memory_mb` /
+  `max_total_processes` — and logs which scopes were OOM-killed when the
+  aggregate ceiling engages. (#3316)
 
 - **Slack manifest: private channels now work out of the box.** The shipped app
   manifest adds the `groups:history` and `users:read` bot scopes and subscribes
@@ -64,6 +155,13 @@ weeks in the open.
   toggle, and the shared MCP gateway follows it.
 - **Connections** gained a provider registry, so an integration declares what it
   is asking for and its consent URL is validated before you are sent to it.
+- Pasting an OAuth return address for an approval that has already expired now
+  says so, instead of blaming the paste — a spent approval is told apart from a
+  failed delivery, so you know to start a fresh one rather than re-copy a dead
+  address.
+- Clicking **Connect** now asks for the provider's approval link instead of
+  waiting for one, so the card offers it within seconds rather than only after
+  some later chat happens to reach that server.
 - Code Review Sage works against **GitHub Enterprise Server** hosts.
 - An MCP server that authenticates with OAuth now receives the scope list and
   client id in the fields kiro-cli actually reads, so those connections

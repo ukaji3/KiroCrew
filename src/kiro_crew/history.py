@@ -675,6 +675,27 @@ _SEARCH_SNIPPET_BUDGET_BYTES = 64 * 1024 * 1024
 # can't silently diverge between surfaces.
 INCOGNITO_MEMORY_MODES = frozenset({"incognito", "temporary"})
 
+
+def is_incognito_transcript(memory_mode: object) -> bool:
+    """True when *memory_mode* marks a transcript private (incognito/temporary).
+
+    The single shared predicate for :data:`INCOGNITO_MEMORY_MODES` membership,
+    so the normalization cannot drift between the surfaces that must agree on
+    what "private" means (history scans, MCP history tools, dashboard session
+    handlers, Discord resume, summary/folder/channel-slot derivations).
+
+    Normalization is ``str()`` + ``lower()`` — exactly what the call sites
+    apply: ``None``/absent reads as persistent (not private), and comparison is
+    case-insensitive because the set holds lowercase members while a
+    hand-edited transcript header is not bound by the API's validation.
+    Whitespace is deliberately NOT stripped and unrecognized values read as
+    not-private: callers that must fail closed on an unreadable or junk header
+    (e.g. the restricted-session write gate) resolve the mode through an
+    allowlist first and deny on ``None`` before this membership test applies.
+    """
+    return str(memory_mode or "").lower() in INCOGNITO_MEMORY_MODES
+
+
 # The fields that record where a message came from: the session key it arrived
 # on (``source_thread``, e.g. ``slack:1785861252.833429``) and the platform user
 # who sent it (``source_user``). Written by :meth:`ConversationLog.append`, read
@@ -813,7 +834,6 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     entirely — the user manages archive deletion manually.
     """
     global _last_cleanup
-    import time as _time
 
     # Explicit negative disables cleanup immediately (no config read needed).
     if retention_days is not None and retention_days < 0:
@@ -827,8 +847,7 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     # Past the throttle window: stamp _last_cleanup NOW, before resolving
     # retention. Otherwise a config-resolved "disabled" (negative) would return
     # without updating the window, so every subsequent archive write would
-    # re-run the expensive KiroCrewConfig.load() — reintroducing the
-    # regression for the disabled case.
+    # re-run the expensive KiroCrewConfig.load().
     _last_cleanup = now
     # Resolve retention from config if not given, honoring a config-resolved
     # negative as the disable signal too.
@@ -1064,12 +1083,12 @@ def latest_transcript_ts(*candidates: str | None) -> str | None:
 
 
 #: Default upper bound on the number of distinct session keys held in the
-#: in-memory transcript / metadata caches.  The previous implementation used
-#: plain ``dict`` caches that grew one entry per session key touched and never
-#: evicted — on a gateway serving thousands of sessions the parsed message
-#: lists (each up to ~200 messages / 2 MB of source JSONL) accumulated in RAM
-#: for the lifetime of the process.  A bounded LRU keeps hot sessions resident
-#: while giving the working set a deterministic ceiling.
+#: in-memory transcript / metadata caches.  Unbounded ``dict`` caches grow one
+#: entry per session key touched and never evict — on a gateway serving
+#: thousands of sessions the parsed message lists (each up to ~200 messages /
+#: 2 MB of source JSONL) accumulate in RAM for the lifetime of the process.  A
+#: bounded LRU keeps hot sessions resident while giving the working set a
+#: deterministic ceiling.
 _TRANSCRIPT_CACHE_MAX = 256
 
 # Metadata reads retry briefly before reporting "no metadata": on Windows a
@@ -3083,10 +3102,8 @@ class ConversationLog:
                             d = json.loads(line.strip())
                         except (json.JSONDecodeError, ValueError):
                             continue
-                        if (
-                            d.get("_type") == "metadata"
-                            and str(d.get("memory_mode", "")).lower()
-                            in INCOGNITO_MEMORY_MODES
+                        if d.get("_type") == "metadata" and is_incognito_transcript(
+                            d.get("memory_mode")
                         ):
                             is_restricted = True
                             break

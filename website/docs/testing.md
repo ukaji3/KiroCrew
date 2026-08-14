@@ -85,6 +85,9 @@ match when you are debugging a CI-only failure: see
 - **jscpd** duplication check: copy-pasted code fails the build.
 - Coverage is emitted as cobertura XML from `test:website`.
 - `npx tsc -b` and eslint run as their own blocking steps.
+- Coverage runs use at most two fork workers with a 3072 MB old-space ceiling
+  per worker. The cap leaves room for the Vitest coordinator, coverage maps,
+  happy-dom state, and the operating system on a standard hosted runner.
 
 Backend-side test determinism and suite-speed rules (they apply to the same CI run)
 are in
@@ -132,11 +135,20 @@ the state just reads as "already correct" and the branch under test never runs:
 ```tsx
 // WRONG: the panel re-pins the scroller on 50/150/300ms timers after history
 // lands. Once one has fired, this scroll reads as "already at the bottom" and the
-// pill never renders — a 1000ms `findByRole` timeout with no hint why.
+// pill never renders — a `findByRole` timeout with no hint why.
 fireEvent.scroll(scroller)
 
-// RIGHT: park it where the test needs it, so the event means one thing.
+// STILL WRONG: a plain write is itself racing the same timers — one that runs
+// after it puts the value right back.
 scroller.scrollTop = 0
+fireEvent.scroll(scroller)
+
+// RIGHT: park it with an own accessor, so every read reports the parked value
+// and the component's own writes are swallowed. The setter must exist: a
+// getter-only property makes the component's strict-mode write throw instead.
+Object.defineProperty(scroller, 'scrollTop', {
+  configurable: true, get: () => 500, set: () => {},
+})
 fireEvent.scroll(scroller)
 ```
 

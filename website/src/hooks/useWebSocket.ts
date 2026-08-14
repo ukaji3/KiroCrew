@@ -189,6 +189,11 @@ export function useWebSocket() {
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
   const autoSpeakRef = useRef(false)
   const spokenLenRef = useRef(0)  // chars already sent to TTS during streaming
+  // Whether the streaming path synthesized anything this turn. chat_segment
+  // resets spokenLenRef to 0, so the completion pass cannot tell "nothing
+  // spoken yet" (speak the whole reply) from "spoken, then segment-reset"
+  // (speaking from 0 repeats the entire reply) without this.
+  const spokeThisTurnRef = useRef(false)
   const voiceMutedRef = useRef(false)  // suppress incoming chunks after interrupt
   const synthChainRef = useRef<Promise<unknown>>(Promise.resolve())  // serialize TTS calls
   // #1 streaming-chunk coalescing: accumulate per-slot chunk text and flush
@@ -404,6 +409,11 @@ export function useWebSocket() {
       const streaming = [...msgs].reverse().find(m => m.role === 'streaming')
       if (streaming) {
         const full = streaming.content
+        // The counter is 0 with the spoke-flag still set only right after a
+        // chat_segment reset. New streaming content in that state is a fresh
+        // post-segment block — the trailing message is no longer the
+        // already-spoken one, so the completion pass must not skip it.
+        if (spokenLenRef.current === 0 && full.length > 0) spokeThisTurnRef.current = false
         let lastBound = -1
         const re = /[.!?](?:\s|$)/g
         let match
@@ -414,6 +424,7 @@ export function useWebSocket() {
           const newText = full.slice(spokenLenRef.current, lastBound).trim()
           if (newText.length >= 10) {
             spokenLenRef.current = lastBound
+            spokeThisTurnRef.current = true
             synthChainRef.current = synthChainRef.current
               .then(() => api.voiceSynthesize(activeSlot, newText))
               .catch(() => {})
@@ -517,6 +528,12 @@ export function useWebSocket() {
         slotActivityBufRef.current.clear()
         dispatch(sseConnected())
         dispatch(fetchSlots()).finally(() => { reconnectingRef.current = false })
+        // A summary regenerated while the socket was down pushed a
+        // `session_summary` event nobody received, and the panel does not poll,
+        // so without this the stale summary persists until the tab remounts.
+        // Invalidate every slot's summary (the key is per-slot and we cannot
+        // know which ones moved); react-query only refetches the observed ones.
+        queryClient.invalidateQueries({ queryKey: ['session-summary'] })
         seedGoalLoops()
         dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
@@ -544,8 +561,9 @@ export function useWebSocket() {
       // was down. fetchNotifications IS still dispatched here despite the
       // mount-effect copy: syncPendingApprovals must only run after a
       // notifications fetch has settled, because fetchNotifications.fulfilled
-      // replaces `items` wholesale and would wipe any approval notifications
-      // synced before it.
+      // replaces membership and ordering wholesale and would wipe any approval
+      // notifications synced before it. Its merge preserves local ack flags
+      // only, so it is no protection for a row the response does not carry.
       dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
       // Eagerly subscribe to subagent events on first connect too.
@@ -630,6 +648,20 @@ export function useWebSocket() {
           case 'slot_title':
             dispatch(sseSlotTitle(data as { key: string; title: string }))
             break
+          case 'session_summary': {
+            // A turn finished and the backend regenerated this session's intent
+            // summary. Invalidate so the panel picks it up immediately.
+            //
+            // This event is why the summary panel does not poll: the summary is
+            // deliberately a pull-friendly artifact — a panel on an interval
+            // would reward refreshing, which is the checking loop the feature
+            // exists to remove. Push-on-change gives freshness without it.
+            const key = (data as { key?: string }).key
+            if (key) {
+              queryClient.invalidateQueries({ queryKey: ['session-summary', key] })
+            }
+            break
+          }
           case 'artifact_update': {
             // Live artifact refresh: the backend broadcasts from the artifact
             // mutation funnel (create / content PATCH / revert / relocate /
@@ -714,7 +746,14 @@ export function useWebSocket() {
             }
             // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
             if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
-              new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), tag: 'kirocrew-approval' })
+              // Android Chrome throws "Illegal constructor" for page-context
+              // Notification; an uncaught throw here kills the whole message
+              // handler, so the native toast is best-effort.
+              try {
+                new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), tag: 'kirocrew-approval' })
+              } catch {
+                /* unsupported platform */
+              }
             }
             dispatch(addNotification({
               kind: 'approval',
@@ -820,7 +859,7 @@ export function useWebSocket() {
             // trigger (no-op unless an L2 theme with that manifest sound is
             // active + unmuted). User/tool messages don't chime.
             if (data.role === 'assistant') emitThemeSound('message-received')
-            if (data.role === 'user' || data.role === 'inject' || data.role === 'subagent') { stopVoice(); spokenLenRef.current = 0; synthChainRef.current = Promise.resolve() }
+            if (data.role === 'user' || data.role === 'inject' || data.role === 'subagent') { stopVoice(); spokenLenRef.current = 0; spokeThisTurnRef.current = false; synthChainRef.current = Promise.resolve() }
             if (data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
             }
@@ -893,9 +932,46 @@ export function useWebSocket() {
             break
           }
           case 'tool_call':
+            // Re-broadcast BEFORE the store dispatches: ChatPage opens the Browser
+            // panel from this event, and a reducer that throws on a malformed
+            // payload must not also cost the panel its only signal.
+            window.dispatchEvent(new CustomEvent('kirocrew-tool-call', { detail: data }))
             dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
             if (data.slot) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'tool', text: sanitizeLlmOutput((data as Record<string, unknown>).purpose as string || data.tool), toolName: sanitizeLlmOutput(data.tool), ts: Date.now() }))
+              // A refinement (`is_update`) carries only the fields it refines,
+              // so merge it into the live status the way sseToolActivity merges
+              // the tool-log entry: an update that omits `purpose` must not
+              // replace the purpose the initial tool_call supplied with the raw
+              // command, and one that omits `tool` must not blank the title.
+              // Without this the session-list row of a running session flips
+              // from the agent's purpose to the literal command mid-call.
+              // Merging is gated on the tool_call_id matching, so when several
+              // tools run in parallel a refinement of one cannot inherit a
+              // sibling's purpose.
+              //
+              // `text` holds the PURPOSE ALONE and stays empty when the agent
+              // supplied none — the fallback to the tool title belongs to
+              // toolStatusLabel, which owns the label rule. Storing the title
+              // in `text` instead would make the two indistinguishable here,
+              // and a purpose-less call would then pin the initial stub title
+              // ("Terminal") for the whole call instead of advancing to the
+              // refined command.
+              const tcid = (data as Record<string, unknown>).tool_call_id as string | undefined
+              const isUpdate = (data as Record<string, unknown>).is_update === true
+              const purpose = sanitizeLlmOutput((data as Record<string, unknown>).purpose as string || '')
+              const toolName = sanitizeLlmOutput(data.tool || '')
+              const prev = store.getState().chat.slotStatusDetail[data.slot]
+              const mergeInto = isUpdate && tcid && prev?.kind === 'tool' && prev.toolCallId === tcid
+                ? prev
+                : undefined
+              dispatch(setSlotStatusDetail({
+                slot: data.slot,
+                kind: 'tool',
+                text: purpose || mergeInto?.text || '',
+                toolName: toolName || mergeInto?.toolName || '',
+                ...(tcid ? { toolCallId: tcid } : {}),
+                ts: Date.now(),
+              }))
             }
             // Note: do NOT dispatch sseChatMessage here. The backend persists the
             // tool message via slot.append and broadcasts it as 'chat_message'.
@@ -1159,13 +1235,18 @@ export function useWebSocket() {
               const last = [...msgs].reverse().find(m => m.role === 'assistant')
               if (last) {
                 const remaining = last.content.slice(spokenLenRef.current).trim()
-                if (remaining.length >= 10) {
+                // spokenLen 0 after streaming spoke means chat_segment reset
+                // the counter — "remaining" would then be the whole reply,
+                // repeating everything already spoken.
+                const segmentReset = spokeThisTurnRef.current && spokenLenRef.current === 0
+                if (remaining.length >= 10 && !segmentReset) {
                   synthChainRef.current = synthChainRef.current
                     .then(() => api.voiceSynthesize(data.slot, remaining))
                     .catch(() => {})
                 }
               }
               spokenLenRef.current = 0
+              spokeThisTurnRef.current = false
             } else if (data.slot === store.getState().chat.activeSlot) {
               // Re-check config in case it changed
               api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
@@ -1298,12 +1379,6 @@ export function useWebSocket() {
             queryClient.invalidateQueries({ queryKey: ['pull-request-checks', delta.url] })
             break
           }
-          case 'browser_frame':
-            // Live mirror frame (a screenshot the agent took, forwarded by the
-            // MCP proxy). Routed via a window event so the Browser panel
-            // (WebPreviewPanel via useBrowserFrame) can render without a Redux slice.
-            window.dispatchEvent(new CustomEvent('kirocrew-browser-frame', { detail: data }))
-            break
           case 'computer_use_frame':
             // Computer-use PiP frame — the downscaled JPEG the agent's own
             // computer_get_state call already captured, relayed by the gateway

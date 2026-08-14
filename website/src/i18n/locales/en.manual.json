@@ -135,7 +135,12 @@
     },
     "fileExplorer": {
       "fileViewer": {
-        "copy_path_2": "Copy path: {{path}}"
+        "copy_path_2": "Copy path: {{path}}",
+        "more_options": "More options",
+        "open_in_file_explorer": "Open in File Explorer",
+        "open_in_finder": "Open in Finder",
+        "path_copied_to_clipboard_no_desktop_available": "Path copied to clipboard (no desktop available)",
+        "show_in_file_manager": "Show in file manager"
       },
       "searchPanel": {
         "search_failed": "search failed",
@@ -1115,12 +1120,6 @@
       "open_a_chat_page_to_move_this_terminal_there": "Open a chat page to move this terminal there",
       "terminal": "Terminal"
     },
-    "browserAuthPrompt": {
-      "auth_gate": "Auth gate: {{gateType}}",
-      "retry": "Retry",
-      "retrying": "Retrying...",
-      "unknown": "unknown"
-    },
     "chatInput": {
       "agent": "Agent: {{name}}",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
@@ -1382,13 +1381,7 @@
       "worktree_disabled_no_project_directory": "\"Add to this session\" pre-fills the composer — nothing is sent until you press send. Worktrees are unavailable here: this session has no project directory (pick one with the composer's Project chip)."
     },
     "inboundLinkChip": {
-      "confirm_release": "Release this session from {{label}}?\n\nMessages sent there will stop arriving here, and replies will stop being delivered there. You can re-attach with !sessions from that channel.",
-      "driven_from": "Driven from {{label}}",
-      "release": "Release",
-      "release_aria": "Release this session from {{label}}",
-      "release_failed": "Could not release the session: {{reason}}",
-      "released": "Released from {{label}}",
-      "tooltip": "This session is two-way with {{label}}: replies are delivered there, and messages sent there arrive here."
+      "driven_from": "Driven from {{label}}"
     },
     "instancesViewport": {
       "connecting": "Connecting…",
@@ -1407,7 +1400,10 @@
       "tunnel_connected_token_valid_auto_refresh": "Tunnel connected. Token valid {{valid}}; auto-refresh {{refresh}}.",
       "tunnel_connecting": "Tunnel connecting…",
       "tunnel_error": "tunnel error",
-      "tunnel_state": "Tunnel {{state}}."
+      "tunnel_state": "Tunnel {{state}}.",
+      "stopped": "stopped",
+      "show_all_crews": "Show all crews",
+      "collapse_crews": "Collapse crews"
     },
     "issuePanel": {
       "add_to_chat": "Add to chat",
@@ -1470,6 +1466,7 @@
     },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "Agent specs missing",
+      "agent_specs_rejected": "Agent specs rejected",
       "another_sandbox_already_confines_kiro_crew_so_it": "Another sandbox already confines Kiro Crew, so its own sandbox cannot nest inside it. This host's sandbox is not broken.",
       "copied": "Copied",
       "copy_command": "Copy command",
@@ -1481,7 +1478,9 @@
       "kiro_cli_is_installed_but_could_not_be_verified": "Kiro CLI is installed but could not be verified",
       "kiro_cli_is_installed_finish_signing_in_to_conti": "Kiro CLI is installed. Finish signing in to continue.",
       "kiro_cli_is_required_on_the_gateway_host": "Kiro CLI is required on the {{platform}} gateway host.",
+      "kiro_cli_s_reason": "Why it was refused",
       "kiro_cli_was_found_on_this_host": "Kiro CLI was found on this host.",
+      "kiro_cli_will_not_load_kiro_crew_s_agent_specs": "Kiro CLI will not load Kiro Crew's agent specs",
       "kiro_crew_installs_the_agent_specs_kiro_cli_load": "Kiro Crew installs the agent specs Kiro CLI loads before it can answer anything.",
       "kiro_crew_isolates_the_agent_in_an_os_level_sand": "Kiro Crew isolates the agent in an OS-level sandbox before it runs anything.",
       "kiro_crew_s_agent_specs_are_not_installed": "Kiro Crew's agent specs are not installed",
@@ -1489,10 +1488,14 @@
       "linux_sandbox_guide": "Linux sandbox guide",
       "missing": "Missing",
       "open_kiro_cli_setup": "Open Kiro CLI setup",
+      "rejected": "Rejected",
       "remedy_apparmor_service_install": "Install Kiro Crew as a service. It also writes a narrow AppArmor profile (kirocrew-userns) that grants only the user-namespace permission, to the Kiro Crew service alone — nothing else on the machine is loosened.",
       "remedy_max_user_namespaces": "User namespace creation hit the per-user cap, which usually means user.max_user_namespaces is 0 on a hardened host. Raise it, and persist the value in /etc/sysctl.d/ so it survives a reboot.",
       "remedy_no_user_ns": "This kernel was built without user-namespace support (CONFIG_USER_NS), so there is no setting to change. A different kernel is the only fix.",
+      "remedy_spec_rejected_rewrite": "Rewrite the specs from scratch on the gateway host. This discards Kiro Crew's own MCP tool selections and rebuilds them from defaults.",
+      "remedy_spec_rejected_update": "Update Kiro Crew. This is the fix when Kiro CLI has moved to a spec format this version does not know how to write.",
       "remedy_userns_denied": "The kernel refused to create the user namespace. On Debian-family hosts check this legacy knob, and persist the value in /etc/sysctl.d/ so it survives a reboot. Inside a container it is usually the container's own seccomp filter denying unshare, which is fixed with container run flags rather than host settings.",
+      "repair_rewrites_the_specs_kiro_crew_owns": "Check again asks Kiro CLI to load the specs again. It does not rewrite them, because overwriting a spec that is already on disk would discard any MCP tool access you have changed. If re-checking does not clear this, one of the two remedies below will.",
       "required": "Required",
       "run_kirocrew_doctor_on_the_gateway_host_for_a_ful": "Run this on the gateway host for a full prerequisite report, including which sandbox step failed.",
       "sandbox_unavailable": "Sandbox unavailable",
@@ -1503,6 +1506,7 @@
       "sign_in_with_kiro_cli_on_the_gateway_host": "Sign in with Kiro CLI on the gateway host, then check again. Kiro CLI manages the sign-in and keeps the credentials.",
       "technical_detail": "Technical detail",
       "the_check_hit_a_temporary_limit_and_was_not_cach": "The check hit a temporary resource limit. Try again — do not disable the sandbox.",
+      "the_files_are_on_disk_but_kiro_cli_refuses_them": "The files are on disk, but Kiro CLI refuses them, so it drops them from its agent list. Kiro Crew's agent then resolves to Kiro CLI's default one, without any of Kiro Crew's tools.",
       "the_gateway_returned_an_unexpected_error": "The gateway returned an unexpected error.",
       "the_gateway_returned_no_prerequisite_status": "The gateway returned no prerequisite status.",
       "the_repair_attempt_failed": "The repair attempt failed",
@@ -1513,23 +1517,13 @@
       "waiting": "Waiting"
     },
     "linkedSurfacesSection": {
-      "confirm_release": "Release this session from {{label}}?\n\nMessages sent there will stop arriving here, and replies will stop being delivered there. You can re-attach with !sessions from that channel.",
-      "confirm_stop_mirroring": "Stop mirroring this session to {{label}}?\n\nReplies will no longer be delivered there. You can re-link it later from the configured-channel picker.",
-      "connected": "Connected: {{label}}",
-      "mirror": "Mirror",
-      "mirror_stopped": "Stopped mirroring to {{label}}",
-      "offline": "Offline",
-      "origin": "Origin",
-      "post_reminder": "Post reminder in {{label}}",
-      "release": "Release {{label}}",
-      "released": "Released from {{label}}",
-      "link_failed": "Could not link channel: {{reason}}",
-      "reminder_failed": "Could not post reminder: {{reason}}",
-      "reminder_sent": "Reminder posted in {{label}}",
-      "stop_failed": "Could not stop mirroring: {{reason}}",
-      "stop_mirroring": "Stop mirroring to {{label}}",
-      "two_way": "Two-way",
-      "unavailable": "This destination is unavailable."
+      "connect_failed": "Could not connect to {{label}}: {{reason}}",
+      "connect_to": "Connect to {{label}}",
+      "disconnect_failed": "Could not disconnect from {{label}}: {{reason}}",
+      "disconnect_from": "Disconnect from {{label}}",
+      "held_elsewhere": "{{label}} is in use by another session.",
+      "unavailable": "This destination is unavailable.",
+      "unknown_error": "unknown error"
     },
     "linkPreview": {
       "copied": "Copied",
@@ -1676,7 +1670,8 @@
       "publishing_2": "Publishing…",
       "scan_blocked_finding_one": "Scan blocked ({{count}} finding)",
       "scan_blocked_finding_other": "Scan blocked ({{count}} findings)",
-      "unexpected_response": "Unexpected response"
+      "unexpected_response": "Unexpected response",
+      "public_exposure_warning": "Anyone with the published link can view this content. It is served on the public internet with no authentication."
     },
     "pullRequestPanel": {
       "all_checks_passed": "All checks passed",
@@ -1912,7 +1907,8 @@
       "expand_preview_hide_nav_sessions": "Expand (hide nav and sessions)",
       "responsive_desktop": "Responsive (desktop)",
       "can_t_preview_this_dashboard_here": "Can't preview this dashboard here",
-      "this_url_is_the_dashboard_s_own_server_which_ref": "This URL is the dashboard's own server, which refuses to be embedded. Enter a dev server URL instead."
+      "this_url_is_the_dashboard_s_own_server_which_ref": "This URL is the dashboard's own server, which refuses to be embedded. Enter a dev server URL instead.",
+      "more_actions": "More actions"
     },
     "welcomeView": {
       "autopilot": "Autopilot",
@@ -2165,6 +2161,7 @@
       "logs": "Logs",
       "side": "Side",
       "subagents": "Subagents",
+      "summary": "Summary",
       "workflows": "Workflows"
     }
   },
@@ -2281,7 +2278,9 @@
       "removed_from_registry_your_aws_config_is_untouche": "Removed from registry (your ~/.aws/config is untouched).",
       "unknown": "unknown",
       "unknown_2": "(unknown)",
-      "update_failed": "update failed"
+      "update_failed": "update failed",
+      "public_by_link_warning": "Published URLs are public-by-link: anyone with the link can view the content — it is served on the public internet with no authentication.",
+      "random_domain_note": "Content is served at a random *.cloudfront.net domain — don't publish anything you wouldn't put on the open internet."
     },
     "artifactDetailPage": {
       "agent_chat": "Agent chat",
@@ -2505,6 +2504,7 @@
       },
       "sideChat": {
         "ask_a_side_question_2": "Ask a side question…",
+        "question_too_long": "Question too long — reduce to under ~{{max}} characters (yours: {{current}})",
         "queue_cancel_failed": "Could not cancel that queued question",
         "queue_edit_failed": "Could not update that queued question",
         "steer_demoted_to_queue": "The turn ended — queued instead"
@@ -2531,6 +2531,8 @@
         "menu_side_desc": "Parallel chat, shared context",
         "menu_subagents": "Subagents",
         "menu_subagents_desc": "Live agent activity & transcripts",
+        "menu_summary": "Summary",
+        "menu_summary_desc": "What this session is about and what needs you",
         "menu_workflows": "Workflows",
         "menu_workflows_desc": "Runs, phases & restartable steps",
         "open_in_editor_2": "Open {{path}} in editor",
@@ -2599,6 +2601,39 @@
         "wait_ending": "Ending…",
         "wait_remaining": "{{time}} left",
         "wait_status": "Waiting"
+      },
+      "sessionSummary": {
+        "empty_body": "A summary is written when a turn finishes. Send a message to get one for this session.",
+        "empty_title": "No summary yet",
+        "failed": "Try again, or reload the page if it keeps failing.",
+        "failed_title": "Could not load the summary",
+        "from_intent": "Part of {{intent}}",
+        "loading": "Loading summary…",
+        "most_recent_first": "Most recently worked first",
+        "not_generated": "Not generated yet",
+        "nothing_outstanding": "Nothing outstanding.",
+        "off_body": "Turning them on summarizes new turns; earlier turns are not backfilled.",
+        "off_title": "Session summaries are off",
+        "open_items_heading": "Open items",
+        "open_items_more": "+{{n}} more",
+        "open_items_one": "{{count}} open item",
+        "open_items_other": "{{count}} open items",
+        "pivoted_from_turn": "Pivoted here from your question at turn {{turn}}",
+        "project_notes": "How this project works",
+        "reload": "Check again",
+        "retry": "Try again",
+        "returned_to": "Resumed ×{{times}}",
+        "state_active": "Active",
+        "state_done": "Done",
+        "state_dropped": "Dropped",
+        "state_needs_you": "Needs you",
+        "suggested_next": "Suggested next",
+        "title": "Summary",
+        "turns": "turns {{ranges}}",
+        "updated": "Updated",
+        "updated_behind": "Updated {{when}} — behind the conversation",
+        "where_it_stands": "Where it stands",
+        "you_asked_for": "You asked for"
       }
     },
     "chatPage": {
@@ -2673,9 +2708,9 @@
       "last_30_days": "Last 30 Days",
       "last_7_days": "Last 7 Days",
       "dashboard_source": "Dashboard",
-      "mirroring_to": "Mirroring to {{label}}",
-      "two_way_with_channel": "This session is two-way with {{channel}}: replies are delivered there, and messages sent there arrive here.",
-      "two_way_with_direct_message": "This session is two-way with a direct message: replies are delivered there, and messages sent there arrive here.",
+      "connected_to": "Connected to {{label}}",
+      "started_in_channel": "This conversation started in {{channel}}.",
+      "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
       "new": "New",
       "new_chat": "New chat",
@@ -2883,7 +2918,19 @@
       "verifying": "Verifying",
       "restart_pending": "Restart pending",
       "cutover_staged_run_the_restart_command_to_finish": "Cutover staged: this worktree becomes live when the gateway next starts. Run `{{cmd}}` to finish it — the gateway is still running the previous checkout until then.",
-      "stages_the_code_behind_the_live_dashboard_manual": "Stages this worktree as the live target (same port, same data). Dev Fleet cannot restart this gateway, so the swap takes effect when you run `{{cmd}}` yourself — this page will NOT reconnect on its own. Refused unless the worktree is provisioned and built."
+      "stages_the_code_behind_the_live_dashboard_manual": "Stages this worktree as the live target (same port, same data). Dev Fleet cannot restart this gateway, so the swap takes effect when you run `{{cmd}}` yourself — this page will NOT reconnect on its own. Refused unless the worktree is provisioned and built.",
+      "cancel_staged_cutover": "Cancel staged cutover",
+      "keeps_name_the_live_target_and_discards_the_stag": "Keeps {{name}} as the live target and discards the staged switch to {{staged}}. Nothing restarts — the gateway keeps running the code it is running now.",
+      "keeps_this_checkout_the_live_target_and_discards": "Keeps this checkout the live target and discards the staged switch to {{staged}} (nothing restarts)",
+      "cancel_staged_cutover_2": "Cancel staged cutover?",
+      "keep_cutover": "Keep cutover",
+      "cutover_staged_run_cmd_to_finish_or_cancel": "Cutover staged: this worktree becomes live when the gateway next starts. Run `{{cmd}}` to finish it, or use this row’s menu → Cancel staged cutover to back out. The gateway is still running the previous checkout until then.",
+      "keeps_the_live_checkout_the_live_target_and_disc": "Keeps the live checkout as the live target and discards the staged switch to {{staged}} (nothing restarts)",
+      "restarting_completes_the_pending_cutover_boots": "Restarting completes the pending cutover: the gateway comes back up on \"{{staged}}\", not the current checkout. The dashboard will briefly disconnect and reconnect automatically. To back out instead, use Cancel staged cutover.",
+      "no_checkout_found": "No Kiro Crew checkout found",
+      "no_checkout_found_help": "Dev Fleet manages the git worktrees of a Kiro Crew source checkout. None was found in your project directory, in the checkout serving this dashboard, or in the usual clone locations.",
+      "no_checkout_found_env_example": "KIROCREW_DEVFLEET_REPO=/path/to/your/checkout",
+      "no_checkout_found_action": "Set the environment variable below, or add dev_fleet.repo_path to config.json in your Kiro Crew data directory (~/.kiro/crew by default) to make it stick, then restart the gateway."
     },
     "developerPage": {
       "tabs": {
@@ -2978,6 +3025,7 @@
         "graph_view": "Graph View",
         "list_view": "List View",
         "sources_tab": "Sources",
+        "settings_tab": "Settings",
         "status_active": "Active",
         "status_archived": "Archived"
       },
@@ -3035,6 +3083,31 @@
         "weeks_ago": "{{n}}w ago",
         "welcome_to_the_knowledge_library": "Welcome to the Knowledge Library",
         "your_centralized_knowledge_base_with_entity_extr": "Your centralized knowledge base with entity extraction, graph relationships, and full-text search."
+      },
+      "settings": {
+        "title": "Ingestion Settings",
+        "description": "Control how documents are extracted, indexed, and rate-limited. Changes take effect on the next watcher sweep unless noted otherwise.",
+        "save_failed": "Failed to save knowledge setting",
+        "chunk_limit_label": "Per-source chunk limit",
+        "chunk_limit_desc": "Maximum chunks a single source may ingest per scan cycle. Each chunk costs one LLM extraction call. 0 = no limit.",
+        "max_sources_label": "Max sources",
+        "max_sources_desc": "Maximum number of auto-discovered knowledge sources. Manually added sources are not capped. 0 = no limit.",
+        "embed_rate_label": "Embedding rate limit",
+        "embed_rate_desc": "How many embedding requests per minute when indexing documents into the vector store. Lower values reduce system load but slow down indexing. 0 = unlimited.",
+        "model_label": "Extraction model",
+        "model_desc": "LLM used for chunking & extracting document content. \"Auto\" inherits your default chat model. Set a cheaper model (e.g. claude-haiku-4.5) to control extraction cost.",
+        "model_auto": "auto (use chat model)",
+        "pool_size_label": "Extraction pool size",
+        "pool_size_desc": "Concurrent extraction workers. More workers = faster indexing, higher peak resource usage.",
+        "requires_restart": "restart required",
+        "auto_add_label": "Auto-add documents",
+        "auto_add_desc": "Let the agent add documents it reads during normal work to the Knowledge Library.",
+        "auto_project_label": "Auto-register project documents",
+        "auto_project_desc": "Register documents from each project you work in as a Knowledge source automatically.",
+        "auto_artifacts_label": "Auto-add saved artifacts",
+        "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
+        "load_failed": "Failed to load settings.",
+        "retry": "Retry"
       }
     },
     "logsPage": {
@@ -3434,6 +3507,7 @@
         "published": "published {{when}}",
         "restarting": "Restarting...",
         "retry": "Retry",
+        "update_error_install_unknown": "Something went wrong while installing the update.",
         "update_error_integrity": "The download failed its integrity check and was discarded.",
         "update_error_misconfigured": "This build can't check for updates. Reinstall to fix it.",
         "update_error_no_release": "No update has been published for this channel yet.",
@@ -3539,12 +3613,6 @@
         "where_to_find_the_bot_token": "Where to find the bot token",
         "where_to_find_the_credential": "Where to find the {{label}}"
       },
-      "browserPanel": {
-        "cannot_reach_gateway_is_it_running": "Cannot reach gateway. Is it running?",
-        "confirm": "Confirm",
-        "save": "Save",
-        "saving": "Saving..."
-      },
       "channelsPanel": {
         "checking": "Checking…",
         "connected": "Connected",
@@ -3613,7 +3681,10 @@
         "somewhat": "Somewhat",
         "tail_preserve_end_final_summary": "Tail (preserve end / final summary)",
         "ux_designer": "UX Designer",
-        "failed_to_save_knowledge_setting": "Failed to save knowledge setting"
+        "failed_to_save_knowledge_setting": "Failed to save knowledge setting",
+        "session_summaries": "Session summaries",
+        "summarize_each_session_by_intent_in_the_right_pa": "Summarize each session by intent. Uses tokens on turns that change the session.",
+        "failed_to_save_session_summaries": "Failed to save session summaries setting"
       },
       "displayPanel": {
         "color": "Color {{n}}",
@@ -3936,6 +4007,7 @@
         "connect_via_qr": "Connect via QR",
         "could_not_reach_the_wechat_login_service": "Could not reach the WeChat login service.",
         "could_not_start_the_login_flow": "Could not start the login flow.",
+        "created_for_you_when_you_turn_this_on_if_it_does": "Created for you when you turn this on, if it does not exist yet.",
         "scanned_confirm_in_wechat": "Scanned — confirm in WeChat",
         "sign_in_again": "Sign in again",
         "waiting_for_scan": "Waiting for scan…"
@@ -4000,6 +4072,28 @@
         "support": "Support",
         "blurb": "Something not working? Send us a diagnostics report — logs are scrubbed of secrets first.",
         "report_a_problem": "Report a Problem"
+      },
+      "browserPanel": {
+        "attach_title": "Use your own logged-in browser",
+        "token_stored": "saved",
+        "browser_missing": "no browser yet",
+        "install_steps_intro": "Installing runs three steps.",
+        "step_npm": "Install @playwright/cli globally with npm.",
+        "step_browser": "Download the browser it drives.",
+        "step_skills": "Register its skills so the agent knows the commands.",
+        "engines_title": "Browsers on this machine",
+        "engines_explains": "Each engine is a separate download. Chromium is the one attach mode needs; add Firefox or WebKit to check a page in them.",
+        "engine_chromium": "Chromium",
+        "engine_firefox": "Firefox",
+        "engine_webkit": "WebKit",
+        "engine_downloaded": "Downloaded",
+        "engine_download": "Download",
+        "engine_needed_for_attach": "needed for attach",
+        "node_missing": "Needs Node.js 20 or newer, and no Node was found on this machine.",
+        "node_how": "Install it, then reopen this page. <dl>Download Node.js</dl>",
+        "node_no_admin": "On a machine where you cannot install Node — no admin rights, or a registry that needs a login — run the command below on the machine where Kiro Crew is running. The script installs Node and the CLI into your home directory, and tells you how to fix it if your network blocks the download.",
+        "copy_command": "Copy command",
+        "copied": "Copied"
       }
     },
     "systemPage": {},
@@ -4063,7 +4157,7 @@
         "label": "About"
       },
       "browser": {
-        "description": "Playwright browser mode, extension token, and auth configuration",
+        "description": "Install the Playwright CLI and manage attach access",
         "label": "Browser"
       },
       "channels": {

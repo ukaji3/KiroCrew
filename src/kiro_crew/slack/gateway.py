@@ -188,7 +188,7 @@ from kiro_crew.platform.governance_profiles import (
 )
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import safety_override
-from kiro_crew.sandbox import warm_backend
+from kiro_crew.sandbox import ensure_agents_slice_limits, warm_backend
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
@@ -1289,14 +1289,12 @@ class GatewayOrchestrator:
                     # implicit trust path here: an unowned background command
                     # always prompts.
                     #
-                    # This used to consult an "all open conversations are
-                    # trusted" rule, which was narrower than the heuristic it
-                    # replaced but still reproduced the exact harm this change
-                    # exists to remove. For a single-user dashboard with one
-                    # trusted chat open -- the typical state -- `all()` is
-                    # trivially satisfied, so a cron's command was silently
-                    # auto-approved with no prompt: privilege the job was never
-                    # granted, justified by trust the user granted to a
+                    # An "all open conversations are trusted" rule does not
+                    # narrow this enough to be safe: for a single-user dashboard
+                    # with one trusted chat open -- the typical state -- `all()`
+                    # is trivially satisfied, so a cron's command would be
+                    # silently auto-approved with no prompt: privilege the job
+                    # was never granted, justified by trust the user granted to a
                     # conversation the job has nothing to do with.
                     #
                     # Session trust means "auto-approve tools for THIS chat
@@ -4410,6 +4408,10 @@ class GatewayOrchestrator:
                 return
             slot._recovery_retrigger_count += 1
             slot._recovery_chat_triggered = True
+            # Bound here rather than at module scope: this reads ``_run_chat`` from
+            # ``dashboard.chat``, a different module than the top-level
+            # ``chat_runner`` import, and resolving it per call is what lets a test
+            # patch ``dashboard.chat._run_chat`` and have this path observe it.
             from kiro_crew.dashboard.chat import _run_chat
 
             failures = slot._pending_subagent_failures[:]
@@ -4745,11 +4747,16 @@ class GatewayOrchestrator:
                 # digest — held members return before the announce is sent, so
                 # without accumulation only the last member's guard_msg would
                 # survive and a mid-wave "you MUST ask the user" ceiling would
-                # be silently dropped (Opus MEDIUM / Arbiter item 3).
+                # be silently dropped.
                 if guard_msg:
                     bp["guard_msgs"].append(guard_msg)
                 _oc = info.outcome
-                bp["stopped" if _oc == "stopped" else "err" if _oc == "failed" else "ok"] += 1
+                if _oc == "stopped":
+                    bp["stopped"] += 1
+                elif _oc == "failed":
+                    bp["err"] += 1
+                else:
+                    bp["ok"] += 1
                 # Exception-first digest content: failures/stops carry detail,
                 # successes are one pointer line (full output stays on disk).
                 if _oc == "completed":
@@ -4770,7 +4777,7 @@ class GatewayOrchestrator:
                     # members only (running OR still queued behind the
                     # stagger gate) — an unrelated agent under the same
                     # parent must neither hold the digest hostage nor
-                    # release it early (GPT 5.6 round-1 HIGH).
+                    # release it early.
                     try:
                         _last = bool(
                             self.subagent_mgr
@@ -4781,7 +4788,7 @@ class GatewayOrchestrator:
                 if _last:
                     self._batch_progress.pop(_batch_id, None)
                     # Prune per-wave bookkeeping for ALL wave sizes (bounds
-                    # _seen_batches / _batch_submitted growth — Opus LOW).
+                    # _seen_batches / _batch_submitted growth).
                     try:
                         if self.subagent_mgr:
                             self.subagent_mgr.finalize_batch(_batch_id)
@@ -4829,14 +4836,14 @@ class GatewayOrchestrator:
                         # Held for the next chunk — the terminal WS event,
                         # tracker accounting, and stats above already ran;
                         # only the per-agent injection turn is suppressed.
-                        # Restart safety (Arbiter item 1): flag the member so
-                        # the run loop SKIPS mark_delivered — its result is
-                        # not in the parent's context yet, and a "delivered"
-                        # tombstone would hide it from orphan reconciliation.
-                        # If the gateway restarts mid-chunk, PR #298's orphan
-                        # path finds these undelivered results and delivers a
-                        # recovery digest; in normal operation they are marked
-                        # delivered when their chunk flushes.
+                        # Restart safety: flag the member so the run loop SKIPS
+                        # mark_delivered — its result is not in the parent's
+                        # context yet, and a "delivered" tombstone would hide it
+                        # from orphan reconciliation. If the gateway restarts
+                        # mid-chunk, the orphan path finds these undelivered
+                        # results and delivers a recovery digest; in normal
+                        # operation they are marked delivered when their chunk
+                        # flushes.
                         info._digest_held = True
                         # Hold clock for the reaper's hold-deadline sweep. Kept
                         # separate from _digest_held (the restart-safety flag the
@@ -4873,7 +4880,7 @@ class GatewayOrchestrator:
                     if len(_digest_body) > 60_000:
                         _digest_body = _digest_body[:60_000] + "\n…(digest truncated)"
                     # Deduped union of this chunk's members' escalation
-                    # guards — not just the flushing member's (Arbiter item 3).
+                    # guards — not just the flushing member's.
                     _guards = "".join(dict.fromkeys(bp.get("guard_msgs", [])))
                     bp["chunks"] += 1
                     bp["flushed"] = bp["done"]
@@ -5505,7 +5512,6 @@ class GatewayOrchestrator:
                     body = f"{body}\n\n{cron_response}"
                     logger.info("Subagent %s → cron session %s", info.id, parent_key)
                     # also deliver the synthesized response to Slack.
-                    # Previously it only reached the dashboard notification body.
                     # honor the parent cron job's silent flag too —
                     # info.silent is never set from the cron's silent setting for
                     # spawn_run sub-agents, so a silent cron would otherwise still
@@ -7240,6 +7246,12 @@ class GatewayOrchestrator:
         self._channel_handles = await registry.start_channels(self, descriptors, permitted)
 
 
+# Strong reference to the background slice-limit apply task: the event loop
+# holds tasks weakly, so a fire-and-forget create_task with no reference can
+# be garbage-collected mid-flight.
+_SLICE_LIMITS_TASK: "asyncio.Task[None] | None" = None
+
+
 async def run_gateway(
     cfg: KiroCrewConfig,
     *,
@@ -7263,6 +7275,31 @@ async def run_gateway(
     # Standalone composes the all-defaults context (identical to today); a
     # non-standalone profile that cannot compose its companion fails closed.
     boot_platform(cfg)
+
+    # ── Aggregate cgroup ceiling for all agent scopes ──
+    # The per-spawn scope wrapper (sandbox.cgroup_scope_argv) bounds ONE spawn
+    # tree; this bounds ALL of them together by putting MemoryMax/TasksMax on
+    # their shared parent slice. Scheduled as a contained background task —
+    # never awaited on the boot path, so a slow user manager (the systemctl
+    # call carries a 15s timeout) cannot delay dashboard binding. The module
+    # global keeps a strong reference (the loop holds tasks weakly). Skipped
+    # in test_mode: the offline E2E gate must not mutate the developer's real
+    # user manager. Failure is non-fatal — the function logs and the
+    # per-scope ceilings still apply.
+    global _SLICE_LIMITS_TASK
+    if not test_mode:
+
+        async def _apply_slice_limits() -> None:
+            try:
+                await asyncio.to_thread(ensure_agents_slice_limits)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "aggregate cgroup ceiling apply failed", exc_info=True
+                )
+
+        _SLICE_LIMITS_TASK = asyncio.create_task(
+            _apply_slice_limits(), name="agents-slice-limits"
+        )
 
     # ── Anonymous usage beacon (at most one HTTP GET per day) ──
     # Detached daemon thread, NOT awaited: ``beacon.send`` is blocking urllib

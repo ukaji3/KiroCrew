@@ -17,6 +17,7 @@ import type {
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { installApiTransport } from './apiTransport'
+import type { SessionSummary } from '../types/sessionSummary'
 import { queryClient } from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
@@ -60,6 +61,25 @@ export type McpManagedServer = {
 export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
 
 /**
+ * A Connections provider's approval-URL mint, as the card reads it.
+ *
+ * `idle` means no mint exists — distinct from `failed`, which is a mint that ran
+ * and produced nothing. `oauth_url` is present only while `waiting`, and only
+ * while the process holding the URL is alive: the backend reports `expired`
+ * rather than serving a URL no redirect can be redeemed against.
+ */
+export interface ConnectionMintState {
+  slug: string
+  state: 'idle' | 'minting' | 'waiting' | 'granted' | 'failed' | 'expired'
+  oauth_url?: string
+  reason?: string
+  /** Opaque id of the backend row, unique across gateway restarts as well as
+   *  within one process. Reported so a row can be told apart from its
+   *  successor for the same provider. */
+  token?: string
+}
+
+/**
  * A single task-runner plan step as sent to the server. Known fields are
  * typed; the payload is forwarded verbatim, so extra fields are permitted via
  * the index signature.
@@ -88,6 +108,54 @@ export interface InstallStreamResult {
   clientInstall?: { shell?: string; postInstall?: string }
 }
 
+
+/**
+ * The Playwright CLI browser view, as reported by `GET /api/browser/view` and
+ * returned again by `POST /api/browser/view/start`.
+ *
+ * The CLI serves its own dashboard over loopback HTTP (`show --port`), which
+ * already carries the session grid, live screencast, tab bar and full remote
+ * mouse/keyboard input — so the dashboard's Browser panel frames that URL rather
+ * than assembling a picture from pushed screenshot frames.
+ *
+ * Three states, and the UI must be able to tell them apart:
+ *   • `running`     — `url` and `port` are set; frame it.
+ *   • `stopped`     — installed but no view server up; a start is worth offering.
+ *   • `unavailable` — it cannot run here at all (CLI not installed, unsupported
+ *                     host). `reason` says why, in words meant for a human.
+ *
+ * `reason` is server-authored prose, so it is rendered VERBATIM and never
+ * translated: inventing a catalog key for it would either drop the detail or
+ * assert a cause the server did not report. A null `reason` is the caller's cue
+ * to fall back to its own generic (translated) copy.
+ */
+export interface BrowserInstallData {
+  installed: boolean
+  cli_path: string | null
+  cli_version: string | null
+  node_ok: boolean
+  node_version: string | null
+  browser_ok: boolean
+  installing: boolean
+  last_error: string | null
+  token: boolean
+  /** Per-engine download state, keyed by engine name (chromium/firefox/webkit).
+   *  Optional so an older gateway that predates it degrades to "unknown" rather
+   *  than rendering every engine as missing. */
+  browsers?: Record<string, boolean>
+  /** The OS-appropriate standalone installer command, composed by the gateway
+   *  because only it knows which OS it runs on. Offered when Node blocks the
+   *  in-app install. Optional so an older gateway simply shows nothing extra
+   *  rather than rendering `undefined`. */
+  standalone_install?: string
+}
+
+export interface BrowserViewData {
+  status: 'running' | 'stopped' | 'unavailable'
+  url: string | null
+  port: number | null
+  reason: string | null
+}
 
 /** ADVISORY macOS permission rows. Never a gate — macOS attributes a TCC grant
  * to the responsible parent process, so `missing` can coexist with a working
@@ -1064,6 +1132,22 @@ export interface KiroPrerequisiteStatus {
    * untranslated: it names the failing install step.
    */
   agent_spec_repair_error: string
+  /**
+   * Kiro Crew's own specs that are PRESENT on disk but which the installed
+   * kiro-cli refuses to load. Presence and acceptance are different questions: a
+   * rejected spec is dropped from kiro-cli's agent table, so `--agent kirocrew`
+   * resolves to the default agent with none of Kiro Crew's MCP servers — the
+   * same total failure as an absent spec, which statting the file cannot detect.
+   * Non-empty forces `ready` false and `repair_required` true.
+   *
+   * Optional because a gateway older than this field does not send it.
+   */
+  rejected_agent_specs?: string[]
+  /**
+   * kiro-cli's own reason for the first rejection above, sanitized. Shown
+   * verbatim and untranslated: it names the file and the construct refused.
+   */
+  agent_spec_rejection_detail?: string
 }
 
 export interface KiroBonusCreditGrantPayload {
@@ -1297,6 +1381,14 @@ export const api = {
   // telemetry main switch: the usage rows it reads are always written.
   telemetryContextTrace: (slot: string) =>
     fetch('/api/telemetry/context-trace?slot=' + encodeURIComponent(slot)).then(j),
+  /** Intent summary for the chat summary panel.
+   *
+   *  Read-only: it never triggers generation. Summaries are produced at turn end
+   *  by a background pass, so opening the panel cannot spend tokens and repeated
+   *  opening cannot become a refresh loop. Returns `enabled: false` (not an
+   *  error) when the feature is off, so the panel can explain itself. */
+  sessionSummary: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/summary').then(j) as Promise<SessionSummary>,
   beaconStatus: () => fetch('/api/telemetry/beacon').then(j),
   /** Local metric-collection posture for the Privacy panel's recording switch.
    *  Separate from telemetryStartup(), which parses every shard in the window. */
@@ -1711,6 +1803,11 @@ export const api = {
   mcpRemove: (name: string) => post('/api/mcp/remove', { name }).then(j),
   mcpOAuthRelay: (server: string, redirectUrl: string) =>
     post('/api/mcp/oauth/relay', { server, redirect_url: redirectUrl }).then(j) as Promise<{ ok: boolean }>,
+  // Connections approval-URL mint. POST starts one; GET is the card's feed for it.
+  connectionsMint: (slug: string) =>
+    post('/api/connections/mint', { slug }).then(j) as Promise<{ ok: boolean; slug: string; state: string; token: string }>,
+  connectionsMintState: (slug: string) =>
+    fetch(`/api/connections/mint?slug=${encodeURIComponent(slug)}`).then(j) as Promise<ConnectionMintState>,
   // MCP Gateway (shared pool)
   mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
@@ -1833,6 +1930,14 @@ export const api = {
   rewind: (slot: string, ts: string, content: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/rewind', { ts, content }).then(j),
   slackLink: (slot: string, channel?: string, threadTs?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-link', (channel || threadTs) ? { ...(channel ? { channel } : {}), ...(threadTs ? { thread_ts: threadTs } : {}) } : undefined).then(j),
   unlinkSlack: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-unlink').then(j),
+  // Sets whether turns reach the linked Slack thread. One call for both
+  // directions: a session born in its thread has no binding to re-establish, so
+  // reconnecting cannot go through slack-link.
+  pauseSlack: (slot: string, paused: boolean) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-pause', { paused }).then(j),
+  /** `origin` names WHICH non-Slack delivery to act on: the conversation the
+   *  session was born in, or its explicit mirror binding. A session can hold
+   *  both, and they mute independently, so the row has to say which it is. */
+  pauseMirror: (slot: string, paused: boolean, origin = false) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-pause', { paused, origin }).then(j),
   channelTargets: () => fetch('/api/chat/channel-targets').then(j),
   linkMirror: (slot: string, channelType: string, targetId: string) => post(
     '/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link',
@@ -2369,9 +2474,14 @@ export const api = {
     del(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`).then(j),
   editArtifactComment: (slug: string, commentId: string, body: { text: string }) =>
     patch(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`, body).then(j),
-  browserAuthRetry: () => post('/api/browser-auth-retry', {}).then(j),
-  getBrowserConfig: () => get('/api/browser/config').then(j) as Promise<{enabled: boolean; engine: string; engines: string[]; extension_mode: boolean; token: boolean; installed: boolean}>,
-  saveBrowserConfig: (body: {enabled: boolean; engine: string; extension_mode: boolean; token: string}) => put('/api/browser/config', body).then(j) as Promise<{ok: boolean; mcp_status?: string; enabled?: boolean; engine?: string; install?: {ok: boolean; step: string; detail: string; engine: string}}>,
+  // Playwright CLI browser view. GET reports; POST /start is idempotent and
+  // returns the SAME shape, so a start needs no follow-up read.
+  getBrowserInstall: () => get('/api/browser/install').then(j) as Promise<BrowserInstallData>,
+  setBrowserToken: (token: string) => put('/api/browser/token', { token }).then(j) as Promise<{ok: boolean; token: boolean}>,
+  installBrowserCli: () => post('/api/browser/install', {}).then(j) as Promise<BrowserInstallData>,
+  installBrowserEngine: (engine: string) => post('/api/browser/engine', { engine }).then(j) as Promise<BrowserInstallData>,
+  getBrowserView: () => get('/api/browser/view').then(j) as Promise<BrowserViewData>,
+  startBrowserView: () => post('/api/browser/view/start', {}).then(j) as Promise<BrowserViewData>,
   // Computer use (desktop automation). The PUT returns the refreshed snapshot so
   // the panel re-renders from server truth rather than its optimistic guess.
   getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,
@@ -2445,7 +2555,7 @@ export const api = {
   },
 
   // Tips
-  tipsNext: () => get('/api/tips/next').then(jNullable) as Promise<{ tip: { id: string; feature: string; title: string; body: string; why: string; doc: string; cta_prompt: string; action?: { kind: 'route'; label: string; route: string } | null } | null; glow: boolean } | null>,
+  tipsNext: () => get('/api/tips/next').then(jNullable) as Promise<{ tip: { id: string; feature: string; title: string; body: string; why: string; doc: string; doc_link?: string; cta_prompt: string; action?: { kind: 'route'; label: string; route: string } | null } | null; glow: boolean } | null>,
   tipsStatus: () => get('/api/tips/status').then(j) as Promise<{ enabled_config: boolean; opted_out: boolean; cadence_hours: number }>,
   tipsFeedback: (id: string, action: 'shown' | 'ack' | 'dismiss' | 'snooze' | 'helpful' | 'optout' | 'optin') => post('/api/tips/feedback', { id, action }).then(j),
 }

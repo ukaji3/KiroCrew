@@ -20,7 +20,7 @@ import re as _re
 import stat as _stat
 import threading
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +98,8 @@ from kiro_crew.config.validation import (  # noqa: F401
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
 from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort, model_supports_effort
+from kiro_crew.instances.constants import CONNECT_TIMEOUT_CEILING_SECS as _CONNECT_TIMEOUT_CEILING
+from kiro_crew.instances.constants import DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _DEFAULT_MAX_RECOVERY
 from kiro_crew.instances.constants import DEFAULT_PROBE_FAILURE_THRESHOLD as _DEFAULT_PROBE_FAILS
 from kiro_crew.instances.constants import DEFAULT_RECOVER_BACKOFF_MAX_SECS as _DEFAULT_BACKOFF_MAX
@@ -186,6 +188,12 @@ CRED_MICROSOFT_APP_ID = "MICROSOFT_APP_ID"
 CRED_MICROSOFT_APP_PASSWORD = "MICROSOFT_APP_PASSWORD"
 CRED_MICROSOFT_APP_TENANT_ID = "MICROSOFT_APP_TENANT_ID"
 CRED_WEIXIN_TOKEN = "WEIXIN_TOKEN"  # iLink bot credential from the Settings QR flow
+# kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
+# above, its rightful consumer is the agent subprocess itself (and the whoami
+# identity probe), so it is deliberately NOT in sandbox._AGENT_DENIED_ENV_KEYS:
+# the spawn paths re-inject it from the .env file after the Docker entrypoint
+# scrubs it out of the gateway's /proc/<pid>/environ.
+CRED_KIRO_API_KEY = "KIRO_API_KEY"
 _CREDENTIAL_KEYS = (
     CRED_SLACK_APP_TOKEN,
     CRED_SLACK_BOT_TOKEN,
@@ -199,6 +207,7 @@ _CREDENTIAL_KEYS = (
     CRED_MICROSOFT_APP_PASSWORD,
     CRED_MICROSOFT_APP_TENANT_ID,
     CRED_WEIXIN_TOKEN,
+    CRED_KIRO_API_KEY,
 )
 
 DEFAULT_MODEL = "auto"
@@ -957,6 +966,79 @@ def env_path() -> Path:
     return config_dir() / ".env"
 
 
+def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
+    """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
+
+    Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
+    per line, ``#`` comments, no quotes required, last occurrence wins).
+    Returns ``""`` when the file is absent or unreadable — callers treat the
+    credential as unset rather than failing.
+
+    Blocking file IO: call via ``asyncio.to_thread`` from async paths.
+    """
+    ep = env_file if env_file is not None else env_path()
+    try:
+        text = ep.read_text()
+    except OSError:
+        return ""
+    value = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                value = v.strip()
+    return value
+
+
+def inject_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Ensure *env* carries kiro-cli's own model credential (``KIRO_API_KEY``).
+
+    The Docker entrypoint scrubs :data:`_CREDENTIAL_KEYS` out of the gateway's
+    process environment into the data home's ``.env`` (mode 600) so they never
+    reside in a long-lived ``/proc/<pid>/environ``. Every other credential is
+    consumed in-process from :meth:`KiroCrewConfig.load_credentials`, but this
+    one authenticates the kiro-cli CHILD, which reads it from its own
+    environment — so kiro-cli spawn paths call this to hand the child exactly
+    the one variable it owns, without re-widening the parent's environ. A value
+    already present in *env* wins (same precedence as ``load_credentials``);
+    outside Docker nothing changes because the variable is still inherited.
+
+    Mutates *env* in place and returns it for convenience. Blocking file IO:
+    call via ``asyncio.to_thread`` from async paths.
+    """
+    if not env.get(CRED_KIRO_API_KEY):
+        val = read_env_file_credential(CRED_KIRO_API_KEY)
+        if val:
+            env[CRED_KIRO_API_KEY] = val
+    return env
+
+
+def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Remove kiro-cli's model credential from a foreign child's environment.
+
+    Counterpart to :func:`inject_kiro_cli_api_key` for the non-kiro-cli ACP
+    backends (the dormant Claude seam, KAS): the credential is kiro-cli's
+    alone, and it is deliberately NOT in ``sandbox._AGENT_DENIED_ENV_KEYS``, so
+    without this an inherited copy in the raw ``os.environ`` snapshot would
+    ride into a foreign agent process. Matches the platform env-key convention
+    (exact on POSIX, case-folded on Windows) so a differently-cased Windows
+    spelling cannot slip past. Mutates *env* in place and returns it.
+    """
+    matched = [
+        k for k in env if platform_compat.env_key_allowed(k, _KIRO_API_KEY_ONLY)
+    ]
+    for k in matched:
+        del env[k]
+    return env
+
+
+# Single-key allowlist for strip_kiro_cli_api_key's platform-aware matching.
+_KIRO_API_KEY_ONLY = frozenset({CRED_KIRO_API_KEY})
+
+
 def resolve_agent_config_path() -> Path:
     """Return defaults.json, preferring project-dir override for development.
 
@@ -1084,13 +1166,29 @@ class AgentConfig:
         default="acp",
         metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
     )
+    mcp_registry_mode: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enterprise MCP Registry Mode",
+            "Set true when this Kiro account is governed by an enterprise MCP "
+            "registry (Kiro console -> Shared settings -> MCP Registry URL, which "
+            "applies to IAM Identity Center and API-key sign-ins). In registry "
+            "mode the client connects ONLY to mcpServers entries carrying "
+            "'type': \"registry\" that resolve to a catalog entry of the same "
+            "name, so Kiro Crew stamps that marker on the servers it manages. "
+            "Leave false on a personal account: with no registry configured the "
+            "filter inverts and registry-marked entries are the ones dropped. "
+            "The administrator must also allow-list kirocrew-core, kirocrew-cron "
+            "and kirocrew-computer in the registry by those exact names.",
+        ),
+    )
     acp_backend: str = field(
         default="",
         metadata=_meta(
             "ACP Backend",
-            "Which ACP agent to drive. Only '' (kiro-cli) is selectable; the "
-            "'kas' plumbing is present but not yet usable.",
-            enum=[""],
+            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. "
+            "KAS runs chat but has no native subagent progress reporting yet.",
+            enum=["", "kas"],
         ),
     )
     default_agent: str = field(
@@ -1228,10 +1326,32 @@ class AgentConfig:
             "MCP Tool Search",
             "Load MCP tool specs on demand (search-and-call) instead of sending "
             "every tool definition each turn, keeping the context window clear "
-            "when many MCP servers are configured. kiro-cli backend only. When "
-            "enabled, Kiro Crew forces deferral always-on (minPct=0/minTokens=0) "
-            "via the per-session kiro settings overlay; disabling reverts to "
-            "sending full tool specs. No effect on an alternate ACP backend.",
+            "when many MCP servers are configured. kiro-cli backend only. "
+            "Deferral only starts once the specs cross tool_search_min_pct or "
+            "tool_search_min_tokens; disabling reverts to sending full tool "
+            "specs. No effect on an alternate ACP backend.",
+        ),
+    )
+    tool_search_min_pct: int = field(
+        default=5,
+        metadata=_meta(
+            "Tool Search threshold (% of context)",
+            "Start deferring MCP tool specs once they exceed this percentage of "
+            "the context window. Paired with tool_search_min_tokens — whichever "
+            "is crossed first wins. Below both thresholds every spec is sent "
+            "directly, so the agent never pays a tool_search round-trip for a "
+            "small tool set. 0 with tool_search_min_tokens 0 defers always. "
+            "Clamped to 0-100; matches the kiro-cli default.",
+        ),
+    )
+    tool_search_min_tokens: int = field(
+        default=50000,
+        metadata=_meta(
+            "Tool Search threshold (tokens)",
+            "Start deferring MCP tool specs once they exceed this many tokens. "
+            "Paired with tool_search_min_pct — whichever is crossed first wins. "
+            "0 with tool_search_min_pct 0 defers always. Matches the kiro-cli "
+            "default.",
         ),
     )
     session_sharing: bool = field(
@@ -4141,6 +4261,20 @@ class InstancesConfig:
             "on a fast/local link where compression CPU outweighs the bandwidth win.",
         ),
     )
+    connect_timeout_secs: float = field(
+        default=_DEFAULT_CONNECT_TIMEOUT,
+        metadata=_meta(
+            "Connect Timeout (secs)",
+            "How long to wait for the local forward port to accept connections "
+            "before declaring a connect attempt failed. The default (15s) is "
+            "sufficient for a direct ssh TCP connect, but hosts behind a "
+            "ProxyCommand or jump host routinely need longer (the proxy handshake "
+            "runs before ssh begins the forward). Raise this if connecting a "
+            "remote instance times out while the same ssh forward succeeds by hand. "
+            "The SSM transport uses its own higher default (25s) unless this value "
+            "is explicitly set. Clamped to [1, 120].",
+        ),
+    )
     max_recovery_attempts: int = field(
         default=_DEFAULT_MAX_RECOVERY,
         metadata=_meta(
@@ -4180,6 +4314,21 @@ class InstancesConfig:
                 _DEFAULT_TUNNEL_BASE_PORT,
             )
             object.__setattr__(self, "tunnel_base_port", _DEFAULT_TUNNEL_BASE_PORT)
+        if self.connect_timeout_secs < 1.0:
+            logger.warning(
+                "instances.connect_timeout_secs %s < 1, using %s",
+                self.connect_timeout_secs,
+                _DEFAULT_CONNECT_TIMEOUT,
+            )
+            object.__setattr__(self, "connect_timeout_secs", _DEFAULT_CONNECT_TIMEOUT)
+        elif self.connect_timeout_secs > _CONNECT_TIMEOUT_CEILING:
+            logger.warning(
+                "instances.connect_timeout_secs %s > %s, clamping to %s",
+                self.connect_timeout_secs,
+                _CONNECT_TIMEOUT_CEILING,
+                _CONNECT_TIMEOUT_CEILING,
+            )
+            object.__setattr__(self, "connect_timeout_secs", _CONNECT_TIMEOUT_CEILING)
         if self.max_recovery_attempts < 1:
             logger.warning(
                 "instances.max_recovery_attempts %d < 1, using %d",
@@ -5588,6 +5737,7 @@ class KiroCrewConfig:
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
+                mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "auto"),
@@ -5611,6 +5761,10 @@ class KiroCrewConfig:
                 notify_override_expiry=agent_data.get("notify_override_expiry", True),
                 conductor_skill=agent_data.get("conductor_skill", False),
                 tool_search=bool(agent_data.get("tool_search", True)),
+                tool_search_min_pct=_safe_int(agent_data.get("tool_search_min_pct", 5), 5),
+                tool_search_min_tokens=_safe_int(
+                    agent_data.get("tool_search_min_tokens", 50000), 50000
+                ),
                 session_sharing=bool(agent_data.get("session_sharing", True)),
                 max_subagents=agent_data.get("max_subagents", 0),
                 subagent_mem_buffer_pct=_safe_int(
@@ -6207,6 +6361,10 @@ class KiroCrewConfig:
                 ssh_compression=bool(
                     instances_data.get("ssh_compression", _DEFAULT_SSH_COMPRESSION)
                 ),
+                connect_timeout_secs=_safe_float(
+                    instances_data.get("connect_timeout_secs", _DEFAULT_CONNECT_TIMEOUT),
+                    _DEFAULT_CONNECT_TIMEOUT,
+                ),
                 max_recovery_attempts=_safe_int(
                     instances_data.get("max_recovery_attempts", _DEFAULT_MAX_RECOVERY),
                     _DEFAULT_MAX_RECOVERY,
@@ -6541,6 +6699,8 @@ class KiroCrewConfig:
 
         sandbox = self.agent.sandbox
         tool_search = self.agent.tool_search
+        tool_search_min_pct = self.agent.tool_search_min_pct
+        tool_search_min_tokens = self.agent.tool_search_min_tokens
         # Global default effort for new sessions. A per-slot override always
         # wins; this only fills in when the slot carries none, so a session that
         # has never touched the effort control still starts at the user's
@@ -6639,6 +6799,8 @@ class KiroCrewConfig:
                 acp_backend=self.agent.acp_backend,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
+                tool_search_min_pct=tool_search_min_pct,
+                tool_search_min_tokens=tool_search_min_tokens,
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,

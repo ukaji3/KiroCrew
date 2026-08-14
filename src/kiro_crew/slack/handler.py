@@ -2129,11 +2129,14 @@ def build_timing_footer(
     if client is not None:
         try:
             ctx_pct = round(client.context_usage_pct())
-            ctx_icon = (
-                "🔴"
-                if ctx_pct >= 70
-                else "🟠" if ctx_pct >= 50 else "🟡" if ctx_pct >= 30 else "🟢"
-            )
+            if ctx_pct >= 70:
+                ctx_icon = "🔴"
+            elif ctx_pct >= 50:
+                ctx_icon = "🟠"
+            elif ctx_pct >= 30:
+                ctx_icon = "🟡"
+            else:
+                ctx_icon = "🟢"
             footer_text = f"Finished in {duration} · {ctx_icon} ctx {ctx_pct}%"
         except Exception:
             logger.debug("Failed to retrieve context usage", exc_info=True)
@@ -2262,11 +2265,17 @@ async def _handle_compact_command(
                 await slack.post_message(channel, "❌ Compaction failed unexpectedly.", reply_ts)
             except Exception:
                 logger.debug("Failed to post compact error for %s", session_key, exc_info=True)
+            # Drop the wedged native conversation, NOT the session's channel
+            # identity: the map entry carries the thread linkage that
+            # ``get_session_for_thread`` routes every later reply through, so a
+            # full ``destroy`` would fork this thread into a fresh session with
+            # none of its context. Housekeeping never unlinks (see
+            # ``SessionMap.prune`` and ``SessionManager._recycle_held``).
             try:
-                await sessions.destroy(session_key)
+                await sessions.discard_conversation(session_key)
             except Exception:
                 logger.warning(
-                    "Failed to destroy session %s after compact failure",
+                    "Failed to discard conversation %s after compact failure",
                     session_key,
                     exc_info=True,
                 )
@@ -4490,6 +4499,9 @@ async def handle_interaction(
                     error="not_thread_owner",
                 )
                 return None
+            # Imported at call time on purpose: tests patch
+            # ``kiro_crew.session.SessionMap`` to drive the fail-closed path, and
+            # only a call-time rebind observes that patch.
             from kiro_crew.session import SessionMap
 
             session_key = thread_ts
@@ -4865,13 +4877,18 @@ async def _handle_run_command(
     # "run status"
     if arg.lower() == "status":
         status = runner.status()
-        if not status.get("running") and not status.get("status"):
+        if not status.get("running"):
             return "No task running."
+        # Progress is reported per run: build_status() puts only `running`,
+        # `agent` and `runs` at the top level. Prefer the live run when the
+        # runner is tracking several.
+        runs = status.get("runs") or []
+        run = next((r for r in runs if r.get("running")), runs[0] if runs else {})
         return (
             f"*Task Runner*\n"
-            f"Status: {status.get('status', 'idle')}\n"
-            f"Steps: {status.get('completed', 0)}/{status.get('steps', 0)}\n"
-            f"Current: step {status.get('current_step', 0)}"
+            f"Status: {run.get('status', 'idle')}\n"
+            f"Steps: {run.get('completed', 0)}/{run.get('tasks', 0)}\n"
+            f"Current: step {run.get('current_task', 0)}"
         )
 
     # "run cancel"

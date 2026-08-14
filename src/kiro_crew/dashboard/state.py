@@ -1760,6 +1760,21 @@ class _ChatSlot:
                 return True
         return False
 
+    def queue_promote_by_id(self, queue_id: str) -> bool:
+        """Move a queue item to the front by ID. Returns True if found.
+
+        Used by the interrupt endpoint's "run this next" path: the promoted
+        item is what the dequeue loop picks up after the current turn stops.
+        Like every ``*_by_id`` helper, this matches the storage key (``id``)
+        that :meth:`queue_append` / :meth:`queue_insert` write — callers
+        translate the wire-side ``queue_id`` field to it at the boundary.
+        """
+        for i, item in enumerate(self._queue):
+            if item["id"] == queue_id:
+                self._queue.insert(0, self._queue.pop(i))
+                return True
+        return False
+
     @property
     def running(self) -> bool:
         return self.task is not None and not self.task.done()
@@ -2067,26 +2082,25 @@ class _ChatSlot:
             and bool(self.messages)
             and last_conv_role == "assistant"
         )
-        # needs_input: the agent ASKED the user something and cannot move past it
-        # — an unanswered question card, or a turn that ended with an [OPTIONS:]
-        # tag (the fallback the model uses when no card can be rendered).
+        # needs_input: an unanswered question CARD is on screen and the agent
+        # cannot move past it.
         #
-        # Deliberately narrower than `waiting_for_input`, which is true of every
-        # ordinary finished turn: a status that lights on all of them says
-        # nothing, and the sidebar's unread dot already covers that case. It is
-        # also separate from `pending_approval`, whose answer is allow/deny on a
-        # tool rather than input, and which keeps its own precedence and label.
+        # Scoped to the card on purpose. It exists to correct a status that would
+        # otherwise be WRONG, not to add one: a blocking ask_question parks the
+        # turn mid-flight, so `self.running` stays true and the row would read
+        # "Thinking…" forever while nothing can advance without the user. That is
+        # why it is NOT gated on `self.running`.
         #
-        # NOT gated on `self.running`: a blocking ask_question parks the turn
-        # mid-flight, so the session is running AND waiting on the user.
-        # `reason` is a discriminator for the label, not a severity: "question"
-        # outranks "options" because a card is the live surface when both are
-        # somehow present.
-        needs_input_reason = ""
-        if self._question_pending:
-            needs_input_reason = "question"
-        elif has_options:
-            needs_input_reason = "options"
+        # A turn that merely ENDED — including one ending in an [OPTIONS:] tag —
+        # is not this. Every finished turn is waiting on the user, so a status
+        # that lights on them says nothing (the same reason `waiting_for_input`
+        # cannot carry a badge), and the row already carries the last message plus
+        # the unread dot. Raising it there only displaced the message and hid the
+        # live turn status behind a constant string.
+        #
+        # Separate from `pending_approval`, whose answer is allow/deny on a tool
+        # rather than input, and which keeps its own precedence and label.
+        needs_input = bool(self._question_pending)
         # If an approval is pending, surface the tool metadata from the most
         # recent unresolved permission message so the Board can show inline
         # Approve/Trust/Reject buttons without a second API call.
@@ -2143,8 +2157,7 @@ class _ChatSlot:
             "pending_approval_info": pending_approval_info,
             "last_activity_ts": last_activity_ts,
             "waiting_for_input": waiting_for_input,
-            "needs_input": bool(needs_input_reason),
-            "needs_input_reason": needs_input_reason,
+            "needs_input": needs_input,
             "stop_state": self._stop_state,
             # In-flight `wait` sleep, or None. Carries the absolute deadline the
             # transcript counts down against and the wait_id the "End wait"
@@ -2479,6 +2492,9 @@ class DashboardState:
         self._refine_error: str = ""
         self._terminal_sessions: dict[str, Any] = {}  # PTY sessions for CLI panel
         self._terminal_reaper: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._browser_snapshot_pruner: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._browser_install_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._browser_install_error: str | None = None
         self._terminal_title_poller: asyncio.Task | None = None  # type: ignore[type-arg]
         # Background reconciler that surfaces channel-originated sessions
         # (slack:<ts>, discord:…) as chat slots. Held to prevent GC.
@@ -3863,6 +3879,12 @@ class DashboardState:
                     done_at = float(info.get("done_at") or 0.0)
                     if done_at and (now - done_at) > ttl_secs:
                         continue
+                    if info.get("stopped"):
+                        outcome = "stopped"
+                    elif info.get("error"):
+                        outcome = "failed"
+                    else:
+                        outcome = "completed"
                     done.append(
                         {
                             **base,
@@ -3870,11 +3892,7 @@ class DashboardState:
                             "elapsed": float(info.get("elapsed") or 0.0),
                             "error": info.get("error"),
                             "stopped": bool(info.get("stopped")),
-                            "outcome": (
-                                "stopped"
-                                if info.get("stopped")
-                                else ("failed" if info.get("error") else "completed")
-                            ),
+                            "outcome": outcome,
                             "result": str(info.get("result") or ""),
                             "done_at": done_at,
                         }
@@ -4243,11 +4261,24 @@ class DashboardState:
 
     def _broadcast_chat_message(self, slot_key: str, msg: dict) -> None:
         """Push a chat message to all SSE clients via the global stream."""
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        # Mirror the display-time redaction gate _prepare_messages applies on
+        # the HTTP history path, so a row's *content* leaves the backend in one
+        # byte form regardless of which consumer receives it. Scope: content
+        # only — `cls` / `meta` and the live `chat_chunk` stream are
+        # deliberately not covered (see the direct_meta comment below). Gate is
+        # `!= "user"` for the same reason as there: every non-user role can
+        # carry model/tool output, and user-authored content stays raw (the
+        # user typed it and is the only one who sees it back).
+        if role != "user" and isinstance(content, str) and content:
+            content, _ = redact_exfiltration_urls(content)
+            content, _ = redact_credentials(content)
         payload: dict[str, Any] = {
             "_type": "chat_message",
             "slot": slot_key,
-            "role": msg.get("role", ""),
-            "content": msg.get("content", ""),
+            "role": role,
+            "content": content,
             "ts": msg.get("ts", ""),
         }
         # Include cls for backward compatibility
@@ -4907,9 +4938,19 @@ class DashboardState:
     def _slot_links(self, slot: _ChatSlot) -> tuple[list[dict[str, Any]], bool, str, str]:
         """Build the redacted channel-neutral link projection for one slot."""
         # circular import: chat imports state at module scope.
-        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.dashboard.chat_utils import (
+            effective_session_key,
+            mirror_is_paused,
+            slack_mirror_is_paused,
+        )
 
         session_key = effective_session_key(slot)
+        # Resolved once per slot rather than per row: all three are storage reads,
+        # and a session holds at most one Slack thread, one born-in conversation
+        # and one mirror binding.
+        slack_paused = slack_mirror_is_paused(self, session_key)
+        mirror_paused = mirror_is_paused(self, session_key)
+        origin_paused = mirror_is_paused(self, session_key, origin=True)
         mirror: ChannelLink | None = None
         persisted_ts: str | None = None
         persisted_channel: str | None = None
@@ -4956,6 +4997,21 @@ class DashboardState:
             if nested and nested[0] == channel_type:
                 channel_id = nested[1]
             normalized = ChannelLink(channel_type, channel_id, link.thread_id)
+            # Real on EVERY row, origin included: the conversation a session was
+            # born in can be disconnected too, so it stops syndicating there and
+            # the session carries on in the dashboard. `direction` still records
+            # the provenance the sidebar mark needs; it no longer decides whether
+            # the row has a control.
+            #
+            # Keyed to the row's SOURCE, not just its channel: a session born in
+            # Discord that also mirrors to Telegram draws two non-Slack rows, and
+            # while both read one value, muting either silently muted the other.
+            if channel_type == SLACK_NAMESPACE:
+                paused = slack_paused
+            elif direction == "origin":
+                paused = origin_paused
+            else:
+                paused = mirror_paused
             links.append(
                 {
                     "channel": channel_type,
@@ -4963,6 +5019,7 @@ class DashboardState:
                     "target": _redacted_link_target(channel_id),
                     "direction": direction,
                     "live": self._channel_link_is_live(normalized),
+                    "paused": paused,
                 }
             )
 
@@ -5011,9 +5068,32 @@ class DashboardState:
                 "out",
             )
 
+        if genuine_slack and slack_origin_self_link:
+            # The conversation a session was BORN in gets a row too. Suppressing
+            # it was the last place a channel appeared with no control at all:
+            # you can stop a Slack-born session syndicating to its thread and
+            # carry on in the dashboard, and a human reply in that thread brings
+            # it back. It stays `origin` so the sidebar keeps showing where the
+            # conversation came from — provenance is history and survives a
+            # disconnect; only the delivery indicator reflects the mute.
+            append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "origin")
+
         if genuine_slack and not slack_origin_self_link:
             slack_namespace = _split_namespaced_channel_id(slack_channel)
             visible_slack_channel = slack_namespace[1] if slack_namespace else (slack_channel or "")
+            # A Slack ROW accompanies `slack_linked=True` unconditionally. The
+            # dashboard's channel control is built from `links` alone — it no
+            # longer synthesizes a Slack row from this boolean, because a
+            # synthesized row cannot know `paused` and so rendered a muted thread
+            # as connected. That makes a True here with no row worse than a
+            # cosmetic gap: the session IS linked and the menu would offer to
+            # connect it. Guaranteed here rather than left to hold incidentally
+            # across the branches above.
+            if not any(
+                row["channel"] == SLACK_NAMESPACE and row["direction"] != "origin"
+                for row in links
+            ):
+                append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "out")
             return links, True, visible_slack_channel, slack_ts or ""
         return links, False, "", ""
 
@@ -5326,6 +5406,18 @@ class DashboardState:
                             "deleted": note.get("deleted", False),
                         },
                     }
+                )
+            elif msg_type == "session_summary":
+                # Typed envelope, for the same reason as artifact_update above.
+                # Without it this event falls into the generic `notification`
+                # fallback, where two things go wrong: the client's
+                # `case 'session_summary'` never matches (so the panel is never
+                # invalidated and only a reload shows a new summary — defeating
+                # the push-on-change design that lets the panel skip polling),
+                # and the payload is dispatched as a Notification, putting one
+                # entry with no `ts` in the bell feed.
+                ws_msg = json.dumps(
+                    {"type": "session_summary", "data": {"key": note["key"]}}
                 )
             elif msg_type == "chat_message":
                 chat_data: dict[str, Any] = {
