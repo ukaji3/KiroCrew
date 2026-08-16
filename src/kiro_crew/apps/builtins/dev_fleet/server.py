@@ -364,7 +364,15 @@ def _default_main_repo() -> str:
 
 
 # --- configuration ---
-MAIN_REPO = _default_main_repo()
+def _default_main_repo_state() -> tuple[str, bool]:
+    """Import-time checkout hint and whether an inferred tier supplied it."""
+    repo = _default_main_repo()
+    explicit = os.environ.get("KIROCREW_DEVFLEET_REPO", "").strip()
+    return repo, bool(repo and not explicit)
+
+
+# Startup replaces this stat-only hint after the complete discovery chain runs.
+MAIN_REPO, MAIN_REPO_INFERRED = _default_main_repo_state()
 BASE_BRANCH = "main"
 
 # --- upstream remote resolution (replaces hardcoded 'origin') ---
@@ -2230,6 +2238,7 @@ async def _build_fleet() -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "worktrees": wts,
         "main_repo": _repo(),
+        "main_repo_inferred": MAIN_REPO_INFERRED,
         "base_branch": BASE_BRANCH,
         "sync_run_id": _SYNC_RID,
         "build_pending": _build_pending(),
@@ -2838,6 +2847,7 @@ async def _worktree_remove(
 
     pr = (await _pr_status_cached(branch)) if branch else None
     own = await _own_commits_count(path)
+
     if not force and not _is_pr_merged(pr):
         if own is None or own > 0:
             return {
@@ -3180,7 +3190,14 @@ async def _worktree_remove(
                 )
             return {"ok": False, "error": _redact((stderr or stdout).strip()[:300])}
 
-        # Delete branch if shipped/empty — atomically against the pinned OID.
+        # Delete branch ref only when the PR is MERGED — atomically against
+        # the pinned OID. Unmerged branch refs are always retained, even when
+        # own == 0 (every commit already reachable from the upstream base, so
+        # no unique commits exist): keying deletion to PR state alone is a
+        # deliberately simpler, fail-closed policy (recoverable > irrecoverable).
+        # Known cost: removing an unmerged empty worktree leaves refs/heads/
+        # <branch> behind, which blocks re-creating a worktree under the same
+        # branch name until the ref is deleted manually.
         # Fail-closed ancestry gate: even when the cached PR status says MERGED,
         # verify the branch OID is actually contained in the base branch. A stale
         # or wrong merged verdict cannot delete the only local pointer to unmerged
@@ -3191,7 +3208,7 @@ async def _worktree_remove(
         # using the pr_head_oid already fetched above (or fresh if needed).
         if branch and branch != BASE_BRANCH and verdict_oid:
             should_delete = False
-            if _is_pr_merged(pr) or own == 0:
+            if _is_pr_merged(pr):
                 remote = await _upstream_remote()
                 rc_anc, _, _ = await _run_cmd(
                     [
@@ -3203,7 +3220,7 @@ async def _worktree_remove(
                 should_delete = rc_anc == 0
                 # Squash-safe fallback: ancestry fails for squash/rebase merges.
                 # Use the containment check (branch OID is ancestor of PR head).
-                if not should_delete and _is_pr_merged(pr):
+                if not should_delete:
                     head_oid = pr_head_oid or await _fetch_pr_head_oid(
                         branch, repo=(pr or {}).get("_repo")
                     )
@@ -3646,16 +3663,22 @@ async def _prune_candidates() -> dict:
         if v["ok"]:
             candidates.append(row)
         else:
+            # Surface dirty flag so the frontend can pre-disable force-selection
+            # for dirty+unmerged worktrees (the backend refuses force=True on
+            # those anyway — exposing the flag avoids a misleading checkbox).
+            if v.get("dirty") is True:
+                row["dirty"] = True
             kept.append(row)
     return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(worktrees) - 1}
 
 
-async def _prune_run(names: list[str]) -> dict:
+async def _prune_run(names: list[str], force_names: set[str] | None = None) -> dict:
     # Deduplicate while preserving order: the API accepts any list of names,
     # and a duplicate would spawn two workers racing to remove the SAME
     # worktree — the second one then reports a spurious failure over the
     # first one's success.
     names = list(dict.fromkeys(names))
+    _force = force_names or set()
     async with _PRUNE_LOCK:
         if _PRUNE_STATE["running"]:
             return {"ok": False, "error": "prune already running"}
@@ -3697,23 +3720,50 @@ async def _prune_run(names: list[str]) -> dict:
                     error = err
                     result = {"name": nm, "ok": False, "error": err}
                 else:
-                    verdict = await _prunable(target["path"], target.get("branch"))
-                    if not verdict.get("ok"):
-                        error = f"not prunable: {verdict.get('code', 'unknown')}"
-                        result = {"name": nm, "ok": False, "error": error}
-                    else:
-                        def _progress(phase: str, _nm: str = nm) -> None:
-                            # phase in {"stopping_pod", "removing"}
-                            items[_nm]["status"] = phase
+                    is_forced = nm in _force
+                    if not is_forced:
+                        verdict = await _prunable(target["path"], target.get("branch"))
+                        if not verdict.get("ok"):
+                            error = f"not prunable: {verdict.get('code', 'unknown')}"
+                            result = {"name": nm, "ok": False, "error": error}
+                    if not error:
+                        # For forced items: hold _MAKE_LIVE_LOCK from the
+                        # protection recheck through _worktree_remove so a
+                        # concurrent /make-live cannot stage the target between
+                        # our check and the actual deletion.
+                        if is_forced:
+                            async with _MAKE_LIVE_LOCK:
+                                _lp = await _live_worktree_path()
+                                _ln = Path(_lp).name if _lp else None
+                                _sp = _staged_target()
+                                _sn = Path(_sp).name if _sp else None
+                                if (_ln and nm == _ln) or (_sn and nm == _sn):
+                                    error = "became protected during batch (staged or live)"
+                                    result = {"name": nm, "ok": False, "error": error}
+                                else:
+                                    def _progress(phase: str, _nm: str = nm) -> None:
+                                        items[_nm]["status"] = phase
 
-                        res = await _worktree_remove(
-                            nm, force=False, progress=_progress, _caller="prune"
-                        )
-                        result = {"name": nm, **res}
-                        if res.get("ok"):
-                            status, error = "done", None
+                                    res = await _worktree_remove(
+                                        nm, force=True, progress=_progress, _caller="prune"
+                                    )
+                                    result = {"name": nm, **res}
+                                    if res.get("ok"):
+                                        status, error = "done", None
+                                    else:
+                                        status, error = "failed", res.get("error")
                         else:
-                            status, error = "failed", res.get("error")
+                            def _progress(phase: str, _nm: str = nm) -> None:
+                                items[_nm]["status"] = phase
+
+                            res = await _worktree_remove(
+                                nm, force=False, progress=_progress, _caller="prune"
+                            )
+                            result = {"name": nm, **res}
+                            if res.get("ok"):
+                                status, error = "done", None
+                            else:
+                                status, error = "failed", res.get("error")
             except Exception as exc:  # noqa: BLE001
                 error = _redact(str(exc))
                 result = {"name": nm, "ok": False, "error": error}
@@ -4093,11 +4143,52 @@ async def api_dev_fleet_prune_run(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "'names' must be a list of strings"}, status=400
         )
+    raw_force = body.get("force_names") or []
+    if not isinstance(raw_force, list) or not all(isinstance(n, str) for n in raw_force):
+        return web.json_response(
+            {"ok": False, "code": "invalid_force_names", "error": "'force_names' must be a list of strings"},
+            status=400,
+        )
     valid = await _valid_worktree_names()
-    names = [n for n in raw_names if n in valid]
-    if not names:
-        return web.json_response({"ok": False, "error": "no valid names"}, status=400)
-    return web.json_response(await _prune_run(names))
+    force_set: set[str] = set()
+    if raw_force:
+        # Guard: never force-remove the main checkout, the currently live
+        # worktree, or a staged cutover target (removing a staged target
+        # would leave live_target.json pointing at a missing checkout,
+        # silently abandoning the pending restart).
+        # Per-item _MAKE_LIVE_LOCK is held inside _prune_one for each forced
+        # removal (recheck + _worktree_remove atomically), preventing a
+        # concurrent /make-live from staging between check and deletion.
+        live_path = await _live_worktree_path()
+        live_name = Path(live_path).name if live_path else None
+        staged_path = _staged_target()
+        staged_name = Path(staged_path).name if staged_path else None
+        guarded: set[str] = set()
+        for nm in raw_force:
+            wt, _ = await _find_worktree(nm)
+            if wt and wt.get("is_main"):
+                guarded.add(nm)
+            elif live_name and nm == live_name:
+                guarded.add(nm)
+            elif staged_name and nm == staged_name:
+                guarded.add(nm)
+        if guarded:
+            return web.json_response(
+                {"ok": False, "code": "protected_worktree",
+                 "error": f"cannot force-remove protected worktrees: {', '.join(sorted(guarded))}"},
+                status=400,
+            )
+        force_set = {n for n in raw_force if n in valid}
+    # Merge both lists: regular + forced (forced items skip the prunable verdict).
+    all_names = [n for n in raw_names if n in valid]
+    for fn in raw_force:
+        if fn in valid and fn not in all_names:
+            all_names.append(fn)
+    if not all_names:
+        return web.json_response({"ok": False, "code": "no_valid_names", "error": "no valid names"}, status=400)
+    if force_set:
+        return web.json_response(await _prune_run(all_names, force_names=force_set))
+    return web.json_response(await _prune_run(all_names))
 
 
 async def _pod_name_action(request: web.Request, action) -> web.Response:
@@ -4151,7 +4242,7 @@ async def api_dev_fleet_rebase(request: web.Request) -> web.Response:
 # --- startup hook ---
 async def dev_fleet_startup(app: web.Application) -> None:
     """Start the background fleet refresher on app startup."""
-    global _refresher_task, _warm_task, _reaper_task, MAIN_REPO
+    global _refresher_task, _warm_task, _reaper_task, MAIN_REPO, MAIN_REPO_INFERRED
     loop = asyncio.get_running_loop()
     # Full discovery here rather than at import: it reads config.json and stats
     # candidate directories, both of which would block the event loop on the
@@ -4161,6 +4252,7 @@ async def dev_fleet_startup(app: web.Application) -> None:
     # hook out of the AST ratchet's allowlist, so a future git call added here
     # (where MAIN_REPO is most often still unresolved) cannot read the bare
     # global unnoticed.
+    configured = await loop.run_in_executor(subprocess_executor(), _configured_main_repo)
     discovered = await loop.run_in_executor(subprocess_executor(), _discover_main_repo)
     if discovered:
         discovered = await loop.run_in_executor(
@@ -4185,6 +4277,7 @@ async def dev_fleet_startup(app: web.Application) -> None:
             f"markers (.git, src/kiro_crew/, pyproject.toml). {hint}"
         )
     MAIN_REPO = discovered
+    MAIN_REPO_INFERRED = bool(discovered and not configured)
     await _load_trusted_credential_helpers()
     await _load_fallback_repos()
     await _upstream_remote()

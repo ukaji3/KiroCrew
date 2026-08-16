@@ -41,6 +41,7 @@ from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn
 from kiro_crew.messaging.link import (
     CHAT_TYPE_DIRECT,
     CHAT_TYPE_FORUM,
+    UNBIND_REASON_ORIGIN_REBIND,
     ChannelLink,
     bind_origin_mirror,
     build_dm_session_key,
@@ -170,7 +171,9 @@ class TelegramDispatcher:
     One instance per gateway lifetime. Holds the per-user conversation state
     (generation counter + soft-threshold flag). ``handle_message`` is wired as
     the transport's dispatch callback; ``on_callback`` is wired as the client's
-    inline-button handler. ``client`` is set by the gateway after construction.
+    inline-button handler. ``client`` and ``bot_username`` are set by the
+    gateway after construction (the latter from ``getMe``, once the token is
+    proven).
     """
 
     def __init__(
@@ -192,6 +195,11 @@ class TelegramDispatcher:
         self.conv_log = conv_log
         self.approval_mode = approval_mode
         self.client: "TelegramClient | None" = None
+        # This bot's own registered username (no leading @), from getMe().
+        # Empty until the gateway's startup call resolves -- see
+        # kiro_crew.telegram.commands._strip_bot_mention for why an unset
+        # value means no @-mention is ever treated as ours.
+        self.bot_username: str = ""
         self._conv = ConversationState(seed_fn=self._seed_gen)
         # The mid-turn queue receipt: one in-place "queued" bubble per session,
         # plus the lock that serializes check-then-send-then-store against the
@@ -272,12 +280,16 @@ class TelegramDispatcher:
         # attachment ingestion, silently discarding the photo the user attached
         # to it. Mirrors discord/transport_dispatch.py's interpret_as_command.
         interpret_as_command = interpret_commands and not msg.attachments
-        if interpret_as_command and parse_command(text) is None:
-            override_mode, text = parse_mid_turn_override(text)
+        if interpret_as_command and parse_command(text, self.bot_username) is None:
+            override_mode, text = parse_mid_turn_override(text, self.bot_username)
 
         # ── Command intercept (no LLM session needed; skipped for override
         # payloads and drained queue content — see above) ──
-        cmd = parse_command(text) if interpret_as_command and override_mode is None else None
+        cmd = (
+            parse_command(text, self.bot_username)
+            if interpret_as_command and override_mode is None
+            else None
+        )
         if cmd == "new":
             self._conv.bump_gen(route)
             await self._reply(chat_id, "✅ New conversation started.", thread=reply_thread)
@@ -311,7 +323,11 @@ class TelegramDispatcher:
         # would answer the literal string and read as a broken feature. Gated on
         # interpret_as_command so a caption on an attachment is never read as a
         # bare directive -- that would answer with usage and drop the file.
-        if interpret_as_command and override_mode is None and is_bare_mid_turn_override(text):
+        if (
+            interpret_as_command
+            and override_mode is None
+            and is_bare_mid_turn_override(text, self.bot_username)
+        ):
             await self._reply(
                 chat_id,
                 "Those take a message: /queue <msg> or /steer <msg>.",
@@ -1414,11 +1430,17 @@ class TelegramDispatcher:
         # for what is one user-visible action.
         with self.sessions.batched_save():
             self.sessions.set_mirror_opt_out(key, False)
-            self.sessions.set_mirror_link(key, self._origin_mirror_link(route, chat_id))
+            self.sessions.set_mirror_link(
+                key,
+                self._origin_mirror_link(route, chat_id),
+                reason=UNBIND_REASON_ORIGIN_REBIND,
+            )
             # Drop any pre-unification row so a stale binding cannot outlive the
             # rebind (reads prefer the channel key, but a leftover row would still
             # answer a clear).
-            self.sessions.clear_mirror_link(legacy_dashboard_mirror_key(key))
+            self.sessions.clear_mirror_link(
+                legacy_dashboard_mirror_key(key), reason=UNBIND_REASON_ORIGIN_REBIND
+            )
         await self._reply(
             chat_id,
             "✅ Linked. Replies from the dashboard for this conversation will "

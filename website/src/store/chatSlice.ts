@@ -92,6 +92,50 @@ function isRedeliveredMessage(
   return false
 }
 
+/** Reconcile a server echo (carrying both `sendId` and `mid`) against the
+ *  optimistic user bubble that was appended client-side at send time.
+ *
+ *  Scans backward over non-steer user messages looking for a `sendId` match.
+ *  On match: updates ts/meta, clears the `optimistic` flag, and strips the
+ *  one-shot `sendId` from persisted meta (it served its correlation purpose).
+ *
+ *  Returns `true` if reconciliation succeeded (caller should `return` to skip
+ *  the push), `false` if no match was found (caller falls through to push).
+ *
+ *  FIX for #3898: the prior inline scan used an unconditional `break` after the
+ *  first non-matching user message, preventing reconciliation of pipelined sends
+ *  (user A then user B — echo for A could never reach past B). Now uses
+ *  `continue` to keep scanning. */
+function reconcileOptimisticEcho(
+  msgs: ChatMessage[],
+  echoSendId: string,
+  meta: Record<string, unknown>,
+  ts?: string,
+): boolean {
+  const reconcileFloor = Math.max(0, msgs.length - 50)
+  for (let i = msgs.length - 1; i >= reconcileFloor; i--) {
+    const m = msgs[i]
+    if (m.role !== 'user') continue
+    if (m.meta?.steer) break // steer boundary — stop scanning
+    if (m.meta?.sendId === echoSendId) {
+      if (ts) m.ts = ts
+      m.meta = { ...(m.meta || {}), ...meta }
+      // The sendId is a one-shot wire correlation ID — strip it from the
+      // persisted meta now that reconciliation succeeded (#3898 item 2).
+      delete (m.meta as Record<string, unknown>).sendId
+      delete (m.meta as Record<string, unknown>).optimistic
+      return true
+    }
+    // #3898 fix: continue scanning past non-matching user messages so
+    // pipelined sends (multiple optimistic bubbles) can all be reconciled.
+  }
+  return false
+}
+
+/** Timeout (ms) after which an unconfirmed optimistic bubble is marked stale.
+ *  The UI renders a retry affordance for stale messages (#3898 item 3). */
+export const OPTIMISTIC_TIMEOUT_MS = 30_000
+
 /** Frame roles that retire a slot's pending STATELESS question card.
  *
  *  Deliberately NARROWER than "every role that starts a turn". The card's
@@ -507,6 +551,9 @@ interface ChatState {
   historyHasMore: boolean
   historyOffset: number
   pendingInput: string | null
+  /** Transient feedback for agent-rebind failures shared by the picker and
+   *  global cycle shortcuts. The App shell owns rendering and expiry. */
+  agentSwitchNotice: { message: string } | null
   // True while a createSlot POST is in flight. Lets every New Chat entry
   // point show a pending state so the UI never looks dead on click.
   creatingSlot: boolean
@@ -648,6 +695,7 @@ const initialState: ChatState = {
   historyHasMore: false,
   historyOffset: 0,
   pendingInput: null,
+  agentSwitchNotice: null,
   creatingSlot: false,
   slotContextPct: {},
   slotContextTokens: {},
@@ -823,31 +871,14 @@ function applyNonActiveFrame(
       }
     }
     // Reconcile the optimistic user bubble (appendSlotMessage) rather than
-    // pushing a 2nd identical one when the server echoes the user frame — same
-    // pattern as sseSideResult / steer reconcile. The bubble is NOT necessarily
-    // the last message: the agent can start streaming (thinking/tool/assistant
-    // frames) before the server echoes the user frame, so a tail-only check
-    // misses the bubble and the echo is pushed as a duplicate — or worse, the
-    // original bubble never receives its `mid`, making it un-pinnable (#2845).
-    // PRIMARY: sendId correlation. FALLBACK: tail content match for paths
-    // that don't generate a sendId (split-pane, queued promotions).
+    // pushing a 2nd identical one when the server echoes the user frame (#2845).
+    // Uses shared helper that scans past non-matching pipelined sends (#3898).
     const echoSendId = meta?.sendId as string | undefined
     if (echoSendId && meta?.mid) {
-      const reconcileFloor = Math.max(0, msgs.length - 50)
-      for (let i = msgs.length - 1; i >= reconcileFloor; i--) {
-        const m = msgs[i]
-        if (m.role !== 'user') continue
-        if (m.meta?.steer) break
-        if (m.meta?.sendId === echoSendId) {
-          if (ts) m.ts = ts
-          m.meta = { ...(m.meta || {}), ...meta }
-          delete (m.meta as Record<string, unknown>).optimistic
-          return
-        }
-        break
-      }
+      if (reconcileOptimisticEcho(msgs, echoSendId, meta as Record<string, unknown>, ts)) return
     } else if (meta?.mid) {
-      // Fallback: tail content match (pre-existing behavior).
+      // Fallback: no sendId on the echo — use tail content match for paths
+      // that don't generate a sendId (split-pane, queued promotions).
       const last = msgs[msgs.length - 1]
       if (last?.role === 'user' && last.content === content && !last.meta?.mid) {
         if (ts) last.ts = ts
@@ -907,26 +938,14 @@ export const fetchHistory = createAsyncThunk(
   },
 )
 
-/** Raw server rows one older-history page consumes. The handler slices
- *  all_msgs[end - limit : end] (chat_handlers.api_chat_slot_detail), so when it
- *  reports has_more this limit IS the raw span -- unlike the returned array,
- *  which _prepare_messages has already collapsed. */
-const OLDER_PAGE_RAW = 100
-
-/** Raw server rows a paged resume consumes: api_chat_slot_resume sends
- *  messages[-200:] and reports has_more only when total > 200, so a paged
- *  resume always consumed exactly this many raw rows. */
-const RESUME_PAGE_RAW = 200
+/** Rows to request per older-history page. */
+const OLDER_PAGE_LIMIT = 100
 
 async function fetchSlotDetail(key: string) {
   // No limit → backend returns all chained history (across gateway restarts).
   const d = await api.chatSlotDetail(key)
   type QueueItem = string | { content: string; id: string }
-  // This path requests no limit, so the handler returns the whole tail and
-  // reports has_more false; the raw span is therefore the entire history. Any
-  // value would do while has_more is false, but total keeps the cursor at 0
-  // rather than at a wrong index if that ever changes.
-  return { key, rawCount: d.total || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
+  return { key, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
 }
 
 /** SINGLE hydration path for the slot-detail context-meter fields — the one
@@ -1281,7 +1300,10 @@ export const resumeFromHistory = createAsyncThunk(
       dispatch(addSlotOptimistic({ key: d.key, title: title || d.key, messages: 0, running: false, memory_mode: d.memory_mode, mode: d.mode, surface: d.surface ?? d.mode, pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }))
       dispatch(updateSlot({ key: d.key, mode: d.mode, surface: d.surface ?? d.mode }))
     }
-    return { ok: d.ok, key: d.key, rawCount: RESUME_PAGE_RAW, messages: filterMessages(d.messages || []), hasMore: d.has_more || false, total: d.total || 0 }
+    // Without a cursor this response cannot be paged, so do not advertise more:
+    // a zero cursor beside hasMore renders an affordance that loads nothing.
+    const cursor = typeof d.next_before === 'number' ? d.next_before : null
+    return { ok: d.ok, key: d.key, nextBefore: cursor ?? 0, messages: filterMessages(d.messages || []), hasMore: cursor !== null && (d.has_more || false), total: d.total || 0 }
   },
 )
 
@@ -1311,13 +1333,8 @@ export const loadOlderMessages = createAsyncThunk(
     if (!state.activeSlot || !state.slotHasMore) return null
     if (state.slotOldestIndex <= 0) return null
     const slot = state.activeSlot
-    const d = await api.chatSlotDetail(slot, OLDER_PAGE_RAW, state.slotOldestIndex)
-    // rawCount is the span of RAW server rows this page consumed, which is NOT
-    // the length of what came back: the handler returns _prepare_messages(...),
-    // which collapses chunk runs and drops done. When has_more is true the
-    // handler took exactly `limit` raw rows (start = end - limit), so the
-    // requested limit IS the span.
-    return { slot, rawCount: OLDER_PAGE_RAW, messages: filterMessages(d.messages || []), hasMore: d.has_more || false, total: d.total || 0 }
+    const d = await api.chatSlotDetail(slot, OLDER_PAGE_LIMIT, state.slotOldestIndex)
+    return { slot, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), hasMore: d.has_more || false, total: d.total || 0 }
   },
   {
     // Concurrency guard belongs HERE, not in the payload creator: `pending`
@@ -1653,6 +1670,11 @@ const chatSlice = createSlice({
     setActiveSlot(state, action: PayloadAction<string | null>) { state.activeSlot = action.payload; state.slotState = 'idle'; state.pendingTurnSlot = null },
     clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'files'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; state.slotHasMore = false; state.slotOldestIndex = 0; state.loadingOlder = false; state.lastChunkSeq = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
     setPendingInput(state, action: PayloadAction<string | null>) { state.pendingInput = action.payload },
+    setAgentSwitchNotice(state, action: PayloadAction<string | null>) {
+      // Always create a fresh value so repeating the same refusal restarts the
+      // App shell's expiry effect instead of inheriting the previous timer.
+      state.agentSwitchNotice = action.payload === null ? null : { message: action.payload }
+    },
     setQuestionCard(state, action: PayloadAction<{ slot: string; ask_id?: string; card_id?: string; questions: ChatState['pendingQuestions'][string]['questions']; fresh?: boolean }>) {
       // Defensive init: existing test fixtures build partial preloaded state
       // without this key.
@@ -1868,9 +1890,11 @@ const chatSlice = createSlice({
       // Non-steer user bubbles carry a `sendId` in meta (set by ChatPage at
       // send time) that serves as both the optimistic marker and the correlation
       // ID for reconciliation. The `optimistic` flag is kept as a simple boolean
-      // so the reconcile scan knows this bubble is pending confirmation (#2845).
+      // so the reconcile scan knows this bubble is pending confirmation.
+      // `optimisticTs` records when the bubble was created so the UI can show a
+      // retry affordance after OPTIMISTIC_TIMEOUT_MS (#3898 item 3).
       if (m.role === 'user' && !m.meta?.steer && m.meta?.sendId) {
-        m.meta = { ...(m.meta || {}), optimistic: true }
+        m.meta = { ...(m.meta || {}), optimistic: true, optimisticTs: (m.meta as Record<string, unknown>)?.optimisticTs ?? Date.now() }
       }
       state.messages.push(ensureMsgId(m))
     },
@@ -1942,7 +1966,7 @@ const chatSlice = createSlice({
       // Mark non-steer user bubbles as optimistic so the sseChatMessage
       // reconcile can distinguish them from channel-replayed messages (#2845).
       if (message.role === 'user' && !message.meta?.steer && message.meta?.sendId) {
-        message.meta = { ...(message.meta || {}), optimistic: true }
+        message.meta = { ...(message.meta || {}), optimistic: true, optimisticTs: (message.meta as Record<string, unknown>)?.optimisticTs ?? Date.now() }
       }
       msgs.push(ensureMsgId(message))
     },
@@ -1958,6 +1982,23 @@ const chatSlice = createSlice({
       else { state.messages.push({ role: 'assistant', content: payload.content, cls: 'msg msg-a', ts: payload.ts }) }
     },
     removeThinking(state) { state.messages = state.messages.filter(m => m.role !== 'thinking') },
+    /** Mark optimistic bubbles older than OPTIMISTIC_TIMEOUT_MS as stale so the
+     *  UI can show a "retry" affordance. Called periodically from useWebSocket's
+     *  heartbeat timer. Does not remove — the bubble stays in place. (#3898) */
+    sweepStaleOptimistic(state) {
+      const now = Date.now()
+      const sweep = (msgs: ChatMessage[]) => {
+        for (const m of msgs) {
+          if (m.meta?.optimistic && m.meta?.optimisticTs && !m.meta?.stale) {
+            if (now - (m.meta.optimisticTs as number) > OPTIMISTIC_TIMEOUT_MS) {
+              m.meta = { ...(m.meta || {}), stale: true }
+            }
+          }
+        }
+      }
+      sweep(state.messages)
+      for (const msgs of Object.values(state.slotMessages)) sweep(msgs)
+    },
     removeByApprovalId(state, action: PayloadAction<string>) { state.messages = state.messages.filter(m => m.meta?.approval_id !== action.payload) },
     resolveByApprovalId(state, action: PayloadAction<{ id: string; decision?: string }>) {
       const decision = action.payload.decision || 'approved'
@@ -2200,6 +2241,8 @@ const chatSlice = createSlice({
         a.lastTool = action.payload.tool; a.status = 'tool'
         if (typeof action.payload.tool_count === 'number') a.toolCount = action.payload.tool_count
         a.stalled = false
+        a.idleSecs = undefined
+        a.stalledAt = undefined
         a.retrying = false
       }
     },
@@ -2210,27 +2253,42 @@ const chatSlice = createSlice({
       const { slot, id } = action.payload
       if (id === '__proto__' || id === 'constructor' || id === 'prototype') return
       const a = getSlotSubs(state, slot)?.[id]
-      if (a) { a.retrying = true; a.stalled = false }
+      if (a) { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
     },
     sseSubagentStalled(state, action: PayloadAction<{ slot: string; id: string; stalled: boolean; idle_secs?: number }>) {
       const { slot, id } = action.payload
       // Prototype-pollution guard is centralized in getSlotSub.
       const a = getSlotSub(state, slot, id)
-      if (a) a.stalled = action.payload.stalled
+      if (!a) return
+      a.stalled = action.payload.stalled
+      // Keep the idle span with the flag it justifies, and clear it on the
+      // un-stall frame so a resumed agent cannot keep showing a stale
+      // "no activity for Ns" from its previous quiet stretch.
+      // `stalledAt` is the receipt instant: the backend emits `idle_secs` only on
+      // the transition, so the row advances the figure from here rather than
+      // freezing it next to a live elapsed counter.
+      a.idleSecs = action.payload.stalled ? action.payload.idle_secs : undefined
+      a.stalledAt = action.payload.stalled ? Date.now() : undefined
     },
     /** One coalesced ~1s frame carrying the latest delta per agent (scale
      *  plumbing — replaces per-event tool/stalled/retrying frames when many
      *  agents run). Field presence decides what to apply; latest wins. */
-    sseSubagentBatchUpdate(state, action: PayloadAction<{ updates: { id: string; slot: string; tool?: string; tool_count?: number; stalled?: boolean; attempt?: number }[] }>) {
+    sseSubagentBatchUpdate(state, action: PayloadAction<{ updates: { id: string; slot: string; tool?: string; tool_count?: number; stalled?: boolean; idle_secs?: number; attempt?: number }[] }>) {
       for (const u of action.payload.updates || []) {
         const a = getSlotSub(state, u.slot, u.id)
         if (!a) continue
         // Order matters: retrying (attempt) applies FIRST so a tool field in
         // the same merged entry — meaning work resumed — clears it last.
-        if (typeof u.attempt === 'number') { a.retrying = true; a.stalled = false }
+        if (typeof u.attempt === 'number') { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
         if (typeof u.tool === 'string' && u.tool) { a.lastTool = u.tool; if (a.status === 'running') a.status = 'tool'; a.retrying = false }
         if (typeof u.tool_count === 'number') a.toolCount = u.tool_count
-        if (typeof u.stalled === 'boolean') a.stalled = u.stalled
+        if (typeof u.stalled === 'boolean') {
+          a.stalled = u.stalled
+          // Mirror the per-event frame: the idle span lives and dies with the
+          // flag, so a coalesced un-stall cannot leave a stale idle figure.
+          a.idleSecs = u.stalled ? u.idle_secs : undefined
+          a.stalledAt = u.stalled ? Date.now() : undefined
+        }
       }
     },
     /** One coalesced ~1s frame of concatenated streaming text per agent
@@ -2941,45 +2999,14 @@ const chatSlice = createSlice({
           }
         }
         // Reconcile the optimistic user bubble rather than pushing a duplicate
-        // when the server echoes the user frame. The bubble is NOT necessarily
-        // the last message: the agent can start streaming (thinking/tool/
-        // assistant frames) before the server echoes the user frame, so a
-        // tail-only check misses the bubble and the echo is pushed as a
-        // duplicate — or worse, the original bubble never receives its `mid`,
-        // making it un-pinnable (#2845).
-        //
-        // PRIMARY: match by `sendId` — a client-generated correlation ID
-        // stamped at send time into both the optimistic bubble and the POST
-        // body. The server preserves meta fields, so the echo carries the same
-        // sendId plus the server-minted `mid`. This is a cryptographic-strength
-        // identity match — distinct messages with identical text but different
-        // sendIds are never conflated.
-        //
-        // FALLBACK: for code paths that create optimistic bubbles without a
-        // sendId (split-pane sends, queued message promotions), fall back to
-        // the pre-existing tail-check: if the last user message matches
-        // content and has no mid yet, reconcile it. This preserves the
-        // original behavior for those paths.
+        // when the server echoes the user frame (#2845). Uses shared helper that
+        // scans past non-matching pipelined sends (#3898).
         const echoSendId = meta?.sendId as string | undefined
         if (echoSendId && meta?.mid) {
-          const reconcileFloor = Math.max(0, state.messages.length - 50)
-          for (let i = state.messages.length - 1; i >= reconcileFloor; i--) {
-            const m = state.messages[i]
-            if (m.role !== 'user') continue
-            if (m.meta?.steer) break
-            if (m.meta?.sendId === echoSendId) {
-              if (ts) m.ts = ts
-              m.meta = { ...(m.meta || {}), ...meta }
-              delete (m.meta as Record<string, unknown>).optimistic
-              return
-            }
-            break
-          }
+          if (reconcileOptimisticEcho(state.messages, echoSendId, meta as Record<string, unknown>, ts)) return
         } else if (meta?.mid) {
-          // Fallback: no sendId on the echo — use tail content match (the
-          // pre-existing reconcile that worked when the echo arrived before
-          // any streaming). Only checks the LAST message (not a backward scan)
-          // to limit false-match risk to the original code's window.
+          // Fallback: no sendId on the echo — use tail content match for paths
+          // that don't generate a sendId (split-pane, queued promotions).
           const last = state.messages[state.messages.length - 1]
           if (last?.role === 'user' && last.content === content && !last.meta?.mid) {
             if (ts) last.ts = ts
@@ -3165,7 +3192,7 @@ const chatSlice = createSlice({
         state._wsChunkedDuringFetch = false
       })
       .addCase(switchSlot.fulfilled, (state, action) => {
-        const { key, messages, running, hasMore, total, queue, rawCount } = action.payload
+        const { key, messages, running, hasMore, queue, nextBefore } = action.payload
         if (isUnsafeKey(key)) return
         if (state.activeSlot !== key) return  // user switched away during fetch
         state.slotState = running ? 'streaming' : 'idle'
@@ -3241,7 +3268,7 @@ const chatSlice = createSlice({
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
         state.slotHasMore = hasMore
-        state.slotOldestIndex = hasMore ? Math.max(0, total - rawCount) : 0
+        state.slotOldestIndex = hasMore ? nextBefore : 0
         // Hydrate queued messages from the backend queue field through the
         // single shared path (hydrateQueuedBubbles) so this reducer cannot drift
         // from warmSlotCache/refreshSlot. It strips any WS-delivered queued
@@ -3267,7 +3294,7 @@ const chatSlice = createSlice({
       })
       .addCase(refreshSlot.fulfilled, (state, action) => {
         if (!action.payload) return
-        const { key, messages, running, hasMore, total, queue, rawCount } = action.payload
+        const { key, messages, running, hasMore, queue, nextBefore } = action.payload
         if (isUnsafeKey(key)) return
         if (state.activeSlot !== key) return  // user switched away
         // Merge permission messages: prefer state perms (have frontend resolved flags)
@@ -3310,7 +3337,7 @@ const chatSlice = createSlice({
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
         state.slotHasMore = hasMore
-        state.slotOldestIndex = hasMore ? Math.max(0, total - rawCount) : 0
+        state.slotOldestIndex = hasMore ? nextBefore : 0
         seedContextUsage(state, key, action.payload.context)
       })
       .addCase(warmSlotCache.fulfilled, (state, action) => {
@@ -3387,6 +3414,12 @@ const chatSlice = createSlice({
         state.toolLog = []
         state.subagents = {}
         state.activityTab = 'files'
+        // A brand-new chat starts with the side panel CLOSED, like every other
+        // slot-entry path (switchSlot / resumeFromHistory read `?? false` for a
+        // slot they have no cached bucket for). Without this the panel state of
+        // the chat being left leaked into the new one — and was not persisted
+        // under the new slot's key either, so a reload silently closed it again.
+        state.activityOpen = false
         state.slotRunning = false
         state.slotStopping = false
         state.slotState = 'idle'
@@ -3431,7 +3464,7 @@ const chatSlice = createSlice({
           state.slotState = 'idle'
           state.pendingTurnSlot = null
           state.slotHasMore = action.payload.hasMore
-          state.slotOldestIndex = action.payload.hasMore ? Math.max(0, action.payload.total - action.payload.rawCount) : 0
+          state.slotOldestIndex = action.payload.hasMore ? action.payload.nextBefore : 0
         }
       })
       .addCase(deleteHistorySession.fulfilled, (state, action) => {
@@ -3454,9 +3487,7 @@ const chatSlice = createSlice({
           const fresh = merged.filter(m => !isRedeliveredMessage(state.messages, m.meta))
           state.messages = [...fresh, ...state.messages]
           state.slotHasMore = action.payload.hasMore
-          state.slotOldestIndex = action.payload.hasMore
-            ? Math.max(0, state.slotOldestIndex - action.payload.rawCount)
-            : 0
+          state.slotOldestIndex = action.payload.hasMore ? action.payload.nextBefore : 0
         }
       })
       .addCase(loadOlderMessages.rejected, (state) => {
@@ -3466,8 +3497,8 @@ const chatSlice = createSlice({
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  removeThinking, sweepStaleOptimistic, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,

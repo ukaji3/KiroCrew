@@ -620,6 +620,14 @@ name:
   them (idempotent), fixing installs polluted by older builds.
 - The dashboard model PATCH writes the sidecar, never the spec; agent DELETE
   prunes the sidecar entry.
+- `agent_state.lift_and_strip_bookkeeping()` is the single shared
+  implementation of the lift/strip/no-clobber rule above (with a type guard —
+  a non-`bool` `model_managed` or non-`str` `cc_model` is stripped but never
+  lifted, since coercing it could silently flip its meaning). All four spec
+  writers call it — the dashboard's whole-config `PUT /api/agent/config`
+  handler, the per-agent `PATCH /api/agent/<name>` handler,
+  `migrate_agent_specs()`, and `_refresh_dynamic_fields()` — so none of them
+  can drift from the other three.
 
 Note: KiroCrew is KiroACP (kiro-cli) only — the deleted `claude_code` provider
 was the sole reader of spec `cc_model`, so `cc_model` is now dead config. The
@@ -916,6 +924,11 @@ Resolution precedence, implemented in `website/src/i18n/detect.ts`:
 Auto option writes `""` to clear a previous explicit choice. An explicit choice
 always outranks detection, so a user who selects English on a zh-CN machine is
 not re-detected back to Chinese on the next load.
+
+A cross-tab `storage` event is also an explicit user choice. Once one arrives,
+`LanguageProvider` refuses to adopt the older `/api/theme/boot` response that may
+still be in flight, so the UI, local mirror, and workspace write cannot diverge
+because of response ordering.
 
 The picker's Auto row is labelled plain **"Auto"**, not "Auto (follow browser)".
 The desktop app has no browser preference to follow — its locale comes from the

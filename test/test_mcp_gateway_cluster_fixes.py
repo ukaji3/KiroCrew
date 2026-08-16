@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -199,7 +200,6 @@ class TestNamingMigration:
             autoapprove_set_hash="a",
             approval_mode="interactive",
             trust_all_tools=False,
-            user_identity="test",
             config_snapshot_hash="c",
         )
         env_patch = {"MC_MCP_TARGET_TEST_SRV": "/usr/bin/test-srv --stdio"}
@@ -230,7 +230,6 @@ class TestNamingMigration:
             autoapprove_set_hash="a",
             approval_mode="interactive",
             trust_all_tools=False,
-            user_identity="test",
             config_snapshot_hash="c",
         )
         env_patch = {
@@ -283,7 +282,7 @@ class TestNamingMigration:
         (agents_dir / "test.json").write_text(json.dumps({
             "name": "test",
             "mcpServers": {
-                "pooled": {"command": "/bin/srv", "args": ["--stdio"]},
+                "pooled": {"command": sys.executable, "args": ["--stdio"]},
             },
         }), encoding="utf-8")
         overlay_dir = tmp_path / "overlay"

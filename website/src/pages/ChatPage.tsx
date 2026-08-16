@@ -15,7 +15,7 @@ import { useChatPopouts } from '../hooks/useChatPopouts'
 import {
   switchSlot, createSlot, deleteSlot, fetchHistory, loadOlderMessages,
   appendMessage, appendSlotMessage, resumeFromHistory, forkSlot,
-  setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, resolveByApprovalId, clearPendingPermissions, cancelQueuedMessage, editQueuedMessage,
+  setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, setAgentSwitchNotice, resolveByApprovalId, clearPendingPermissions, cancelQueuedMessage, editQueuedMessage,
   selectComposerBusy,
   selectContinuable,
   selectTurnInterrupted,
@@ -72,6 +72,7 @@ const SCROLL_AFTER_RENDER_MS = 100
 export { PREFILL_STORAGE_KEY } from '../utils/navIntent'
 import { PREFILL_STORAGE_KEY, writePrefill } from '../utils/navIntent'
 import { consumeChatHandoff, subscribeChatHandoff } from '../utils/errorReport'
+import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import WelcomeView from '../components/WelcomeView'
 import { usePanelTabs, openPanelView, clearInlineDraft, getInlineDraft, claimAppAutoOpen, useAnyLiveAppTab } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
@@ -98,7 +99,6 @@ import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
 import PendingQuestionCard from '../components/PendingQuestionCard'
-import SessionPulseSurveyCard from '../components/SessionPulseSurveyCard'
 import type { FollowupItem } from '../store/chatSlice'
 
 // Stable identity for the "no follow-up cards" case: returning a fresh {} from
@@ -793,10 +793,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // MCP Apps in the side panel (dashboard.mcp_app_panel, opt-in). When on, a new
   // render opens the panel to its own `app` tab instead of drawing inline in the
   // bubble — same auto-open path the web-preview marker uses.
-  const { data: appPanelCfg } = useQuery<{ mcp_app_panel?: boolean }>({
+  const { data: appPanelCfg, isError: appPanelCfgError } = useQuery<{ mcp_app_panel?: boolean; auto_open_git_panel?: boolean }>({
     queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000,
   })
   const mcpAppPanel = appPanelCfg?.mcp_app_panel === true
+  // Opt-in: expand the side panel to the Git tab on sight of a git project
+  // (dashboard.auto_open_git_panel). See the git-panel effect for why it is off
+  // by default.
+  const autoOpenGitPanel = appPanelCfg?.auto_open_git_panel === true
+  // Whether that value is KNOWN yet. The git effect consumes a one-shot
+  // localStorage marker, so acting while this query is still in flight would
+  // burn the marker with the flag reading false and an opted-in user would never
+  // get the panel. A FAILED query counts as known and resolves to the documented
+  // default (off) — otherwise a config endpoint that is down would withhold the
+  // Git tab itself, which the flag does not govern.
+  const autoOpenGitPanelKnown = appPanelCfg !== undefined || appPanelCfgError
   // Tool-call ids already routed to a tab, so re-renders of the same app don't
   // yank focus back to the panel on every streaming update.
   useEffect(() => {
@@ -814,16 +825,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const messages = useAppSelector(s => s.chat.messages)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
-  const kiroCrewVersion = useAppSelector(s => s.dashboard.status?.version) || ''
-  const assistantTurnCount = useMemo(
-    () =>
-      messages.filter(
-        m =>
-          m.role === 'assistant' &&
-          (m.kind ?? (m.meta?.kind as string | undefined)) !== 'compaction',
-      ).length,
-    [messages],
-  )
   const knowledgeFetch = useKnowledgeFetch(activeSlot)
   const knowledgeFetchRef = useRef(knowledgeFetch)
   knowledgeFetchRef.current = knowledgeFetch
@@ -2990,23 +2991,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => cancelAnimationFrame(raf)
   }, [activeTip, scrollBottom])
 
-  // Same re-anchor need as the tip above, for the session pulse survey card:
-  // it renders after ChatFooter, outside the virtualizer's measured rows, so
-  // mounting/unmounting it changes the scroll viewport's real content height
-  // without the virtualizer knowing — otherwise a new turn arriving while the
-  // card is showing renders visually behind/under it instead of pushing it
-  // out of view.
-  const [surveyVisible, setSurveyVisible] = useState(false)
-  useEffect(() => {
-    if (!isAtBottomRef.current) return
-    const raf = requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (isAtBottomRef.current) scrollBottom(true)
-      })
-    })
-    return () => cancelAnimationFrame(raf)
-  }, [surveyVisible, scrollBottom])
-
   // Navigate to a (possibly off-window) display index: mount it first via the
   // virtualizer so the DOM-based scroll can find it, then scroll next frame.
   // Tracks the in-flight row-mount poll (below) so a newer navigation cancels
@@ -4190,12 +4174,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setPendingModel('')
       return
     }
-    await api.chatSlotAgent(activeSlot, agentName)
-    setAgentDropdown(false)
-    // queryClient, setAgentDropdown, and the setPending* setters are all stable
-    // (react-query client / useState setters / useCallback([])), so listing them
-    // satisfies the linter without re-creating this callback.
-  }, [activeSlot, installedAgents, provider, queryClient, setAgentDropdown, setPendingAgent, setPendingModel])
+    dispatch(setAgentSwitchNotice(null))
+    try {
+      await api.chatSlotAgent(activeSlot, agentName)
+    } catch (error) {
+      // Closing the picker is the call sites' job and already happens
+      // synchronously alongside this call, so a failure surfaces as the shared
+      // notice rather than by holding the dropdown open.
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
+    }
+    // queryClient and the setPending* setters are all stable (react-query
+    // client / useState setters / useCallback([])), so listing them satisfies
+    // the linter without re-creating this callback.
+  }, [activeSlot, dispatch, installedAgents, provider, queryClient, setPendingAgent, setPendingModel])
   const switchModel = useCallback(async (modelName: string) => {
     // 'auto' is stored VERBATIM, not collapsed to ''. Both resolve to the same
     // provider behaviour server-side, but '' is also the "never chosen" state,
@@ -4694,10 +4685,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
 
   // Auto-open the Git panel when the slot has a project dir that is a git repo.
-  // Once per slot+path (dismissed via localStorage marker if the user closes it).
+  // OPT-IN (dashboard.auto_open_git_panel, default off) because the marker below
+  // cannot make this the once-per-project nudge it reads like: a new slot inherits
+  // `dashboard.default_project`, so keying on slot+path re-fires for every new
+  // chat in the same repo — forever. The Git TAB is still created unconditionally
+  // (same as the folder tab below), so the panel is one click away when off.
   useEffect(() => {
     if (!activeSlot || !_slotProject || projectGitError) return
     if (!projectGit?.repo) return
+    // Do not consume the marker before the opt-in's value is known — see
+    // `autoOpenGitPanelKnown`.
+    if (!autoOpenGitPanelKnown) return
     const key = `mc-git-panel-opened:${activeSlot}:${_slotProject}`
     if (localStorage.getItem(key)) return
     // If the marker cannot be persisted (quota), skip the auto-open entirely:
@@ -4705,8 +4703,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // would make it open again forever.
     try { localStorage.setItem(key, '1') } catch { return }
     tabsCtl.openView('git')
-    dispatch(openActivityPanel())
-  }, [activeSlot, _slotProject, projectGit?.repo, projectGitError, tabsCtl, dispatch])
+    if (autoOpenGitPanel) dispatch(openActivityPanel())
+  }, [activeSlot, _slotProject, projectGit?.repo, projectGitError, tabsCtl, dispatch, autoOpenGitPanel, autoOpenGitPanelKnown])
 
   // Auto-open the folder tab for the project dir once per slot+path.
   useEffect(() => {
@@ -5826,6 +5824,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     mo.observe(document.body, { childList: true, subtree: true })
     return () => mo.disconnect()
   }, [isMobile, embedMode])
+  /** True while the INLINE side panel (mobile / embed, no actbar column) is
+   *  mounted AND visible.
+   *
+   *  Mobile has no actbar grid column, so the panel renders as a flex sibling of
+   *  the chat pane at the full window width — it covers the content area
+   *  outright. Anything the chat pane floats over that area (the sessions FAB
+   *  below) would land on top of the panel's own controls, so it is gated on
+   *  this. Reuses the panel's own mount/visibility predicates rather than
+   *  re-deriving them from `activityOpen`, which is only one of their inputs (a
+   *  live app or browser tab keeps the panel mounted through a close, and the
+   *  find pane hides it while owning the dock). */
+  const inlineSidePanelShowing = !activitySlot
+    && shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
+    && !isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
   const openSidebar = useCallback(() => setMobileSessions(true), [])
   const closeSidebar = useCallback(() => setMobileSessions(false), [])
   useSwipeEdge(chatContainerRef, { enabled: isMobile && !mobileSessions, edge: 'left', edgeZone: 0.35, onSwipe: openSidebar })
@@ -6164,7 +6176,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             <button onClick={dismissPinStatus} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="w-4 h-4" /></button>
           </div>
         )}
-        {isMobile && !sidebarOpen && !(activeSlot && (messages.length > 0 || slotRunning)) && (
+        {/* Floating sessions opener — mobile only, and only on a chat with
+            nothing in it yet (a conversation gets the in-header control
+            instead). Suppressed while the inline side panel is showing: it is
+            `fixed` at the same top-left corner as the panel's own collapse
+            button and, carrying z-10 against that button's auto z-index, paints
+            OVER it — leaving no way to close a panel that covers the whole
+            screen. It would also be pointing at a chat pane the panel has
+            squeezed to zero width. Sessions stay reachable meanwhile via the
+            left-edge swipe (useSwipeEdge above).
+
+            Suppressed when EMBEDDED for the same reason it is suppressed
+            behind the side panel: `fixed` anchors it to the VIEWPORT, not to
+            the host's pane, so it lands on whatever the host put in that
+            corner -- in Papyrus, on the toolbar's back button, giving two
+            overlapping tap targets on the app's primary exit. A host that
+            embeds one scoped conversation has no sessions list to open. */}
+        {isMobile && !embedded && !sidebarOpen && !inlineSidePanelShowing && !(activeSlot && (messages.length > 0 || slotRunning)) && (
           <div className="fixed top-[42px] left-2 z-10">
             <button className="p-2 rounded-lg text-muted hover:text-text bg-bg-elevated border border-border shadow-sm cursor-pointer" onClick={() => setMobileSessions(true)} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
               {effectiveMode === 'orchestrator' ? <MessageSquareDot size={18} /> : <MessageSquare size={18} />}
@@ -6209,7 +6237,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     {effectiveMode === 'orchestrator' ? <MessageSquareDot size={16} /> : <MessageSquare size={16} />}
                   </button>
                 )}
-                <div className="group/header flex items-stretch gap-0.5 pointer-events-auto">
+                <div className="group/header flex min-w-0 items-stretch gap-0.5 pointer-events-auto">
                 <div className="flex items-center rounded-l-md rounded-r-[2px] px-1.5 py-0.5 group-hover/header:bg-bg-hover transition-colors">
                 <ChatHeaderMenu
                   activeSlot={activeSlot}
@@ -6234,17 +6262,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 />
                 </div>
               {editingTitle ? (
-                <div className="flex w-fit items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
+                <div className="flex min-w-0 flex-1 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
                   {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
                   {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                  <Input className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 flex-none outline-none max-w-[50vw] focus:!shadow-none" size={Math.min(Math.max(titleDraft.length + 2, 6), 80)} autoFocus value={titleDraft} onChange={e => setTitleDraft(e.target.value)} onBlur={() => { if (!cancelTitleRef.current && titleDraft.trim() && activeSlot && titleDraft !== title) { dispatch(sseSlotTitle({ key: activeSlot, title: titleDraft.trim() })); api.renameSlot(activeSlot, titleDraft.trim()).catch(() => {}) } cancelTitleRef.current = false; setEditingTitle(false) }} onCompositionStart={() => { composingRef.current = true }} onCompositionEnd={() => { composingRef.current = true; setTimeout(() => { composingRef.current = false }, 50) }} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && !composingRef.current) (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { cancelTitleRef.current = true; setEditingTitle(false) } }} />
+                  <Input className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-none md:max-w-[50vw] focus:!shadow-none" size={Math.min(Math.max(titleDraft.length + 2, 6), 80)} autoFocus value={titleDraft} onChange={e => setTitleDraft(e.target.value)} onBlur={() => { if (!cancelTitleRef.current && titleDraft.trim() && activeSlot && titleDraft !== title) { dispatch(sseSlotTitle({ key: activeSlot, title: titleDraft.trim() })); api.renameSlot(activeSlot, titleDraft.trim()).catch(() => {}) } cancelTitleRef.current = false; setEditingTitle(false) }} onCompositionStart={() => { composingRef.current = true }} onCompositionEnd={() => { composingRef.current = true; setTimeout(() => { composingRef.current = false }, 50) }} onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && !composingRef.current) (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { cancelTitleRef.current = true; setEditingTitle(false) } }} />
                 </div>
               ) : (
-                <div className="cursor-text flex items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover transition-colors">
-                  <Clickable className="flex items-center gap-1" onClick={() => { if (activeSlot && generatingTitleSlots.has(activeSlot)) return; setEditingTitle(true); setTitleDraft(title) }}>
+                <div className="cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover transition-colors">
+                  <Clickable className="flex min-w-0 items-center gap-1" onClick={() => { if (activeSlot && generatingTitleSlots.has(activeSlot)) return; setEditingTitle(true); setTitleDraft(title) }}>
                     {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
                     {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                    <TypewriterText text={title} className="session-header-title text-sm font-semibold text-muted font-body truncate max-w-[50vw]" />
+                    <TypewriterText text={title} className="session-header-title text-sm font-semibold text-muted font-body truncate min-w-0 md:max-w-[50vw]" />
                     <Pen size={13} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-60 transition-opacity" />
                   </Clickable>
                   {activeSlot && (generatingTitleSlots.has(activeSlot) ? <Loader size={16} className="shrink-0 text-accent animate-spin" /> : <Btn aria-label={i18nT('pages.chatPage.regenerate_title_with_llm')} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-40 hover:!opacity-100 hover:text-accent transition-all cursor-pointer bg-transparent border-none p-0" title={i18nT('pages.chatPage.regenerate_title_with_llm')} onClick={e => { e.stopPropagation(); if (!activeSlot || generatingTitleSlots.has(activeSlot)) return; const slot = activeSlot; setGeneratingTitleSlots(prev => new Set(prev).add(slot)); api.generateTitle(slot).then(r => { /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */ if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title })) }).catch(e => {
@@ -6259,7 +6287,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
                   siblings split the gap, parking the split icon mid-header). */}
-              <div className="ml-auto flex items-center gap-1.5 pointer-events-none">
+              <div className="ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none">
               {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
                   dimmed icon to act, an accent chip when the state is active.
@@ -6440,6 +6468,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <div className="h-16" />
               {/* Top sentinel: drives upward window expansion via virtualizer's IO. */}
               <div ref={virt.topSentinelRef} aria-hidden style={{ height: 1 }} />
+              {/* top-16 matches the h-16 header spacer above, so the pinned spinner
+                  clears the overlay header instead of sitting under it.
+                  overflow-anchor:none so appearing/vanishing here cannot become the
+                  browser's scroll anchor and jump the list mid-fetch. */}
+              {loadingOlder && (
+                <div className="sticky top-16 z-[1] flex justify-center py-2" data-testid="older-messages-loading" role="status" aria-label={i18nT('pages.chatPage.loading_earlier_messages')} style={{ overflowAnchor: 'none', background: 'var(--bg)' }}>
+                  <Loader size={16} className="animate-spin text-muted" />
+                </div>
+              )}
               {/* Top spacer — reserves the height of all items above the mounted
                   window so the scrollbar stays accurate while only the window
                   renders real DOM (keeps fast scroll cheap — O(window) nodes).
@@ -6537,32 +6574,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
               {/* Footer */}
               <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
-              {activeSlot && !slotLoading && (
-                <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-                  <SessionPulseSurveyCard
-                    // Remount on session switch: without this, React reuses
-                    // the same component instance across sessions, so an
-                    // in-progress rating/feedback/email from session A would
-                    // still be sitting in state when the user switches to
-                    // session B and hits Submit — attributing A's answers to
-                    // B's sessionId prop, which had already updated.
-                    //
-                    // Gated on !slotLoading: the card captures its baseline
-                    // turn count on FIRST MOUNT (see the component's own
-                    // comment), so mounting before history finishes loading
-                    // would baseline at 0 and then count every loaded
-                    // historical turn as "live" once the fetch resolves —
-                    // reintroducing the exact reopened-session bug the
-                    // baseline exists to prevent, just via a race instead of
-                    // a missing check.
-                    key={activeSlot}
-                    sessionId={activeSlot}
-                    kiroCrewVersion={kiroCrewVersion}
-                    turnCount={assistantTurnCount}
-                    onVisibleChange={setSurveyVisible}
-                  />
-                </div>
-              )}
               <div style={{height: '2vh'}} />
             </div>
             )}

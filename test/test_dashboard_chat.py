@@ -948,11 +948,16 @@ class TestSlotDetailPagination:
             assert data["has_more"] is True
             assert len(data["messages"]) == 200
             assert data["total"] == 300
+            # The cursor for the next page, in the raw index space this slice was
+            # taken in. The client cannot derive it from the response body, whose
+            # rows have already been collapsed by _prepare_messages.
+            assert data["next_before"] == 100
 
-            resp = await client.get("/api/chat/slots/test?limit=200&before=100")
+            resp = await client.get(f"/api/chat/slots/test?limit=200&before={data['next_before']}")
             data = await resp.json()
             assert len(data["messages"]) == 100
             assert data["has_more"] is False
+            assert data["next_before"] == 0
             assert data["messages"][0]["content"] == "msg 0"
 
     @pytest.mark.asyncio
@@ -1350,7 +1355,10 @@ class TestSlotLifecycle:
             resp = await client.post("/api/chat/slots/s1/approve", json={"action": "approved"})
             assert (await resp.json())["ok"] is True
             state.broadcast_ws.assert_any_call(
-                "approval_resolved", {"id": "req-abc", "approved": True}
+                "approval_resolved",
+                # ``slot`` keys the frame for the slot-scoped WS gate: without it
+                # an app token never receives its OWN approval resolution.
+                {"id": "req-abc", "approved": True, "slot": "s1"},
             )
 
     @pytest.mark.asyncio
@@ -1370,7 +1378,10 @@ class TestSlotLifecycle:
             )
             assert (await resp.json())["ok"] is True
             state.broadcast_ws.assert_any_call(
-                "approval_resolved", {"id": "req-xyz", "approved": True}
+                "approval_resolved",
+                # ``slot`` keys the frame for the slot-scoped WS gate: without it
+                # an app token never receives its OWN approval resolution.
+                {"id": "req-xyz", "approved": True, "slot": "s1"},
             )
 
     @pytest.mark.asyncio
@@ -1390,7 +1401,10 @@ class TestSlotLifecycle:
             )
             assert (await resp.json())["ok"] is True
             state.broadcast_ws.assert_any_call(
-                "approval_resolved", {"id": "req-rej", "approved": False}
+                "approval_resolved",
+                # ``slot`` keys the frame for the slot-scoped WS gate: without it
+                # an app token never receives its OWN approval resolution.
+                {"id": "req-rej", "approved": False, "slot": "s1"},
             )
 
 
@@ -1863,6 +1877,60 @@ class TestResumeDedupe:
         assert r["surface"] == "orchestrator"
         # The live slot must also carry the restored mode.
         assert state._slots["orchhist"].mode == "orchestrator"
+
+    @pytest.mark.asyncio
+    async def test_resume_from_disk_sends_the_older_history_cursor(self, tmp_path, monkeypatch):
+        """A fresh resume must send next_before. The client pages by that field
+        and treats its absence as 'no older history', so omitting it strands
+        every row outside the returned window."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        for i in range(250):
+            log.append("dashboard:deep", "user", f"m{i}")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            r = await (
+                await client.post(
+                    "/api/chat/slots/deep/resume", json={"key": "dashboard:deep"}
+                )
+            ).json()
+
+        assert r["ok"] is True
+        assert r["has_more"] is True, "250 rows past a 200-row page must report more"
+        assert "next_before" in r, "resume omitted the cursor the client pages by"
+        assert r["next_before"] == 250 - 200
+
+    @pytest.mark.asyncio
+    async def test_resume_existing_slot_cursor_counts_the_frozen_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        """`total` on this branch counts only the in-memory window, so the cursor
+        has to add the frozen on-disk prefix back. Without that it points inside
+        the range it is meant to skip past, and paging silently loses rows."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.conversation_log.append("dashboard:s1", "user", "hello")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            await client.post("/api/chat/slots/s1/resume", json={"key": "dashboard:s1"})
+            # A restored slot keeps its older on-disk rows outside slot.messages.
+            state._slots["s1"]._disk_older_count = 300
+            r = await (
+                await client.post("/api/chat/slots/s1/resume", json={"key": "dashboard:s1"})
+            ).json()
+
+        assert r["ok"] is True
+        # window is 1 row and is entirely returned, so the cursor is the prefix.
+        assert r["next_before"] == 300, (
+            "cursor ignored _disk_older_count; it would page from inside the prefix"
+        )
+        # A cursor the client is told not to use is dead: every reducer does
+        # `hasMore ? nextBefore : 0`, so asserting the value alone would pass
+        # while the fix stayed inert for exactly the slot shape it targets.
+        assert r["has_more"] is True, (
+            "has_more counted only the in-memory window, so the client discards the cursor"
+        )
 
     @pytest.mark.asyncio
     async def test_resume_existing_slot_returns_it(self, tmp_path, monkeypatch):
@@ -3797,6 +3865,98 @@ class TestRunChatCompactDeferredWait:
             "used_tokens": 150_000,
             "window_tokens": 200_000,
         }
+
+    @staticmethod
+    def _compaction_notice(slot) -> str:
+        """The text of the compaction notice appended to the transcript."""
+        notices = [
+            m["content"]
+            for m in slot.messages
+            if m.get("meta", {}).get("kind") == "compaction" and "Compaction" in m.get("content", "")
+        ]
+        assert notices, "no compaction notice was appended"
+        return notices[-1]
+
+    async def _run_failed_compaction(self, tmp_path, monkeypatch, summary):
+        """Drive /compact to a `failed` result carrying *summary*."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+
+        client = self._make_mock_client([LLMEvent(kind=EVENT_COMPLETE)])
+        result = {"type": "failed"}
+        if summary is not None:
+            result["summary"] = summary
+        client.wait_for_compaction = AsyncMock(return_value=result)
+        client.context_window_tokens = MagicMock(return_value=200_000)
+        client.context_used_tokens = MagicMock(return_value=150_000)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "/compact")
+        return slot
+
+    @pytest.mark.asyncio
+    async def test_failed_compaction_surfaces_the_reason(self, tmp_path, monkeypatch):
+        """The provider's reason reaches the user instead of being discarded.
+
+        Without it, a /compact that failed because the conversation is too large
+        is indistinguishable from one that failed because the backend was
+        unreachable — and those two call for different next moves. Every other
+        surface (Slack/Telegram/Discord, and this dashboard's own auto-compact
+        notice) already says which.
+        """
+        slot = await self._run_failed_compaction(
+            tmp_path, monkeypatch, "context too large to summarize"
+        )
+        assert self._compaction_notice(slot) == (
+            "❌ Compaction failed: context too large to summarize"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_compaction_without_a_reason_keeps_the_bare_notice(
+        self, tmp_path, monkeypatch
+    ):
+        """No reason means no dangling colon — the old wording stands."""
+        slot = await self._run_failed_compaction(tmp_path, monkeypatch, None)
+        assert self._compaction_notice(slot) == "❌ Compaction failed."
+
+    @pytest.mark.asyncio
+    async def test_failed_compaction_blank_reason_keeps_the_bare_notice(
+        self, tmp_path, monkeypatch
+    ):
+        """A whitespace-only reason is treated as absent, not printed."""
+        slot = await self._run_failed_compaction(tmp_path, monkeypatch, "   ")
+        assert self._compaction_notice(slot) == "❌ Compaction failed."
+
+    @pytest.mark.asyncio
+    async def test_failed_compaction_reason_is_redacted(self, tmp_path, monkeypatch):
+        """A backend-echoed reason is not trusted to be credential-free.
+
+        Same redact pair as the sibling `completed` branch, which already treats
+        the provider's text as untrusted.
+        """
+        slot = await self._run_failed_compaction(
+            tmp_path, monkeypatch, "auth failed for AKIAIOSFODNN7EXAMPLE key"
+        )
+        notice = self._compaction_notice(slot)
+        assert "AKIAIOSFODNN7EXAMPLE" not in notice
+        assert "Compaction failed:" in notice
+
+    @pytest.mark.asyncio
+    async def test_failed_compaction_reason_is_length_capped(self, tmp_path, monkeypatch):
+        """A wall of provider text cannot scroll the transcript away."""
+        from kiro_crew.dashboard.chat_runner import _COMPACT_FAIL_REASON_MAX_CHARS
+
+        slot = await self._run_failed_compaction(tmp_path, monkeypatch, "x" * 5_000)
+        notice = self._compaction_notice(slot)
+        assert notice.endswith("…")
+        assert len(notice) < _COMPACT_FAIL_REASON_MAX_CHARS + 60
 
 
 class TestTokenPersistenceBackfill:
@@ -7246,7 +7406,8 @@ class TestPythonStageLoop:
             content = path.read_text(encoding="utf-8")
             assert "Result for stage" in content
 
-    def test_build_stage_context_includes_goal_and_status(self):
+    @pytest.mark.asyncio
+    async def test_build_stage_context_includes_goal_and_status(self):
         """_build_stage_context includes goal, status summary, and stage instruction."""
         from kiro_crew.context_management import OrchestrationTracker
         from kiro_crew.dashboard.chat import _build_stage_context
@@ -7257,13 +7418,14 @@ class TestPythonStageLoop:
         tracker = OrchestrationTracker()
         slot._orch_tracker = tracker
 
-        ctx = _build_stage_context(slot, tracker, stage_idx=0)
+        ctx = await _build_stage_context(slot, tracker, stage_idx=0)
         assert "Build feature X" in ctx
         assert "▶️ Stage 1: Research — execute now" in ctx
         assert "⬜ Stage 2: Implement — pending" in ctx
         assert "Stage 1 of 3" in ctx
 
-    def test_build_stage_context_includes_previous_results(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_build_stage_context_includes_previous_results(self, tmp_path, monkeypatch):
         """_build_stage_context includes paths to previous stage results."""
         monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
         from kiro_crew.context_management import OrchestrationTracker
@@ -7280,7 +7442,7 @@ class TestPythonStageLoop:
         result_file.write_text("Stage 1 completed successfully")
         tracker.record_stage_result(1, str(result_file))
 
-        ctx = _build_stage_context(slot, tracker, stage_idx=1)
+        ctx = await _build_stage_context(slot, tracker, stage_idx=1)
         assert "Stage 1 completed successfully" in ctx
         assert str(result_file) in ctx
         assert "✅ Stage 1: A — completed" in ctx
@@ -7435,7 +7597,8 @@ class TestPythonStageLoop:
         ctx = run_chat_mock.call_args[0][2]
         assert "▶️ Stage 2" in ctx
 
-    def test_previous_result_paths_compaction(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_previous_result_paths_compaction(self, tmp_path, monkeypatch):
         """Long stage results are truncated with tail bias (30% head, 70% tail)."""
         monkeypatch.setattr("kiro_crew.dashboard.chat.is_sensitive_path", lambda p: False)
         from kiro_crew.context_management import OrchestrationTracker
@@ -7458,7 +7621,7 @@ class TestPythonStageLoop:
         result_file.write_text(large_content)
         tracker.record_stage_result(1, str(result_file))
 
-        loaded = _previous_result_paths(tracker, 1)
+        loaded = await _previous_result_paths(tracker, 1)
         # Should be truncated (2000 chars max per stage + header + path)
         assert len(loaded) < 3000
         assert "...[truncated]..." in loaded

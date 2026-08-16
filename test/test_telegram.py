@@ -19,7 +19,11 @@ from unittest.mock import patch
 
 from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
-from kiro_crew.messaging.link import ChannelLink, legacy_dashboard_mirror_key
+from kiro_crew.messaging.link import (
+    UNBIND_REASON_UNSPECIFIED,
+    ChannelLink,
+    legacy_dashboard_mirror_key,
+)
 from kiro_crew.messaging.renderer import (
     DONE,
     STEER_CONSUMED,
@@ -320,7 +324,9 @@ class FakeSessions:
     def max_generation(self, bucket: str) -> int:
         return -1
 
-    def set_mirror_link(self, key: str, link: Any) -> None:
+    def set_mirror_link(
+        self, key: str, link: Any, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> None:
         self.batched_writes.append(self.batch_depth > 0)
         self.mirror_links[key] = link
 
@@ -345,11 +351,13 @@ class FakeSessions:
     def mirror_opt_out(self, key: str) -> bool:
         return _opt_out_key(key) in self.mirror_opt_outs
 
-    def clear_mirror_link(self, key: str) -> bool:
+    def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         self.batched_writes.append(self.batch_depth > 0)
         return self.mirror_links.pop(key, None) is not None
 
-    def clear_mirror_links_at(self, link: Any) -> list[str]:
+    def clear_mirror_links_at(
+        self, link: Any, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> list[str]:
         cleared = [key for key, candidate in self.mirror_links.items() if candidate == link]
         for key in cleared:
             self.mirror_links.pop(key, None)
@@ -510,6 +518,86 @@ class TestParseCommand:
         assert is_bare_mid_turn_override("/queue do this") is False
         assert is_bare_mid_turn_override("/new") is False
         assert is_bare_mid_turn_override("hello") is False
+
+
+class TestBotMentionSuffix:
+    """Telegram's own clients append @BotUsername to a slash command in any
+    chat with more than one participant/bot -- e.g. /new@KiroCrewBot instead
+    of /new. This is standard Bot API client behavior (triggered by
+    registering a command menu via set_my_commands, done at gateway startup),
+    not something this codebase's UI controls, and it fires in exactly the
+    multi-user surface (a Telegram forum-topic supergroup) this integration
+    is built to support. Every alias is defined without the suffix, so
+    without stripping it every command silently fell through to the LLM as
+    ordinary chat text there.
+
+    The strip is gated on the mention matching THIS bot's own username (from
+    getMe): Telegram delivers a command addressed to a different bot in the
+    same group to every bot present, and stripping any mention unconditionally
+    would let e.g. /yolo@OtherBot execute here instead of being ignored."""
+
+    def test_parse_command_strips_bot_mention(self) -> None:
+        assert parse_command("/new@KiroCrewBot", "KiroCrewBot") == "new"
+        assert parse_command("/compact@KiroCrewBot", "KiroCrewBot") == "compact"
+        assert parse_command("/model@KiroCrewBot", "KiroCrewBot") == "model"
+        assert parse_command("/yolo@KiroCrewBot", "KiroCrewBot") == "yolo"
+        assert parse_command("/link@KiroCrewBot", "KiroCrewBot") == "link"
+        assert parse_command("/unlink@KiroCrewBot", "KiroCrewBot") == "unlink"
+        assert parse_command("/stop@KiroCrewBot", "KiroCrewBot") == "stop"
+        assert parse_command("/help@KiroCrewBot", "KiroCrewBot") == "help"
+
+    def test_parse_command_with_mention_and_trailing_args(self) -> None:
+        assert parse_command("/yolo@KiroCrewBot on", "KiroCrewBot") == "yolo"
+
+    def test_parse_command_mention_is_case_insensitive(self) -> None:
+        assert parse_command("/NEW@KiroCrewBot", "kirocrewbot") == "new"
+        assert parse_command("/NEW@KIROCREWBOT", "KiroCrewBot") == "new"
+
+    def test_unknown_command_with_mention_is_still_unknown(self) -> None:
+        # The mention strip must not accidentally widen matching -- a
+        # nonexistent command stays unrecognised, mention or not.
+        assert parse_command("/frobnicate@KiroCrewBot", "KiroCrewBot") is None
+
+    def test_mid_turn_override_strips_bot_mention(self) -> None:
+        assert parse_mid_turn_override("/steer@KiroCrewBot do this instead", "KiroCrewBot") == (
+            "steer",
+            "do this instead",
+        )
+        assert parse_mid_turn_override("/queue@KiroCrewBot later", "KiroCrewBot") == (
+            "queue",
+            "later",
+        )
+
+    def test_bare_mid_turn_override_strips_bot_mention(self) -> None:
+        assert is_bare_mid_turn_override("/queue@KiroCrewBot", "KiroCrewBot") is True
+        assert is_bare_mid_turn_override("/steer@KiroCrewBot", "KiroCrewBot") is True
+
+    def test_mention_pattern_requires_a_leading_at_sign(self) -> None:
+        # A bare word after the command must not be mistaken for a mention
+        # suffix and stripped -- only a real @-prefixed suffix is a mention.
+        assert parse_command("/newsomething", "KiroCrewBot") is None
+
+    def test_a_command_mentioning_a_different_bot_is_not_executed(self) -> None:
+        """Security regression: Telegram fans a command addressed to another
+        bot in the same group out to every bot present. Stripping the mention
+        regardless of whose it is would let it match our own alias and
+        execute -- e.g. silently turning on YOLO auto-approval because
+        someone else's bot was told to. It must instead stay unrecognised."""
+        assert parse_command("/yolo@OtherBot", "KiroCrewBot") is None
+        assert parse_command("/yolo@OtherBot on", "KiroCrewBot") is None
+        assert parse_command("/stop@OtherBot", "KiroCrewBot") is None
+        assert parse_mid_turn_override("/steer@OtherBot do this", "KiroCrewBot") == (
+            None,
+            "/steer@OtherBot do this",
+        )
+        assert is_bare_mid_turn_override("/queue@OtherBot", "KiroCrewBot") is False
+
+    def test_a_mention_is_never_stripped_before_our_username_is_known(self) -> None:
+        """Before getMe() resolves at startup, bot_username is "" -- the
+        default every caller uses. No mention can be verified as ours yet, so
+        none should be treated as ours (fail closed, not open)."""
+        assert parse_command("/new@KiroCrewBot") is None
+        assert parse_command("/yolo@KiroCrewBot") is None
 
 
 class TestCommandCatalogue:

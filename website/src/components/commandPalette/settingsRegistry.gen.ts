@@ -87,6 +87,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "session.autocompact_pct"
   },
   {
+    "id": "chat.auto-open-git-in-side-panel",
+    "label": "Auto-Open Git in Side Panel",
+    "labelKey": "pages.settings.chatPanel.auto_open_git_panel",
+    "description": "Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.background-effort",
     "label": "Background Effort",
     "labelKey": "pages.settings.chatPanel.background_effort",
@@ -159,7 +168,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.describe-your-role",
     "label": "Describe your role",
     "labelKey": "pages.settings.chatPanel.describe_your_role",
-    "description": "Kiro quotes this back to itself when calibrating vocabulary and examples.",
+    "description": "Kiro uses this description to adapt vocabulary and examples to your role.",
     "tab": "chat",
     "type": "input",
     "occurrence": 1

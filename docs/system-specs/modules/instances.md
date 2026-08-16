@@ -223,8 +223,9 @@ why it is down.
 
 ### 5.1 `instances.*` config keys
 
-Defaults live in `kiro_crew.instances.constants` and are referenced from the
-`InstancesConfig` dataclass, so the constant and the config default cannot drift.
+Transport defaults and bounds live in `kiro_crew.instances.constants` and are
+referenced from `InstancesConfig`, so the documented values and runtime policy
+cannot drift.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -232,7 +233,8 @@ Defaults live in `kiro_crew.instances.constants` and are referenced from the
 | `instances.warm_set_cap` | `5` | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). Clamped up to 1. |
 | `instances.tunnel_base_port` | `7778` | First local loopback port the allocator hands out. Out-of-range values fall back to the default. |
 | `instances.ssh_compression` | `true` | Add `-C` to the tunnel argv. See §5.2. |
-| `instances.connect_timeout_secs` | `15.0` | How long (secs) to wait for the local forward port to accept connections before declaring a connect attempt failed. Hosts behind a ProxyCommand or jump host need longer (the proxy handshake runs before ssh begins the forward). The SSM transport uses its own higher default (25s) unless this value is explicitly set. Clamped to [1, 120]. |
+| `instances.connect_timeout_secs` | unset (SSH `15.0`, SSM `25.0`) | How long (secs) to wait for the local forward port to accept connections before declaring a connect attempt failed. Hosts behind a ProxyCommand or jump host need longer (the proxy handshake runs before ssh begins the forward). An explicit value applies to both transports, including a value equal to either transport's default. Values below 1 fall back to the transport defaults; values above 120 are clamped to 120. |
+| `instances.mint_timeout_secs` | unset (SSH `30.0`, SSM `90.0`) | How long (secs) to wait for the remote `kirocrew token` mint before failing a connect. The mint rides the same ssh transport as the tunnel, so a host behind a ProxyCommand or jump host pays the proxy handshake here too (the connect flow spawns two proxy-bound ssh children: `connect_timeout_secs` budgets the first, this budgets the second). An explicit value applies to both transports, including a value equal to either transport's default — size it for the slowest transport in use. Values below 10 fall back to the transport defaults; values above 120 are clamped with a warning. |
 | `instances.max_recovery_attempts` | `8` | Consecutive self-heal attempts before the tunnel is left disconnected. Below 1 falls back to the default; above `MAX_RECOVERY_ATTEMPTS_CEILING` (100) is clamped with a warning, so a pathological setting cannot turn bounded self-heal into a near-infinite retry loop. |
 | `instances.recover_backoff_max_secs` | `30.0` | Cap on the per-attempt backoff. Non-positive falls back to the default; above `RECOVER_BACKOFF_MAX_CEILING_SECS` (300) is clamped, bounding the worst-case wall-clock recovery window. |
 | `instances.probe_failure_threshold` | `3` | Consecutive health-probe failures before a non-forwarding tunnel is torn down. Below 1 falls back to the default. |
@@ -241,11 +243,11 @@ Defaults live in `kiro_crew.instances.constants` and are referenced from the
 kirocrew config set instances.warm_set_cap 3
 kirocrew config set instances.ssh_compression false
 kirocrew config set instances.connect_timeout_secs 45
+kirocrew config set instances.mint_timeout_secs 60
 ```
 
 Constants that are **not** user-configurable: the probe interval (30s), the token
-refresh fraction (0.8), the stored-token probe timeout (2s), and the mint
-timeout (30s).
+refresh fraction (0.8), and the stored-token probe timeout (2s).
 
 ### 5.2 `instances.ssh_compression`
 

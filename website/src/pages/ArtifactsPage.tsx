@@ -1,4 +1,4 @@
-import { safeSetItem } from '../utils/safeStorage'
+import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
@@ -13,6 +13,7 @@ import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input
 import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { useIsMobile } from '../hooks/useIsMobile'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from '../components/MarkdownRenderer'
@@ -94,6 +95,22 @@ function isoToTs(iso: string): number {
 // star and Actions columns are controls, not data, and stay unsortable.
 type SortKey = 'name' | 'slug' | 'kind' | 'source' | 'version' | 'tags' | 'updated'
 type SortState = { key: SortKey; dir: 'asc' | 'desc' } | null
+
+const ARTIFACT_SORT_STORAGE_KEY = 'mc-artifacts-sort'
+const SORT_KEYS = new Set<SortKey>(['name', 'slug', 'kind', 'source', 'version', 'tags', 'updated'])
+
+function readPersistedSort(): SortState {
+  try {
+    const value: unknown = JSON.parse(safeGetItem(ARTIFACT_SORT_STORAGE_KEY) ?? 'null')
+    if (!value || typeof value !== 'object') return null
+    const { key, dir } = value as { key?: unknown; dir?: unknown }
+    return typeof key === 'string' && SORT_KEYS.has(key as SortKey) && (dir === 'asc' || dir === 'desc')
+      ? { key: key as SortKey, dir }
+      : null
+  } catch {
+    return null
+  }
+}
 
 /** Type-aware comparator: numeric for version, chronological for updated,
  * locale-collated natural string for the rest (compareText names the active
@@ -1502,6 +1519,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // a click.
   const cloudDeployEnabled = useCloudDeploymentEnabled()
   const [filter, setFilter] = useState('')
+  const isMobile = useIsMobile()
   const [tagFilter, setTagFilter] = useState('')
   const [kindFilter, setKindFilter] = useState<string>('')
   // Default to "All" artifacts, but remember the last visit's choice: if the
@@ -1512,17 +1530,18 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   const [view, setView] = useState<'grid' | 'table'>(
     () => (localStorage.getItem('mc-artifacts-view') === 'table' ? 'table' : 'grid'),
   )
-  // Table column sort — session-local; null renders the server's order.
-  const [sort, setSort] = useState<SortState>(null)
+  // Table column sort persists beside the view choice; null renders the
+  // server's order, and stale storage safely falls back to that default.
+  const [sort, setSort] = useState<SortState>(readPersistedSort)
   const handleSort = useCallback((key: SortKey) => {
-    setSort((prev) =>
-      prev?.key !== key
-        ? { key, dir: 'asc' }
-        : prev.dir === 'asc'
-          ? { key, dir: 'desc' }
-          : null,
-    )
-  }, [])
+    const next: SortState = sort?.key !== key
+      ? { key, dir: 'asc' }
+      : sort.dir === 'asc'
+        ? { key, dir: 'desc' }
+        : null
+    setSort(next)
+    safeSetItem(ARTIFACT_SORT_STORAGE_KEY, JSON.stringify(next))
+  }, [sort])
 
   // ── Folder browse scope ──────────────────────────────────────
   // The open folder rides the URL (?folder=<id>) so gallery navigation is
@@ -2026,7 +2045,12 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           </div>
         )}
 
-        <div className="flex items-center justify-between gap-3 mb-3">
+        {/* `flex-wrap` moves the ACTION GROUP to its own line when the title
+          * cannot share one with it — it does not let the button row itself
+          * wrap, which is what would cost the row its ranking. Without it the
+          * title is the flex item that gives, and at 320px it is squeezed to a
+          * few pixels while the view switcher still hangs off the right edge. */}
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
           <h3 className="text-sm font-semibold text-text-strong">{i18nT('pages.artifactsPage.your_artifacts')}</h3>
           <div className="flex items-center gap-2">
             {/* Split button: creating a blank document is the common verb and
@@ -2044,7 +2068,12 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Btn
-                    aria-label={i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
+                    // On a phone this menu also holds the folder action, so an
+                    // add-only name would under-promise its contents — and the
+                    // name is all a screen reader gets from a chevron.
+                    aria-label={isMobile
+                      ? i18nT('pages.artifactsPage.more_actions')
+                      : i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
                     disabled={addArtifactMut.isPending}
                     className="rounded-l-none border-l-0 px-1"
                   >
@@ -2055,6 +2084,20 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                   <DropdownMenuItem onSelect={handleAddArtifact}>
                     <FileText size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.import_from_a_file')}
                   </DropdownMenuItem>
+                  {/* On a phone this menu is also where the folder action lives:
+                    * three peer controls do not fit a 320px line in the wide
+                    * locales (fr/it/bn run ~40% longer than en), and clipping
+                    * one off the edge is the only worse outcome than moving it
+                    * one tap away. Creating is the row's verb, so creating is
+                    * what keeps the visible slot. */}
+                  {isMobile && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={handleNewFolder}>
+                        <FolderPlus size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.new_folder')}
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -2066,9 +2109,11 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               className="hidden"
               onChange={handleAddArtifactFile}
             />
-            <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
-              <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
-            </Btn>
+            {!isMobile && (
+              <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
+                <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
+              </Btn>
+            )}
             <SegmentedControl
               segments={[
                 { key: 'grid', label: i18nT('pages.artifactsPage.gallery'), icon: <LayoutDashboard size={13} />, tooltip: i18nT('pages.artifactsPage.masonry_preview_gallery') },
@@ -2077,6 +2122,11 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               value={view}
               onChange={(v) => { setView(v); safeSetItem('mc-artifacts-view', v) }}
               layoutId="artifact-view"
+              // This control sits in a content-hugging group, so its own
+              // measurement always reads "plenty of room". Even on its own line
+              // the two labelled segments do not fit beside the create actions
+              // at 320px, and they are the widest thing in the row.
+              compact={isMobile}
             />
           </div>
         </div>

@@ -2686,6 +2686,33 @@ class TestSecurityBoundClamping:
             cfg = _load_from_dict({"session": {"pool_size": 1000}})
         assert cfg.session.pool_size == POOL_SIZE_MAX == 10
 
+    def test_session_start_timeout_default(self) -> None:
+        """Omitted from config.json, the budget is the built-in 90s default."""
+        cfg = _load_from_dict({})
+        assert cfg.agent.session_start_timeout_secs == 90
+
+    def test_session_start_timeout_custom_in_range(self) -> None:
+        """An in-range value from disk is preserved verbatim."""
+        cfg = _load_from_dict({"agent": {"session_start_timeout_secs": 240}})
+        assert cfg.agent.session_start_timeout_secs == 240
+
+    def test_session_start_timeout_floored_to_min(self) -> None:
+        """A value below the floor is clamped UP: a session-start budget under
+        the backend's 30s OAuth authorization wait recreates the race the
+        dedicated budget exists to prevent (issue #2946)."""
+        from kiro_crew.config.loader import SESSION_START_TIMEOUT_MIN
+
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            cfg = _load_from_dict({"agent": {"session_start_timeout_secs": 10}})
+        assert cfg.agent.session_start_timeout_secs == SESSION_START_TIMEOUT_MIN == 90
+
+    def test_session_start_timeout_clamped_to_max(self) -> None:
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            cfg = _load_from_dict({"agent": {"session_start_timeout_secs": 99999}})
+        from kiro_crew.config.loader import SESSION_START_TIMEOUT_MAX
+
+        assert cfg.agent.session_start_timeout_secs == SESSION_START_TIMEOUT_MAX == 900
+
     def test_full_pentest_reproduction_clamped(self) -> None:
         """The exact tester payload is clamped, and to_dict() (what the GET API
         serializes) reports the clamped values, not the inflated ones."""
@@ -3331,6 +3358,100 @@ class TestOrchestratorWatchdogThemeAreParsed:
         )
         assert cfg.watchdog.tool_stall_hard_cap_secs == 61.0
         assert cfg.watchdog.check_after_secs == 5.0
+
+    def test_per_agent_watchdog_overrides_are_parsed(self) -> None:
+        """agents.*.watchdog_tool_stall_* overrides survive load(); read by
+        acp/session_handle._load_watchdog_settings for sessions on that agent."""
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "pr-reviewer": {
+                        "kiro_agent": "pr-reviewer-kiro",
+                        "watchdog_tool_stall_suspect_secs": 900.0,
+                        "watchdog_tool_stall_hard_cap_secs": 1800.0,
+                    }
+                }
+            }
+        )
+        assert cfg.agents["pr-reviewer"].watchdog_tool_stall_suspect_secs == 900.0
+        assert cfg.agents["pr-reviewer"].watchdog_tool_stall_hard_cap_secs == 1800.0
+
+    def test_per_agent_watchdog_overrides_default_to_inherit(self) -> None:
+        """An agent entry without overrides parses to 0 (inherit the global)."""
+        cfg = _load_from_dict({"agents": {"builder": {"kiro_agent": "kirocrew"}}})
+        assert cfg.agents["builder"].watchdog_tool_stall_suspect_secs == 0.0
+        assert cfg.agents["builder"].watchdog_tool_stall_hard_cap_secs == 0.0
+
+    def test_per_agent_watchdog_override_junk_and_negative_collapse_to_inherit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config.json is hand-editable: junk collapses to 0 (inherit) and a
+        negative value is clamped to 0 — never an instant-cancel window, never
+        a crashed load. jsonschema is disabled so the raw values reach the
+        _safe_float guards (with it enabled, validation strips them first)."""
+        import kiro_crew.config.validation as validation
+
+        monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "a": {
+                        "kiro_agent": "kirocrew",
+                        "watchdog_tool_stall_suspect_secs": "junk",
+                        "watchdog_tool_stall_hard_cap_secs": -5,
+                    }
+                }
+            }
+        )
+        assert cfg.agents["a"].watchdog_tool_stall_suspect_secs == 0.0
+        assert cfg.agents["a"].watchdog_tool_stall_hard_cap_secs == 0.0
+
+    def test_per_agent_watchdog_overrides_round_trip(self) -> None:
+        """to_dict() (what save() writes) carries the overrides, so a save
+        from any routine path does not silently drop a hand-written override."""
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "pr-reviewer": {
+                        "kiro_agent": "pr-reviewer-kiro",
+                        "watchdog_tool_stall_suspect_secs": 900.0,
+                    }
+                }
+            }
+        )
+        td = cfg.to_dict()
+        assert td["agents"]["pr-reviewer"]["watchdog_tool_stall_suspect_secs"] == 900.0
+
+    def test_factory_resolves_canonical_crew_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The provider factory resolves crew_agent ONCE at provider-creation:
+        an explicit kwarg wins verbatim (the dashboard's resolved identity,
+        including the authoritative ""), and absent that, a crew-name-passing
+        surface (Slack/cron — see _resolve_model_for_agent's surface
+        convention) is covered by crew-namespace membership; a non-crew name
+        (a kiro template) yields "" so no override can attach to it."""
+        import kiro_crew.providers.acp as acp_mod
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        cfg = _load_from_dict(
+            {"agents": {"pr-reviewer": {"kiro_agent": "pr-reviewer-kiro"}}}
+        )
+        factory = cfg.create_provider_factory()
+
+        factory("k1", agent="pr-reviewer-kiro", crew_agent="pr-reviewer")
+        factory("k2", agent="pr-reviewer")  # crew-name surface, no kwarg
+        factory("k3", agent="pr-reviewer-kiro")  # kiro template, no kwarg
+        factory("k4", agent="pr-reviewer-kiro", crew_agent="")  # explicit no-crew
+
+        assert [c["crew_agent"] for c in captured] == ["pr-reviewer", "pr-reviewer", "", ""]
 
     def test_dashboard_theme_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
@@ -4725,3 +4846,99 @@ class TestUpdateConfigLocked:
 
         assert result == {"repaired": True}
         assert json.loads(cfg.read_text()) == {"repaired": True}
+
+
+class TestMigrationBackupContainment:
+    """``load()`` must not create files beside a config path it does not own.
+
+    The one-time agents migration copies the pre-migration config aside. The
+    copy landed next to whatever ``config_path()`` resolved to, so every caller
+    that redirects the loader at its own temp file (this module's own helpers do
+    exactly that) silently accumulated a ``<tmpname>.json.bak`` orphan it never
+    cleaned up -- 72k of them on one dev host, against a tmpfs inode cap.
+    """
+
+    # A config with neither "agents" nor "default_agent" is what makes
+    # load() take the migration write-back branch that writes the backup.
+    _LEGACY = {"telegram": {"allow_forum": True}}
+
+    def _load_with(self, home: Path, cfg_file: Path) -> KiroCrewConfig:
+        with unittest.mock.patch(
+            "kiro_crew.config.loader.config_dir", return_value=home
+        ), unittest.mock.patch(
+            "kiro_crew.config.loader.config_path", return_value=cfg_file
+        ):
+            return KiroCrewConfig.load()
+
+    def test_no_sibling_left_beside_a_redirected_config(self, tmp_path: Path) -> None:
+        """A caller-owned directory gains nothing from a migrating load()."""
+        caller_dir = tmp_path / "caller-owned"
+        caller_dir.mkdir()
+        cfg_file = caller_dir / "tmpdeadbeef.json"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+
+        before = {p.name for p in caller_dir.iterdir()}
+        cfg = self._load_with(home, cfg_file)
+        after = {p.name for p in caller_dir.iterdir()}
+
+        # Guard the guard: assert the migration branch actually ran, otherwise
+        # this test would pass for the wrong reason if that branch stops firing.
+        assert cfg.agents, "migration write-back did not run, test is vacuous"
+        assert after == before, (
+            "load() left orphans beside the caller's config: %s" % sorted(after - before)
+        )
+
+    def test_real_config_in_the_data_home_is_still_backed_up(self, tmp_path: Path) -> None:
+        """The production path keeps its backup exactly where it always was."""
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "config.json"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+
+        cfg = self._load_with(home, cfg_file)
+
+        assert cfg.agents, "migration write-back did not run, test is vacuous"
+        assert (home / "config.json.bak").exists()
+
+    def test_backup_appends_the_suffix_instead_of_replacing_it(self, tmp_path: Path) -> None:
+        """A config whose name is not ``*.json`` is backed up, not renamed.
+
+        ``Path.with_suffix(".json.bak")`` REPLACES the final suffix, so
+        ``settings.conf`` would have produced ``settings.json.bak``.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "settings.conf"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+
+        self._load_with(home, cfg_file)
+
+        assert (home / "settings.conf.bak").exists()
+        assert not (home / "settings.json.bak").exists()
+
+    def test_failed_backup_still_aborts_the_migration_save(self, tmp_path: Path) -> None:
+        """A config we could not copy aside is not rewritten either.
+
+        The caller's ``except`` is what skips ``cfg.save()``, so containing the
+        LOCATION decision must not also swallow a failing copy: otherwise the
+        only pre-migration copy is overwritten with no backup anywhere.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "config.json"
+        original = json.dumps(self._LEGACY)
+        cfg_file.write_text(original, encoding="utf-8")
+
+        with unittest.mock.patch(
+            "kiro_crew.config.loader.shutil.copy2",
+            side_effect=OSError("backup target is read-only"),
+        ):
+            cfg = self._load_with(home, cfg_file)
+
+        # load() still returns a usable config -- the write-back is best-effort.
+        assert cfg.agents
+        # But the on-disk config is untouched, so the migration retries next load.
+        assert json.loads(cfg_file.read_text(encoding="utf-8")) == json.loads(original)
+        assert not (home / "config.json.bak").exists()

@@ -36,6 +36,39 @@ kiro-cli login
 `kirocrew doctor` reports the binary and the login state on separate lines, so
 check both.
 
+### Dashboard asks for sign-in but `kiro-cli` is already authenticated
+
+Typical on a headless host that authenticates `kiro-cli` with an API key rather
+than `kiro-cli login`. `kirocrew doctor` prints a signed-in state while the
+dashboard's setup gate still asks for a device login, and `/api/models` plus
+usage polling answer 503.
+
+The readiness probe forwards `KIRO_API_KEY` to `kiro-cli whoami`, but only from
+the **gateway's own** environment. Exporting it in a shell after the gateway is
+running does not reach it, and neither launchd nor systemd passes the installing
+shell's environment to the service. Put it where the gateway reads it at boot:
+
+```bash
+P=~/.kiro/crew/.env
+touch "$P" && chmod 600 "$P"
+printf '%s\n' "KIRO_API_KEY=$KIRO_API_KEY" >> "$P"
+kirocrew service restart   # or restart however you run the gateway
+```
+
+The `chmod` comes first on purpose: under a standard `022` umask a file created
+by the append alone is `0644`, and the gateway only forces `0600` the next time
+it reads it — so the key would be readable by other local users until then. The
+quoting matters for the same reason if your crew home contains a space. Every
+key in `~/.kiro/crew/.env` is loaded into the gateway's environment at startup;
+a bare `KIRO_API_KEY=` with no value does not count, because falsy values are
+skipped. Do not put the key in the systemd unit or in
+`/etc/kirocrew/kirocrew.env` — both are readable by any local user.
+`kirocrew service install` warns when it sees a key in your shell that the
+service will not inherit.
+
+Releases before 0.3.0 filtered `KIRO_API_KEY` out of the probe entirely, so no
+placement works on those; use `kiro-cli login` or upgrade.
+
 ### Agent config missing or stale
 
 ```bash
@@ -81,6 +114,29 @@ Your administrator also has to add `kirocrew-core`, `kirocrew-cron` and
 prints an `MCP Governance (enterprise)` section on Identity Center hosts with the
 current state. Full walkthrough, including the registry JSON your administrator
 needs: `docs/guides/enterprise-mcp-governance.md`.
+
+### A remote MCP server shows "Not verified"
+
+Remote MCP servers that authenticate with OAuth — Atlassian, for example — can
+show **Not verified** under Connections → MCP Servers while working perfectly in
+chat. Nothing is wrong with the server. The badge describes what the dashboard
+can see, not what the server can do.
+
+The Kiro CLI runs the OAuth flow and keeps the token in its own credential store;
+Kiro Crew never holds it. The dashboard's status probe therefore connects without a
+token, and the server answers `401`. That single answer covers two situations the
+dashboard cannot tell apart: a server nobody has authorized, and a server already
+authorized through the Kiro CLI. So it reports only what it knows.
+
+To find out which one you have:
+
+- If an agent can call that server's tools in chat, it is authorized and working.
+- If tool calls fail, use the server in chat once. The Kiro CLI starts the OAuth
+  flow on the `401` and Kiro Crew shows the consent link as a banner; approve it
+  there and the calls succeed.
+
+A server that is genuinely broken reads **Error** with the reason next to it, not
+**Not verified**.
 
 ### Dashboard not loading
 

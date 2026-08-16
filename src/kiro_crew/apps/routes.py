@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import yarl
 from aiohttp import web
 
 from kiro_crew.apps.backend import (
@@ -79,6 +80,7 @@ from kiro_crew.apps.registry import (
     install_from_registry,
     is_registry_source,
     known_registry_repos,
+    list_catalog_apps,
     list_registry,
     registry_name_from_source,
 )
@@ -89,6 +91,7 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, config_path
 from kiro_crew.cron import CronStoreBusy
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_reason
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 from kiro_crew.sel import sel
 
@@ -309,50 +312,107 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
     from the former deploy_web app), each with a ``configured`` flag. Built-in
     providers (the internal registry) are registered frontend-side and are not returned here.
 
-    The core deploy row is omitted when the platform's ``external_access`` policy
-    withholds cloud deployment. Because this list is what the Publish panel
-    renders, that single omission is also what makes the panel correct — a
-    deployment that registers only an internal destination shows only that one,
-    with no frontend change.
+    The core deploy row is omitted when EITHER control closes the public-web
+    path, and the two are independent:
+
+    * the platform's ``external_access`` policy withholds cloud deployment; or
+    * the publish-governance chokepoint denies its destination id (governance
+      ceiling ∩ ``publish.allowed_destinations``), so an operator who has closed
+      the path never sees the button.
+
+    Because this list is what the Publish panel renders, that single omission is
+    also what makes the panel correct — a deployment that registers only an
+    internal destination shows only that one, with no frontend change. Omission is
+    presentation only: ``/api/deploy/deploy`` consults the same chokepoint itself,
+    because a filtered list is not a control.
+
+    On EITHER closed path, rows carrying ``DEPLOY_WEB_PROVIDER_ID`` are dropped
+    from the app-declared list too — the platform withhold and the governance
+    denial share one closed path for exactly this reason.
+    ``collect_publish_providers`` validates
+    a declared *endpoint* (it must sit under the app's own namespace) but not the
+    declared *id*, so an enabled app may publish a row under the core
+    destination's id — and ``PublishHub`` routes a click at
+    ``selected.app.endpoint``, which this chokepoint does not cover. Serving that
+    row after the operator closed the destination would hand back the path they
+    closed.
+
+    On the PERMITTED path such a row is left alone. An app shadowing this id is
+    pre-existing, reachable behaviour that ``test_publish_providers`` documents
+    (its fixture app declares this very id and the test asserts the APP's endpoint
+    is the one resolved for it, first-match order). Whether the core provider
+    should own the id outright is a behaviour change worth making on its own
+    merits, not a side effect of closing a denial hole.
     """
     # Both the apps-dir walk (list_apps) and the per-provider configured-state
     # probe (_provider_is_configured reads each app's persisted config file)
     # touch disk, so the whole collection runs off the loop — same shape as the
     # deploy registry read below.
     providers = await asyncio.to_thread(lambda: collect_publish_providers(list_apps()))
-    # Core deploy provider — present unless the platform withholds cloud
-    # deployment, in which case advertising it would offer a destination whose
-    # every mutating route refuses. Omitting the ROW is what makes the Publish
-    # panel correct without a frontend change: the panel is data-driven, so a
-    # deployment that only registers an internal destination shows only that one.
+    # Two independent controls can close this destination, and BOTH must land on
+    # the same closed path — an early return for one of them is how a closed
+    # destination stays reachable (an app-declared row carrying the core id
+    # publishes at its OWN endpoint, which this chokepoint does not cover).
     # circular import: apps.routes is imported by the dashboard handler layer, so
     # reaching back into it must be a function-local downward import.
     from kiro_crew.dashboard.handlers._shared import admits_cloud_deployment
 
-    # In a worker thread with the registry read below: the admission path can
-    # initialize the SEL audit log, which shells out on a fresh Windows gateway.
-    if await asyncio.to_thread(admits_cloud_deployment, "aws"):
-        try:
-            from kiro_crew.deploy import profiles as _deploy_profiles
+    # Gate 1 — platform: advertising a destination whose every mutating route
+    # refuses is worse than not advertising it. In a worker thread with the
+    # registry read below: the admission path can initialize the SEL audit log,
+    # which shells out on a fresh Windows gateway.
+    admits_cloud = await asyncio.to_thread(admits_cloud_deployment, "aws")
 
-            # Align with deploy/handlers.py: registry reads go through to_thread.
-            reg = await asyncio.to_thread(_deploy_profiles.load_registry)
-            configured = bool(reg["profiles"])
-        except Exception:
-            configured = False
-        providers.append(
-            {
-                "id": "deploy-web-aws",
-                "label": "Publish to public web (your AWS)",
-                "icon": "Globe",
-                "endpoint": "/api/deploy/deploy",
-                "kinds": ["widget", "html", "markdown"],
-                "setupRoute": "/artifacts/deploy",
-                "app": "",
-                "origin": "core",
-                "configured": configured,
-            }
+    # Gate 2 — operator: governance ceiling ∩ publish.allowed_destinations. Only
+    # consulted when gate 1 admits, because the row is dropped either way and this
+    # one reads policy + config off disk. A PlatformCompositionError propagates —
+    # fail-closed CPP, same as every other publish surface.
+    deploy_denied = None
+    if admits_cloud:
+        deploy_denied = await asyncio.to_thread(
+            lambda: publish_denied_reason(request, DEPLOY_WEB_PROVIDER_ID)
         )
+
+    if not admits_cloud or deploy_denied:
+        reason = deploy_denied or "the platform withholds cloud deployment"
+        logger.info(
+            "publish provider %r omitted from the registry: %s",
+            DEPLOY_WEB_PROVIDER_ID,
+            reason,
+        )
+        for squatter in [p for p in providers if p.get("id") == DEPLOY_WEB_PROVIDER_ID]:
+            logger.warning(
+                "app %r declares the closed publish destination id %r — dropping its "
+                "row too, or the operator's shutdown would be undone by an install",
+                squatter.get("app", "?"),
+                DEPLOY_WEB_PROVIDER_ID,
+            )
+        return web.json_response({
+            "providers": [
+                p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID
+            ],
+        })
+    try:
+        from kiro_crew.deploy import profiles as _deploy_profiles
+
+        # Align with deploy/handlers.py: registry reads go through to_thread.
+        reg = await asyncio.to_thread(_deploy_profiles.load_registry)
+        configured = bool(reg["profiles"])
+    except Exception:
+        configured = False
+    providers.append(
+        {
+            "id": DEPLOY_WEB_PROVIDER_ID,
+            "label": "Publish to public web (your AWS)",
+            "icon": "Globe",
+            "endpoint": "/api/deploy/deploy",
+            "kinds": ["widget", "html", "markdown"],
+            "setupRoute": "/artifacts/deploy",
+            "app": "",
+            "origin": "core",
+            "configured": configured,
+        }
+    )
     return web.json_response({"providers": providers})
 
 
@@ -1453,7 +1513,12 @@ async def handle_open_app(request: web.Request) -> web.Response:
 
 async def handle_registry(request: web.Request) -> web.Response:
     """GET /api/apps/registry — list all apps available for installation."""
-    apps = await list_registry()
+    # The published catalog is the storefront's source of truth when it is
+    # reachable: its rows replace the seed + per-app manifest fetch. Offline the
+    # catalog is empty and the seed listing answers instead.
+    apps = await list_catalog_apps()
+    if not apps:
+        apps = await list_registry()
     # Published rail order and layout ride along on the response the store already
     # makes, rather than endpoints the page would have to wait on separately. Off
     # the event loop: the first call after a cache expiry does network I/O. Both
@@ -2362,13 +2427,15 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
             status=502,
         )
 
-    # Build target URL — preserve the `/api/` prefix from the route so the
-    # backend sees its own `/api/...` routes without needing any path-
-    # rewriting middleware.  The route captures `path` after `/api/`, so we
-    # explicitly re-add `/api/` here.
-    target = f"{backend_url}/api/{path}"
-    if request.query_string:
-        target += f"?{request.query_string}"
+    # Build target URL — preserve the exact wire encoding of path and query
+    # params so the gateway's HMAC signature matches what the backend sees on
+    # self.path. `request.query_string` is DECODED by aiohttp, so signing it causes
+    # HMAC verification to fail closed (401) whenever query parameters contain
+    # percent-encodable characters like spaces, non-ASCII, or '+'.
+    raw_qs = request.rel_url.raw_query_string
+    target_path = f"/api/{path}" + (f"?{raw_qs}" if raw_qs else "")
+    target_url = yarl.URL(f"{backend_url}{target_path}", encoded=True)
+    wire_target = target_url.raw_path_qs
 
     # Forward headers (strip hop-by-hop, inject proxy auth)
     headers: dict[str, str] = {}
@@ -2395,10 +2462,7 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
             )
         ts = str(int(time.time()))
         body_hash = hashlib.sha256(body or b"").hexdigest()
-        msg = f"{ts}:{request.method}:/api/{path}"
-        if request.query_string:
-            msg += f"?{request.query_string}"
-        msg += f":{body_hash}"
+        msg = f"{ts}:{request.method}:{wire_target}:{body_hash}"
         sig = _hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
         headers["X-KiroCrew-Proxy"] = f"{ts}:{sig}"
     except OSError as exc:
@@ -2417,7 +2481,7 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
         try:
             async with session.request(
                 method=request.method,
-                url=target,
+                url=target_url,
                 headers=headers,
                 data=body,
                 timeout=timeout,

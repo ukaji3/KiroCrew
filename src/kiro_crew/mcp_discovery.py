@@ -20,8 +20,9 @@ import posixpath
 import re
 import shutil
 import signal
-import subprocess
+import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,13 @@ import aiohttp
 
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import data_home, kiro_agents_dir
-from kiro_crew.env import augmented_path
+from kiro_crew.env import (
+    denied_spec_env_keys,
+    emit_env,
+    sanitize_spec_env,
+    spec_env_path,
+    spec_path_key,
+)
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.mcp_provenance import ABSENT, resolve_write
 from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_server_alias
@@ -340,27 +347,36 @@ class _ProbeResult:
     # MCP 2025-03-26 or later can send these, so an empty list is "not
     # available", never "declared nothing".
     tool_annotations: list[dict[str, Any]] = field(default_factory=list)
+    # Wall-clock companion to the monotonic ``probed_at``: monotonic drives the
+    # TTL (immune to clock changes), wall-clock is what the API reports so the
+    # UI can render "as of <time>". Two clocks, one write, no drift.
+    probed_at_wall: float = 0.0
+    probe_mode: str = "handshake"
 
 
 # Module-level probe cache: server name → result
 _probe_cache: dict[str, _ProbeResult] = {}
 
 
-def _get_cached(name: str) -> tuple[str, list[str], str]:
-    """Return (status, tools, error) from cache.
+def _get_cached(name: str) -> tuple[str, list[str], str, float, str]:
+    """Return (status, tools, error, probed_at_wall, probe_mode) from cache.
 
     If within TTL: returns original status + tools.
     If expired: returns "outdated" + tools (tools always preserved).
-    If not cached: returns ("unknown", [], "").
+    If not cached: returns ("unknown", [], "", 0.0, "handshake").
+
+    The wall-clock timestamp and probe mode are returned even for an expired
+    entry — "outdated" is exactly the state where WHEN it was last true is the
+    most useful thing the UI can say.
     """
     cached = _probe_cache.get(name)
     if cached is None:
-        return "unknown", [], ""
+        return "unknown", [], "", 0.0, "handshake"
     age = time.monotonic() - cached.probed_at
     if age <= _PROBE_TTL_SECS:
-        return cached.status, cached.tools, cached.error
+        return cached.status, cached.tools, cached.error, cached.probed_at_wall, cached.probe_mode
     # Expired — mark outdated but preserve tools
-    return "outdated", cached.tools, ""
+    return "outdated", cached.tools, "", cached.probed_at_wall, cached.probe_mode
 
 
 def probe_metadata(name: str) -> _ProbeResult | None:
@@ -383,6 +399,7 @@ def _cache_probe(server: McpServerInfo) -> None:
     would mask a rotated credential's NEW value while the cached error still
     carries the OLD one.
     """
+    server.probed_at = time.time()
     _probe_cache[server.name] = _ProbeResult(
         status=server.status,
         tools=list(server.tools),
@@ -394,6 +411,8 @@ def _cache_probe(server: McpServerInfo) -> None:
         protocol_version=server.protocol_version,
         server_info=dict(server.server_info),
         tool_annotations=[dict(a) for a in server.tool_annotations],
+        probed_at_wall=server.probed_at,
+        probe_mode=server.probe_mode,
     )
 
 
@@ -544,7 +563,7 @@ class McpServerInfo:
     # a client — it only refuses to lose these fields while syncing.
     scopes: list[str] = field(default_factory=list)
     client_id: str = ""
-    status: str = "unknown"  # unknown | ok | error | probing | outdated | disabled
+    status: str = "unknown"  # unknown | ok | error | probing | outdated | disabled | needs_auth
     tools: list[str] = field(default_factory=list)
     error: str = ""
     source: str = "agent"  # agent | mcp.json | discovered  (legacy field, prefer presence)
@@ -574,6 +593,18 @@ class McpServerInfo:
     protocol_version: str = ""
     server_info: dict[str, Any] = field(default_factory=dict)
     tool_annotations: list[dict[str, Any]] = field(default_factory=list)
+    # How the current ``status``/``tools`` were established. "handshake" is a
+    # real spawn + initialize + tools/list round trip; "declared" is the
+    # in-process fallback for a managed server whose probe could not spawn —
+    # the tool list is correct (same declaration the server serves) but nothing
+    # verified the server can start. Surfaced so the UI can tell the two
+    # apart instead of rendering both as an identical green badge.
+    probe_mode: str = "handshake"
+    # Wall-clock time (``time.time()``) of the probe that produced ``status``,
+    # or 0.0 when no probe has run. Carried through the caches and into the
+    # API payload so a badge can say WHEN it was true — the caches legitimately
+    # serve results up to their TTL, and an undated "Online" reads as "now".
+    probed_at: float = 0.0
 
     @property
     def is_remote(self) -> bool:
@@ -590,6 +621,8 @@ class McpServerInfo:
             "error": redact_mcp_error(self.error, self.headers),
             "source": self.source,
             "presence": dict(self.presence),
+            "probeMode": self.probe_mode,
+            "probedAt": self.probed_at,
         }
         if self.url:
             d["url"] = self.url
@@ -827,6 +860,7 @@ _MANAGED_SERVER_SUBCOMMANDS = {
     "kirocrew-core": "mcp-core",
     "kirocrew-cron": "mcp-cron",
     "kirocrew-computer": "mcp-computer",
+    "kirocrew-dashboard": "mcp-dashboard",
 }
 _MANAGED_SERVER_NAMES = set(_MANAGED_SERVER_SUBCOMMANDS)
 
@@ -837,6 +871,7 @@ _MANAGED_SERVER_TOOL_MODULES = {
     "kirocrew-core": "kiro_crew.mcp_core",
     "kirocrew-cron": "kiro_crew.mcp_cron",
     "kirocrew-computer": "kiro_crew.mcp_computer",
+    "kirocrew-dashboard": "kiro_crew.mcp_dashboard",
 }
 
 
@@ -1133,10 +1168,12 @@ def list_servers() -> list[McpServerInfo]:
 
     # 4. Merge cached probe results
     for s in servers.values():
-        status, tools, error = _get_cached(s.name)
+        status, tools, error, probed_at, probe_mode = _get_cached(s.name)
         s.status = status
         s.tools = tools
         s.error = error
+        s.probed_at = probed_at
+        s.probe_mode = probe_mode
 
     return list(servers.values())
 
@@ -1165,9 +1202,32 @@ async def _read_jsonrpc_response(resp: aiohttp.ClientResponse) -> dict:
     return await resp.json()
 
 
+def _needs_authorization(
+    status_code: int, resp_headers: Mapping[str, str], sent_headers: Mapping[str, str]
+) -> bool:
+    """True when a remote probe response means "authenticate", not "broken".
+
+    The runtime completes OAuth and holds the token; the probe does not. So a
+    tokenless probe of an OAuth server gets 401 (or 403 with a
+    ``WWW-Authenticate`` challenge). Treat that as ``needs_auth``.
+
+    A static ``Authorization`` header in the config is a different case: the
+    caller supplied a credential and it was rejected, which is a real error.
+    """
+    if any(k.lower() == "authorization" for k in sent_headers):
+        return False
+    if status_code == 401:
+        return True
+    if status_code == 403 and any(k.lower() == "www-authenticate" for k in resp_headers):
+        return True
+    return False
+
+
 async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
     """Probe a remote Streamable HTTP MCP server via POST."""
     server.status = "probing"
+    server.probed_at = time.time()
+    server.probe_mode = "handshake"
     try:
         init_body = {
             "jsonrpc": "2.0",
@@ -1189,10 +1249,25 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(server.url, json=init_body, headers=hdrs) as resp:
                 if resp.status != 200:
-                    server.status = "error"
-                    server.error = f"HTTP {resp.status}"
+                    if _needs_authorization(resp.status, resp.headers, server.headers):
+                        # A remote OAuth server answers a tokenless probe with
+                        # 401 (or 403 + WWW-Authenticate). That is the expected
+                        # reply, not a fault: the kiro-cli runtime holds the
+                        # OAuth token and calls the server fine. The probe never
+                        # sees that token (Kiro Crew keeps no credentials), so
+                        # report "needs_auth" instead of a misleading error.
+                        server.status = "needs_auth"
+                        server.error = ""
+                    else:
+                        server.status = "error"
+                        server.error = f"HTTP {resp.status}"
                     _cache_probe(server)
                     return server
+                # A stateful Streamable HTTP server issues a session id on
+                # initialize and requires it on every later request — without
+                # it, tools/list gets a 4xx/error and a HEALTHY server renders
+                # errored. Absent header = stateless server; nothing to carry.
+                mcp_session_id = resp.headers.get("Mcp-Session-Id", "")
                 data = await _read_jsonrpc_response(resp)
                 if data.get("error"):
                     server.status = "error"
@@ -1203,16 +1278,56 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
                     _cache_probe(server)
                     return server
 
+            if mcp_session_id:
+                hdrs = {**hdrs, "Mcp-Session-Id": mcp_session_id}
+            # The spec's lifecycle requires notifications/initialized between
+            # initialize and the first request; a conforming stateful server
+            # may reject tools/list without it. Notifications get 202/204 and
+            # no body — only a hard connection failure matters, and that
+            # surfaces on the tools/list call right after.
+            initialized_body = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+            try:
+                async with session.post(server.url, json=initialized_body, headers=hdrs):
+                    pass
+            except aiohttp.ClientError:
+                logger.debug(
+                    "MCP probe [%s]: initialized notification failed; proceeding to tools/list",
+                    server.name,
+                )
+
             list_body = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
             async with session.post(server.url, json=list_body, headers=hdrs) as resp:
-                if resp.status == 200:
-                    data = await _read_jsonrpc_response(resp)
-                    tools_data = data.get("result", {}).get("tools", [])
-                    server.tools = [
-                        name
-                        for t in tools_data
-                        if isinstance(t, dict) and (name := t.get("name", ""))
-                    ]
+                if resp.status != 200:
+                    # An initialize that succeeds and a tools/list that does
+                    # not is a server no session can get a tool out of — the
+                    # badge certifies "tools usable", so this is a failed probe.
+                    server.status = "error"
+                    server.error = f"tools/list: HTTP {resp.status}"
+                    _cache_probe(server)
+                    return server
+                data = await _read_jsonrpc_response(resp)
+                if data.get("error"):
+                    err = data["error"]
+                    server.status = "error"
+                    server.error = "tools/list: " + (
+                        err.get("message", "unknown error") if isinstance(err, dict) else str(err)
+                    )
+                    _cache_probe(server)
+                    return server
+                result = data.get("result")
+                tools_data = result.get("tools") if isinstance(result, dict) else None
+                if not isinstance(tools_data, list):
+                    # Same malformed-response rule as the stdio path: no tools
+                    # LIST is a failed probe, not an empty server.
+                    server.status = "error"
+                    server.error = "tools/list: malformed response (no tools list)"
+                    _cache_probe(server)
+                    return server
+                server.tools = [
+                    name
+                    for t in tools_data
+                    if isinstance(t, dict) and (name := t.get("name", ""))
+                ]
 
         server.status = "ok"
     except asyncio.TimeoutError:
@@ -1363,15 +1478,40 @@ async def probe_server(
         return server
 
     server.status = "probing"
+    # Stamped at probe START so the early error returns below (which skip the
+    # cache) still carry an honest "when": the probe DID run at this time.
+    # _cache_probe overwrites it with completion time on the paths it covers.
+    server.probed_at = time.time()
+    # Reset: the object may arrive carrying "declared" from a previous cached
+    # result (list_servers merges the cache in), and this pass IS a handshake
+    # unless the fallback below says otherwise.
+    server.probe_mode = "handshake"
     proc = None
     sandbox_cleanup: str | None = None
     try:
         env = dict(os.environ)
-        env["PATH"] = augmented_path(env.get("PATH", ""))
-        # Merge server-specific env additively
-        if "PATH" in server.env:
-            env["PATH"] = server.env["PATH"] + os.pathsep + env["PATH"]
-        env.update({k: v for k, v in server.env.items() if k != "PATH"})
+        # The same expression backs command resolution and the PATH emitted into
+        # the agent config (``agent.install_agent``) — sharing it is what keeps
+        # "probes healthy" and "works in a session" from disagreeing. The pooled
+        # backend path resolves a bare command separately
+        # (``mcp_gateway.rewriter``), against a spec value this has already
+        # expanded.
+        # Case-insensitive PATH key: a Windows-authored spec says "Path", and
+        # the emitted config normalizes under that same spelling — reading only
+        # "PATH" here would probe with a different path than the session gets.
+        _path_key = spec_path_key(server.env)
+        _declared_path = server.env.get(_path_key, "") if _path_key else ""
+        env["PATH"] = spec_env_path(_declared_path if isinstance(_declared_path, str) else "")
+        # The declared env is untrusted config text applied to the environment
+        # the SANDBOX LAUNCHER starts under, so loader/interpreter injection
+        # keys must not pass through — they would execute before confinement
+        # exists. See env.sanitize_spec_env; _note_denied_env explains a
+        # resulting failure to the dashboard reader.
+        env.update(
+            sanitize_spec_env(
+                (k, v) for k, v in server.env.items() if k != _path_key
+            )
+        )
 
         # Resolve command to absolute path using the merged env PATH
         resolved = shutil.which(server.command, path=env.get("PATH"))
@@ -1518,31 +1658,60 @@ async def probe_server(
         resp2 = await _read_stdio_jsonrpc_response(
             proc.stdout, _get_probe_timeout(), name=server.name
         )
-        if resp2 is not None:
-            result = resp2.get("result", {}) if isinstance(resp2, dict) else {}
-            tools_data = result.get("tools", []) if isinstance(result, dict) else []
-            server.tools = [
-                name for t in tools_data if isinstance(t, dict) and (name := t.get("name", ""))
-            ]
-            # ``annotations`` (MCP 2025-03-26+) is the only spec-native hint
-            # about whether a tool mutates anything. Collected as positive
-            # evidence only — a server on an older protocol version sends none,
-            # and that must never read as "this tool writes".
-            server.tool_annotations = [
-                ann
-                for t in tools_data
-                if isinstance(t, dict) and isinstance(ann := t.get("annotations"), dict)
-            ]
-        else:
+        if resp2 is None:
             # initialize succeeded but tools/list yielded no response (banner
-            # flood or EOF on this read). Report the server ok, but log so an
-            # empty tool list is distinguishable from a server that genuinely
-            # exposes no tools.
-            logger.debug(
-                "MCP probe [%s]: tools/list returned no response after a "
-                "successful initialize; reporting ok with unknown tools",
+            # flood or EOF on this read). "ok" here would certify a server no
+            # session can get a tool out of — the whole point of the badge is
+            # "tools usable", so a failed tools/list is a failed probe. Cached
+            # (matching _probe_remote's error paths) so the list overlay shows
+            # the same failure the direct probe reports, instead of serving a
+            # stale prior "ok" for up to the TTL.
+            server.status = "error"
+            server.error = "tools/list: no response after a successful initialize"
+            logger.warning(
+                "MCP probe failed [%s]: tools/list returned no response after "
+                "a successful initialize",
                 server.name,
             )
+            # Same synthetic-identity rule as the trailing cache write: a
+            # pre-flight's second-identity run is a diagnostic, not the
+            # canonical observation the dashboard renders.
+            if client_info is None:
+                _cache_probe(server)
+            return server
+        if isinstance(resp2, dict) and resp2.get("error"):
+            err2 = resp2["error"]
+            server.status = "error"
+            server.error = "tools/list: " + (
+                err2.get("message", "unknown error") if isinstance(err2, dict) else str(err2)
+            )
+            if client_info is None:
+                _cache_probe(server)
+            return server
+        result = resp2.get("result", {}) if isinstance(resp2, dict) else {}
+        tools_data = result.get("tools") if isinstance(result, dict) else None
+        if not isinstance(tools_data, list):
+            # A response without a tools LIST is malformed, not "no tools":
+            # rendering it as a green zero-tool server would certify a server
+            # whose one required answer didn't parse. A genuinely tool-less
+            # server sends an empty list, which passes.
+            server.status = "error"
+            server.error = "tools/list: malformed response (no tools list)"
+            if client_info is None:
+                _cache_probe(server)
+            return server
+        server.tools = [
+            name for t in tools_data if isinstance(t, dict) and (name := t.get("name", ""))
+        ]
+        # ``annotations`` (MCP 2025-03-26+) is the only spec-native hint
+        # about whether a tool mutates anything. Collected as positive
+        # evidence only — a server on an older protocol version sends none,
+        # and that must never read as "this tool writes".
+        server.tool_annotations = [
+            ann
+            for t in tools_data
+            if isinstance(t, dict) and isinstance(ann := t.get("annotations"), dict)
+        ]
 
         server.status = "ok"
 
@@ -1595,7 +1764,14 @@ async def probe_server(
             server.status = "ok"
             server.tools = managed_tools
             server.error = ""
+            # Not a handshake: nothing verified the server can START. The mode
+            # rides the cache into the API payload so the UI can distinguish a
+            # declared listing from a proven one instead of rendering both as
+            # the same green badge.
+            server.probe_mode = "declared"
             _warn_managed_in_process_once(server.name)
+            if client_info is None:
+                _cache_probe(server)
             return server
         #
         # The wrap is deliberately KEPT rather than skipped for Kiro Crew's own
@@ -1777,7 +1953,33 @@ async def probe_all() -> list[McpServerInfo]:
             out.append(servers[i])
         else:
             out.append(r)  # type: ignore[arg-type]
+    for s in out:
+        _note_denied_env(s)
     return out
+
+
+def _note_denied_env(server: McpServerInfo) -> None:
+    """Name the policy-dropped env keys on a FAILED probe.
+
+    The probe strips loader/interpreter injection keys before spawning, so a
+    server configured through one of them (a Python server using
+    ``env.PYTHONPATH`` is the realistic case) can fail here while working in a
+    session, where kiro-cli spawns it with no launcher of ours in the chain.
+    The sanitizer logs each drop, but the person reading a red badge is looking
+    at the dashboard, not the gateway log — without this the row reads as a
+    probe bug instead of a deliberate boundary. Only annotates errors: on a
+    success the drop changed nothing worth reporting.
+    """
+    if server.status != "error" or not server.error:
+        return
+    dropped = denied_spec_env_keys(server.env or {})
+    if not dropped:
+        return
+    server.error = (
+        f"{server.error} (probe dropped declared env "
+        f"{', '.join(sorted(dropped))}: these execute in the sandbox launcher "
+        f"before confinement, so the probe cannot honour them — a session still does)"
+    )
 
 
 def _commands_diverged(source_cmd: str, agent_cmd: str) -> bool:
@@ -1807,6 +2009,30 @@ def _commands_diverged(source_cmd: str, agent_cmd: str) -> bool:
         return False
     if _names_a_location(source_cmd) and _basenames_match(source_cmd, agent_cmd):
         return False
+    return True
+
+
+def _envs_agree(agent_env: dict, source_env: dict) -> bool:
+    """True when the agent config's ``env`` already carries *source_env*.
+
+    Every source key must be present in the agent entry, EXCEPT that ``PATH`` is
+    compared through :func:`kiro_crew.env.spec_env_path` — the agent config
+    stores the expanded effective PATH while mcp.json stores the fragment the
+    user authored, exactly as it stores a resolved absolute command against a
+    bare name (see :func:`_commands_diverged`). Comparing the raw strings would
+    read every already-synced server as diverged and re-sync it forever.
+
+    A superset is fine: keys the agent entry adds on its own (a managed pin) are
+    not the source's business.
+    """
+    for key, val in source_env.items():
+        current = agent_env.get(key)
+        if key == "PATH" and val:
+            if current == val or current == spec_env_path(val):
+                continue
+            return False
+        if current != val:
+            return False
     return True
 
 
@@ -1940,7 +2166,7 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
             existing_env = existing.get("env", {})
             if not isinstance(existing_env, dict):
                 existing_env = {}
-            if not all(existing_env.get(k) == v for k, v in info.env.items()) or _commands_diverged(
+            if not _envs_agree(existing_env, info.env) or _commands_diverged(
                 info.command, existing.get("command", "")
             ):
                 out.append(info)
@@ -1950,98 +2176,20 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
 def sync_to_agent_config(servers: list[McpServerInfo]) -> bool:
     """Sync discovered MCP servers into the agent config.
 
-    When the optional ``kiro-cli`` binary is present, genuinely new servers
-    are also registered with it (so ``kiro-cli mcp list`` shows them).  This
-    step is skipped silently when ``kiro-cli`` is not installed.  Either way,
-    the function delegates to ``install_agent()`` — the single authoritative
-    merge function that reads all source files (``~/.kiro/crew/mcp.json``,
-    ``~/.kiro/settings/mcp.json``), merges them with correct priority,
-    resolves commands, and writes the final agent config.
+    Delegates to ``install_agent()`` — the single authoritative merge function
+    that reads all source files (``~/.kiro/crew/mcp.json``,
+    ``~/.kiro/settings/mcp.json``), merges them with correct priority, resolves
+    commands, normalizes each spec's ``env`` (see ``env.emit_env``), and writes
+    the final agent config. There is deliberately no second registration path:
+    a ``kiro-cli mcp add`` subprocess used to run here for cosmetic parity with
+    ``kiro-cli mcp list``, but it was an unsynchronized second writer of the
+    same file with its own (unnormalized) env serialization, and everything it
+    wrote was rewritten by ``install_agent()`` moments later.
 
-    Returns True if any servers were added or the config was refreshed.
+    Returns True if any servers were synced.
     """
-    from kiro_crew.agent import AGENT_FILENAME, install_agent  # circular import
+    from kiro_crew.agent import install_agent  # circular import
 
-    config_path = kiro_agents_dir() / AGENT_FILENAME
-    kiro_bin = shutil.which("kiro-cli")
-
-    # Determine which servers are genuinely new (not yet in agent config)
-    existing_names: set[str] = set()
-    try:
-        pre = json.loads(config_path.read_text(encoding="utf-8"))
-        if isinstance(pre, dict):
-            existing_names = set(pre.get("mcpServers", {}).keys())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-
-    new_servers = [s for s in servers if s.name not in existing_names]
-
-    # Register genuinely new local servers with kiro-cli (optional, cosmetic —
-    # makes them visible in `kiro-cli mcp list`).  No-op when kiro-cli is
-    # absent (public machines): kiro_bin is None and this block is skipped.
-    added = False
-    # Load source specs to check disabled state (defense-in-depth:
-    # discover_servers_to_sync already skips disabled, but guard here too)
-    _source_specs = _load_mcp_json()
-    if kiro_bin and new_servers:
-        procs: list[tuple[McpServerInfo, subprocess.Popen[bytes]]] = []
-        for s in new_servers:
-            if s.is_remote:
-                continue
-            src_spec = _source_specs.get(s.name)
-            if isinstance(src_spec, dict) and src_spec.get("disabled"):
-                logger.warning(
-                    "Skipping disabled server %r in sync (defense-in-depth; "
-                    "discover_servers_to_sync should have excluded it)",
-                    s.name,
-                )
-                continue
-            cmd: list[str] = [
-                kiro_bin,
-                "mcp",
-                "add",
-                "--name",
-                s.name,
-                "--command",
-                s.command,
-                "--agent",
-                "kirocrew",
-                "--force",
-            ]
-            for arg in s.args or []:
-                cmd.extend(["--args", arg])
-            for key, val in s.env.items():
-                cmd.extend(["--env", f"{key}={val}"])
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                procs.append((s, proc))
-            except Exception:
-                logger.warning("kiro-cli mcp add failed to start for %s", s.name, exc_info=True)
-
-        for s, proc in procs:
-            try:
-                _, stderr = proc.communicate(timeout=120)
-                if proc.returncode == 0:
-                    added = True
-                    logger.info("Registered new MCP server with kiro-cli: %s", s.name)
-                else:
-                    msg = (stderr or b"").decode(errors="replace").strip()
-                    logger.warning(
-                        "kiro-cli mcp add returned %d for %s: %s",
-                        proc.returncode,
-                        s.name,
-                        msg[:200],
-                    )
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                logger.warning("kiro-cli mcp add timed out for %s", s.name)
-            except Exception:
-                logger.warning("kiro-cli mcp add failed for %s", s.name, exc_info=True)
-
-    # Delegate the actual config merge to install_agent() — the single
-    # authoritative function that reads all sources, merges with correct
-    # priority, and resolves paths.
     install_agent()
 
     # Audit: log which servers triggered the config rebuild
@@ -2058,7 +2206,39 @@ def sync_to_agent_config(servers: list[McpServerInfo]) -> bool:
     except Exception:
         logger.debug("SEL audit log failed for mcp_server_config_sync", exc_info=True)
 
-    return added or bool(servers)
+    return bool(servers)
+
+
+# One mutex for the whole discover→write sequence. Two dashboard handlers run
+# it (``POST /api/mcp/sync`` and the sessions-restart pre-sync), and each write
+# is a read-modify-write of shared files — unserialized, two concurrent runs
+# can both discover, then interleave writes and drop each other's changes.
+_SYNC_MUTEX = threading.Lock()
+
+
+def sync_discovered_servers() -> list[McpServerInfo]:
+    """Reconcile the consumed configs with the sources, in one serialized step.
+
+    The single entry point for "make the consumed configs match the sources":
+    the agent-config rebuild runs UNCONDITIONALLY — ``install_agent()`` is the
+    idempotent reconciler, and skipping it when discovery reports no new or
+    diverged servers misses the changes discovery deliberately does not
+    report, e.g. a source entry gaining ``disabled: true`` (discovery skips
+    disabled entries, but the rebuild is what removes the server from the
+    agent config). The Claude Code sidecar write is additive-only, so it runs
+    just for the discovered delta. Everything happens under one lock so
+    concurrent callers cannot interleave. Blocking file I/O — call via
+    ``asyncio.to_thread`` from a handler.
+
+    Returns the servers discovery flagged (new or diverged; empty when none —
+    which, deliberately, no longer implies nothing was written).
+    """
+    with _SYNC_MUTEX:
+        to_sync = discover_servers_to_sync()
+        sync_to_agent_config(to_sync)
+        if to_sync:
+            register_servers_for_cc(to_sync)
+        return to_sync
 
 
 def kirocrew_managed_names() -> set[str]:
@@ -2138,7 +2318,11 @@ def register_servers_for_cc(
         else:
             entry = {"command": s.command, "args": s.args or [], "type": "stdio"}
             if s.env:
-                entry["env"] = s.env
+                # The sidecar is consumed by the external ``claude`` CLI, whose
+                # env semantics this repo cannot observe — emit through the
+                # shared normalization point so a declared PATH is complete
+                # under the strictest (replace-per-key) reading. See emit_env.
+                entry["env"] = emit_env(s.env)
 
         # This writer rebuilds an entry from scratch, so rewriting one we did not
         # author would drop the fields it does not reconstruct. The marker says

@@ -98,7 +98,6 @@ def _pool_key(server: str = "demo-mcp", agent: str = "cov-agent", env_hash: str 
         autoapprove_set_hash="b" * 8,
         approval_mode="reads",
         trust_all_tools=False,
-        user_identity="cov",
         config_snapshot_hash="c" * 8,
     )
 
@@ -512,7 +511,7 @@ class TestHeartbeatSweeper:
             task.cancel()
             await asyncio.wait_for(task, timeout=5)
 
-            assert hazards.load_ledger(tmp_path).codes_for("srv") == (
+            assert hazards.load_ledger(tmp_path).codes_for_name("srv") == (
                 hazards.HAZARD_UNROUTABLE_SERVER_REQUEST,
             )
         finally:

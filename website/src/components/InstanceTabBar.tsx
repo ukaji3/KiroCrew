@@ -84,9 +84,12 @@ const LOCAL_VALUE = '__local__'
 // is toggled: the header's inline bar and the InstancesViewport loading/error
 // overlay strips coexist and are hidden (display:none), not unmounted, so a
 // per-instance hook would leave a hidden bar on its stale value until a remount.
-// It does NOT reach a remote pane's embedded bar — that runs in a separate
-// cross-origin iframe realm with its own localStorage — so an embedded bar
-// carries its own per-pane pin state.
+// This module store cannot cross into a remote pane's embedded bar — that runs
+// in a separate cross-origin iframe realm with its own localStorage — so the
+// embedded bar does NOT read this store. Instead the parent relays the pin into
+// each pane via the `expanded` field of `mc-host-model`, and the embedded pin
+// toggle posts `mc-set-expanded` back up; the pin is thus one shared value
+// across every pane (local header + all remote panes), not per-pane.
 const EXPANDED_PREF_KEY = 'mc-crew-switcher-expanded'
 
 let expandedState: boolean = (() => {
@@ -114,7 +117,7 @@ function subscribeExpanded(cb: () => void) {
 }
 
 /** Reactive read of the pin preference + a setter that broadcasts to every bar. */
-function useCrewSwitcherExpanded(): [boolean, (v: boolean) => void] {
+export function useCrewSwitcherExpanded(): [boolean, (v: boolean) => void] {
   const expanded = useSyncExternalStore(subscribeExpanded, () => expandedState, () => expandedState)
   return [expanded, setCrewSwitcherExpanded]
 }
@@ -460,21 +463,33 @@ function ExpandToggle({ expanded, onToggle }: { expanded: boolean; onToggle: () 
  * The expanded row always stays one line and scrolls horizontally: both the
  * fixed-height `inline` header and the fixed-height `strip` overlay bar would
  * spill a wrapped second row over the panel beneath them, so wrapping is not an
- * option in either. The `inline` header additionally caps its width so the row
- * never runs under the centered top-bar search.
+ * option in either. It needs no width cap of its own: in the header the row sits
+ * inside the identity group's own grid track, which the centred search can never
+ * be pushed out of.
  */
 function Switcher({
   entries,
   activeId,
   onSelect,
-  variant,
+  expanded: expandedProp,
+  onSetExpanded,
 }: {
   entries: SwitcherEntry[]
   activeId: string | null
   onSelect: (id: string | null) => void
-  variant: 'strip' | 'inline'
+  /** When provided (embedded pane), the pin state is driven by the parent's
+   *  relayed model instead of this realm's localStorage — a remote pane lives
+   *  in a separate cross-origin iframe whose store the parent can't reach, so
+   *  without this override it would ignore the pin and always show collapsed. */
+  expanded?: boolean
+  /** Paired override for the toggle: the embedded pane relays the new value up
+   *  to the parent (which owns the one shared preference) instead of writing
+   *  its own store. Falls back to the module store when absent (local bar). */
+  onSetExpanded?: (next: boolean) => void
 }) {
-  const [expanded, setExpanded] = useCrewSwitcherExpanded()
+  const [storeExpanded, setStoreExpanded] = useCrewSwitcherExpanded()
+  const expanded = expandedProp ?? storeExpanded
+  const setExpanded = onSetExpanded ?? setStoreExpanded
   if (!expanded) {
     return (
       <div className="flex items-center gap-1 min-w-0">
@@ -488,12 +503,7 @@ function Switcher({
       {/* No role/aria here: the parent bar is already a role="group" labelled
           "Remote crews", so a second group with the same name would be
           announced twice around one control set. */}
-      <div
-        className={
-          'flex items-center gap-1 min-w-0 flex-nowrap overflow-x-auto ' +
-          (variant === 'inline' ? 'max-w-[42vw]' : '')
-        }
-      >
+      <div className="flex items-center gap-1 min-w-0 flex-nowrap overflow-x-auto">
         {entries.map(entry => (
           <SwitcherChip
             key={entry.id ?? LOCAL_VALUE}
@@ -519,6 +529,13 @@ function EmbeddedInstanceTabBar({ variant }: { variant: 'strip' | 'inline' }) {
   const onSelect = useCallback((id: string | null) => {
     // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
     window.parent?.postMessage({ type: 'mc-switch-instance', v: 1, id }, '*')
+  }, [])
+  // The pin lives on the parent (one shared preference across every pane); this
+  // pane can't write the parent's store from its own iframe realm, so it relays
+  // the new value up and lets the parent re-broadcast the model back down.
+  const onSetExpanded = useCallback((next: boolean) => {
+    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
+    window.parent?.postMessage({ type: 'mc-set-expanded', v: 1, expanded: next }, '*')
   }, [])
   const entries = useMemo<SwitcherEntry[]>(() => {
     if (!host) return []
@@ -548,7 +565,13 @@ function EmbeddedInstanceTabBar({ variant }: { variant: 'strip' | 'inline' }) {
       role="group"
       aria-label={i18nT('components.instanceTabBar.instances')}
     >
-      <Switcher entries={entries} activeId={host.activeId} onSelect={onSelect} variant={variant} />
+      <Switcher
+        entries={entries}
+        activeId={host.activeId}
+        onSelect={onSelect}
+        expanded={host.expanded}
+        onSetExpanded={onSetExpanded}
+      />
     </div>
   )
 }
@@ -672,7 +695,7 @@ export default function InstanceTabBar({
       aria-label={i18nT('components.instanceTabBar.instances')}
     >
       <div className={`flex items-center gap-1 min-w-0 ${variant === 'strip' ? 'flex-1' : ''}`}>
-        <Switcher entries={entries} activeId={activeId} onSelect={onSelect} variant={variant} />
+        <Switcher entries={entries} activeId={activeId} onSelect={onSelect} />
       </div>
       {variant === 'strip' && activeInst && (
         <div className="flex items-center gap-1.5 shrink-0 pl-2 pr-1" title={tunnelTitle}>

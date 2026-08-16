@@ -152,8 +152,10 @@ from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
+    TOOL_ALLOW,
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
+    ToolHookResult,
     _normalize_tool_name,
     _tool_matches,
     fire_tool_hooks,
@@ -268,16 +270,34 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 
 
-def _turn_outcome(stop_reason: str | None) -> str:
+def _turn_outcome(stop_reason: str | None, *, exhausted: bool = False) -> str:
     """Map an EVENT_COMPLETE stop_reason to a low-cardinality turn outcome.
 
     Single source of truth shared by the ``kirocrew.turn.duration`` emit in
     ``_run_chat`` and its unit test, so the mapping can't silently drift from
     what the test asserts (tests must exercise real production logic).
+
+    The two watchdog stop reasons are distinct outcomes, not ``error``: a
+    stall-recovery turn is re-driven in place (its budget/outcome is tracked
+    by ``kirocrew.watchdog.recovery.outcome``), so folding it into ``error``
+    would make the fault rate count every recovered stall as a fault AND hide
+    the stall population the watchdog work exists to measure. Checked BEFORE
+    the ``timeout`` substring so a stall never misclassifies.
+
+    ``exhausted`` marks a stall turn whose recovery budget is already spent
+    (the caller reads the slot budgets the stop-reason branches maintain):
+    the slot dies with "start a new chat", so the turn labels
+    ``stall_exhausted`` — a terminal fault to the aggregator — keeping the
+    recovered-stall exclusion from hiding dead sessions while ``fault_rate``
+    stays a single-series computation.
     """
     s = stop_reason or ""
     if s in ("", "end_turn", "stop", "completed"):
         return "ok"
+    if s == STOP_REASON_TOOL_STALL or s == STOP_REASON_STALE_RECOVER:
+        if exhausted:
+            return "stall_exhausted"
+        return "tool_stall" if s == STOP_REASON_TOOL_STALL else "stale_recover"
     if "timeout" in s:
         return "timeout"
     return "error"
@@ -289,6 +309,7 @@ def _emit_turn_metric(
     slot_key: str,
     *,
     elapsed_ms: int | float | None = None,
+    exhausted: bool = False,
 ) -> None:
     """Emit kirocrew.turn.duration (best-effort).
 
@@ -319,7 +340,7 @@ def _emit_turn_metric(
     value = duration_ms or elapsed_ms
     if not value:
         return
-    attrs: dict = {"outcome": _turn_outcome(stop_reason)}
+    attrs: dict = {"outcome": _turn_outcome(stop_reason, exhausted=exhausted)}
     try:
         source = infer_use_case(slot_key)
         if source:
@@ -330,6 +351,37 @@ def _emit_turn_metric(
         get_recorder().histogram("kirocrew.turn.duration", value, unit="ms", attrs=attrs)
     except Exception:
         logger.debug("turn metric emit failed", exc_info=True)
+
+
+def _emit_recovery_outcome(mechanism: str, outcome: str, attempts: int) -> None:
+    """Emit kirocrew.watchdog.recovery.outcome (best-effort).
+
+    One counter point per RESOLVED recovery cycle, derived from the per-slot
+    retry budgets the stop-reason branches already maintain
+    (``slot._stale_recovery_retries`` / ``slot._tool_stall_retries``):
+
+    - ``outcome=recovered`` — a synthetic recovery turn completed ``ok`` while
+      a budget was armed (emitted at the budget-reset block, which is the one
+      place a completed cycle and its attempt count coexist).
+    - ``outcome=exhausted`` — the budget hit its cap and the slot surfaced
+      "start a new chat" (emitted in the stall branches themselves).
+
+    ``attempt_bucket`` is the attempt count clamped to the budget cap (1-3) —
+    a closed enum per the metrics/schema.py cardinality rule, mirroring the
+    CLI's ``attempt_number_bucket`` precedent. Single source of truth shared
+    with its unit test so the mapping cannot silently drift.
+    """
+    try:
+        get_recorder().counter(
+            "kirocrew.watchdog.recovery.outcome",
+            attrs={
+                "mechanism": mechanism,
+                "outcome": outcome,
+                "attempt_bucket": max(1, min(int(attempts), 3)),
+            },
+        )
+    except Exception:
+        logger.debug("recovery outcome metric emit failed", exc_info=True)
 
 
 def _pre_tool_hooks_should_block(pre_hook_results: Any) -> bool:
@@ -660,6 +712,12 @@ POISONED_SESSION_CYCLES = 2
 # message wording, and the canary needs no classification at all.
 _POISON_CANARY_PROMPT = "Reply with the single word OK."
 _POISON_CANARY_TIMEOUT_SECS = 30.0
+
+# Cap the backend-echoed reason interpolated into the "Compaction failed"
+# notice. The notice is a one-line receipt in the transcript, so an unbounded
+# provider string (a stack trace, an echoed payload) would scroll the
+# conversation away instead of explaining it.
+_COMPACT_FAIL_REASON_MAX_CHARS = 300
 
 
 def _truncate_snapshot(content: str) -> str:
@@ -1007,17 +1065,6 @@ def _redact_acp_string(s: str) -> str:
     return s
 
 
-def _oauth_url_contains_credential(url: str) -> bool:
-    """True if the URL embeds an actual credential or exfiltration payload.
-
-    The security module owns the exact endpoint allowlist and parameter-level
-    entropy exemption. This wrapper preserves the historical dashboard API
-    while avoiding ``redact_credentials`` here: that broader redactor includes
-    the bare-secret entropy rule that legitimate state/PKCE values trigger.
-    """
-    return oauth_url_contains_credential(url)
-
-
 def _emit_mcp_oauth_request(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -1060,7 +1107,7 @@ def _emit_mcp_oauth_request(
             },
         )
         return
-    if _oauth_url_contains_credential(oauth_url):
+    if oauth_url_contains_credential(oauth_url):
         # Legitimate OAuth consent URLs carry state/code_challenge/client_id —
         # never AKIA*/Bearer/etc.  Surface this so the user can ask the server
         # owner to fix it instead of just seeing nothing happen.
@@ -1224,9 +1271,10 @@ def _mark_mcp_oauth_completed(
     # NOT preserve realistic `oauth_url`s: it calls `redact_exfiltration_urls`,
     # whose query-length (>=200) and base64-blob heuristics blank a real Google OIDC
     # or GitHub PKCE consent URL. (Measured: those two are blanked; only a short URL
-    # survives.) The emit-path gate `_oauth_url_contains_credential` deliberately
-    # exempts OAuth params from exactly those heuristics — its docstring notes they
-    # "would reject every real OAuth URL".
+    # survives.) The emit-path gate `security.oauth_url_contains_credential`
+    # deliberately exempts OAuth params from exactly those heuristics — it is
+    # "the sole path allowed to exempt standard OAuth entropy from the generic
+    # URL heuristics" (its docstring).
     #
     # That is harmless HERE only because `oauth_url` is dead data by this point:
     # every path through this function sets `completed` or `failed`, and
@@ -2993,11 +3041,17 @@ async def _eager_spawn(
             # switches don't — the snapshot covers them all uniformly.
             _bound = (slot.agent, slot.model, slot.project, slot.reasoning_effort)
             kiro_agent: str | None = None
+            # Canonical crew identity for watchdog overrides. Seeded from the
+            # slot, replaced by the resolver's alias below: an EMPTY slot runs
+            # the DEFAULT crew (resolve_agent_bindings step 2), whose overrides
+            # would be discarded by passing "" here.
+            crew_alias = slot.agent or ""
             agent_model = ""
             try:
                 cfg = KiroCrewConfig.load()
                 bindings = resolve_agent_bindings(cfg, slot.agent or None)
                 kiro_agent = bindings.kiro_agent
+                crew_alias = bindings.resolved_alias
                 agent_model = normalize_agent_model(bindings.model)
             except Exception:
                 logger.warning(
@@ -3016,6 +3070,12 @@ async def _eager_spawn(
                 _, is_new, resumed = await sessions.get_or_create(
                     session_key,
                     agent=kiro_agent or slot.agent or None,
+                    # Canonical crew identity — the resolver's alias, which
+                    # covers the default crew on an empty slot; plumbed to the
+                    # session so per-agent watchdog windows never depend on a
+                    # cross-namespace name match. "" is authoritative: no
+                    # alias applied, so no override applies.
+                    crew_agent=crew_alias,
                     model=slot.model or agent_model or None,
                     cwd=slot.project or None,
                     speculative=True,
@@ -4016,6 +4076,29 @@ async def _run_chat(
     if _prompt_depth == 0:
         await expire_slack_options(state, session_key)
 
+    # Publish the identity of the turn this call is about to run. From here down
+    # the local `session_key` is what the turn acquires, audits and releases,
+    # while `slot.linked_session_key` stays mutable underneath it: a cron
+    # injection binds an existing slot with no `running` gate, so a turn that
+    # started on `dashboard:<slot>` can find the slot routed at `cron:<id>`
+    # before it ends. A cancel that re-derived the key would then address a
+    # session this turn never ran on, so the cancel routes read this instead.
+    #
+    # Placed at the same boundary as the OPTIONS expiry above, and for the same
+    # reason: `/goal`, a `/prompts` listing or error, and a blocked slash command
+    # all return without starting an agent turn, so none of them owns a turn
+    # identity. `/prompts get` re-enters at `_prompt_depth=1`, and it is that
+    # depth-1 call which reaches the machinery below while its depth-0 wrapper
+    # returns above — so keying on the BOUNDARY is what puts the identity on the
+    # invocation that actually runs the turn. Keying on `_prompt_depth == 0`
+    # would put it on the wrapper instead.
+    #
+    # BELOW the expiry, not above it: that await is the only thing between the
+    # boundary and the try, so installing after it means every exit that can
+    # happen while the identity is live reaches the teardown that retires it.
+    # Only plain assignments separate this line from the try.
+    slot._active_turn_session_key = session_key
+
     _acquired = False
     _mirror_stream_ts: str = ""
     _mirror_chan: str | None = ""
@@ -4043,6 +4126,11 @@ async def _run_chat(
         # guards (`is_claude_backend`, the advertised list) rather than trusting a
         # provider name that could not be read.
         provider_name = ""
+        # Canonical crew identity for watchdog overrides — same seeding rule
+        # as the eager-spawn path (the two must agree): slot value until the
+        # resolver supplies its alias, which covers the default crew on an
+        # empty slot.
+        crew_alias = slot.agent or ""
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
@@ -4053,6 +4141,7 @@ async def _run_chat(
             await warm_project_agent_names(slot.project)
             bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
             kiro_agent = bindings.kiro_agent
+            crew_alias = bindings.resolved_alias
             memory_store = bindings.memory_store_name
             agent_model = normalize_agent_model(bindings.model)
         except Exception:
@@ -4069,6 +4158,10 @@ async def _run_chat(
         client, is_new, resumed = await state.sessions.get_or_create(
             session_key,
             agent=kiro_agent or slot.agent or None,
+            # Same canonical crew identity as the eager-spawn path — the two
+            # must agree or an eager session and its real first turn would
+            # carry different watchdog windows.
+            crew_agent=crew_alias,
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
             reasoning_effort_override=slot.reasoning_effort or None,
@@ -5274,6 +5367,13 @@ async def _run_chat(
                     _flush_segment(state, slot, assistant_text)
                     assistant_text = ""
                 _pre_tool_hooks_fired = False
+                # Backend-subagent request whose SECURITY context is absent
+                # (structured params missing, or shell with no recoverable
+                # command — see AcpEvent.child_low_fidelity): every
+                # auto-approve gate below is skipped for it, falling through
+                # to the interactive card. A child WITH full context takes the
+                # same branches as the main agent (mode parity).
+                _child_low_fidelity = event.child_low_fidelity
                 if state.context_builder:
                     # Pass the raw shell command (not just the display title)
                     # so the security gate evaluates what actually executes.
@@ -5340,6 +5440,23 @@ async def _run_chat(
                         # fragments, paths, or credentials.
                         _refusal_reasons.append((_deny_title, _deny_msg))
                         continue
+                    if _child_low_fidelity:
+                        # Backend-subagent origin whose tool_call frames never
+                        # reached us (cache miss): command bytes are absent, so
+                        # every gate below would judge the LLM-authored title
+                        # alone. Fail closed past all auto-approve paths — the
+                        # request falls through to the interactive card. When
+                        # the child's session/update frames WERE routed (the
+                        # normal case), tool_input carries the real command
+                        # bytes and the child takes the exact same mode
+                        # branches as the main agent below.
+                        if tool_result.action == TOOL_AUTO_APPROVE:
+                            logger.info(
+                                "downgrading auto-approve to interactive card for "
+                                "low-fidelity subagent permission request (child=%s)",
+                                event.sub_session_id,
+                            )
+                            tool_result = ToolHookResult(action=TOOL_ALLOW)
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         try:
                             validated_tool = _validate_tool_name(
@@ -5451,7 +5568,9 @@ async def _run_chat(
                 # parent turn. Deny-by-default (CWE-1188): with no active crew this
                 # predicate is False no matter the trust flags, so the tool falls
                 # through to the normal interactive/trust gate below.
-                if _native_crew_should_auto_approve(_native_tracker, state, slot):
+                if _native_crew_should_auto_approve(
+                    _native_tracker, state, slot
+                ) and not _child_low_fidelity:
                     logger.debug(
                         "Native crew auto-approve: %r (request_id=%s)",
                         _safe_native_crew_debug_title(event.title),
@@ -5491,7 +5610,7 @@ async def _run_chat(
                 # use event.title as it IS the provider-controlled tool name.
                 # When tool_input exists but isn't recognized as bash, skip pattern
                 # matching entirely (deny-by-default).
-                if slot._trusted_patterns:
+                if slot._trusted_patterns and not _child_low_fidelity:
                     _tp_cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                     if _tp_cmd:
                         _tp_check_title = f"Running: {_tp_cmd}"
@@ -5673,8 +5792,13 @@ async def _run_chat(
                             metadata={"reason": "trust_reads"},
                         )
                         continue
-                # Trust mode (per-slot) or YOLO mode (global) — auto-approve
-                if slot_trusted or yolo_active:
+                # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
+                # Low-fidelity child events (backend subagents whose command
+                # bytes never reached the caches) are excluded from every
+                # auto-approve path and fall through to the interactive card;
+                # children WITH cached bytes take these branches exactly like
+                # the main agent (mode parity).
+                if (slot_trusted or yolo_active) and not _child_low_fidelity:
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
@@ -5953,7 +6077,12 @@ async def _run_chat(
                         slot._dirty = True
                         state.broadcast_ws(
                             "approval_resolved",
-                            {"id": str(event.request_id), "approved": _approved},
+                            {
+                                "id": str(event.request_id),
+                                "approved": _approved,
+                                # Keys the frame for the slot-scoped WS gate.
+                                "slot": slot.key,
+                            },
                         )
                         state.push_slots_update()
                     # Clean up the Slack prompt: remove the registry entry and
@@ -6253,11 +6382,26 @@ async def _run_chat(
                 # elapsed_ms carries the wall clock computed above because acp
                 # leaves usage.duration_ms at 0 — without it this histogram is
                 # never emitted for the default backend.
+                # ``exhausted`` mirrors the stop-reason branches below: the
+                # recovery-outcome exclusion from fault_rate is earned only by
+                # a turn that is actually re-driven in place, so a stall takes
+                # the terminal stall_exhausted label when its 3-attempt budget
+                # is already spent ("Session stuck") OR when it is a NESTED
+                # turn (depth > 0), which the branches below never re-queue —
+                # it dies with "please retry", a user-visible fault that must
+                # reach fault_rate.
+                if event.stop_reason == STOP_REASON_STALE_RECOVER:
+                    _turn_exhausted = _prompt_depth > 0 or slot._stale_recovery_retries >= 3
+                elif event.stop_reason == STOP_REASON_TOOL_STALL:
+                    _turn_exhausted = _prompt_depth > 0 or slot._tool_stall_retries >= 3
+                else:
+                    _turn_exhausted = False
                 _emit_turn_metric(
                     event.usage.duration_ms,
                     event.stop_reason,
                     slot.key,
                     elapsed_ms=_turn_elapsed_ms,
+                    exhausted=_turn_exhausted,
                 )
                 _stop_reason = event.stop_reason
                 # Recorded on the slot so post-turn consumers reached later
@@ -6317,6 +6461,18 @@ async def _run_chat(
                 )
                 _emit_stale("⟳ Recovering a stalled turn…")
             elif slot._stale_recovery_retries >= 3:
+                # Budget exhausted — terminal for this slot until a turn
+                # actually completes. The budget is deliberately NOT reset
+                # here: zeroing it would re-arm a fresh 3-attempt recovery
+                # cycle on the next stall of a permanently wedged slot
+                # (recover→exhaust looping forever). Telemetry dedup is the
+                # emitted flag's job instead: emit exhausted once per cycle,
+                # and the flag also blocks a later "recovered" mis-emit.
+                if not slot._stale_recovery_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "stale_recover", "exhausted", slot._stale_recovery_retries
+                    )
+                    slot._stale_recovery_exhausted_emitted = True
                 _emit_stale("Session stuck — please start a new chat.")
             else:
                 # depth>0 (nested turn) with budget remaining: reset the session
@@ -6363,6 +6519,15 @@ async def _run_chat(
                 )
                 _emit_stall("⟳ Tool appeared stalled — recovering…")
             elif slot._tool_stall_retries >= 3:
+                # Budget exhausted — mirrors the stale_recover branch above:
+                # budget left alone (a wedged slot must not re-enter a fresh
+                # recovery cycle); the emitted flag dedups the metric and
+                # blocks a later "recovered" mis-emit.
+                if not slot._tool_stall_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "tool_stall", "exhausted", slot._tool_stall_retries
+                    )
+                    slot._tool_stall_exhausted_emitted = True
                 _emit_stall("Session stuck — please start a new chat.")
             else:
                 _emit_stall("⟳ Tool appeared stalled — please retry.")
@@ -6451,7 +6616,30 @@ async def _run_chat(
                         else "✅ Conversation compacted."
                     )
                 elif compaction_result["type"] == "failed":
-                    msg = "❌ Compaction failed."
+                    # The provider ships the reason on `failed` too, and every
+                    # other surface already tells the user what it was — Slack,
+                    # Telegram, Discord, and this dashboard's own AUTO-compact
+                    # notice (see chat_utils._compaction_notice_text). Dropping
+                    # it here left the one path a user takes deliberately as the
+                    # only one that says nothing, so a `/compact` that fails
+                    # because the conversation is too large is indistinguishable
+                    # from one that failed because the backend was unreachable —
+                    # and the user's next move differs in those two cases.
+                    #
+                    # Redacted with the same pair as the completed branch above:
+                    # the text is backend-echoed, so it is not trusted to be
+                    # free of credentials or exfiltration URLs even though the
+                    # provider already redacts once at its own boundary.
+                    error, _ = redact_credentials(compaction_result.get("summary", ""))
+                    error, _ = redact_exfiltration_urls(error)
+                    error = error.strip()
+                    if len(error) > _COMPACT_FAIL_REASON_MAX_CHARS:
+                        # A notice is a one-line receipt, not a log: a provider
+                        # that echoes a wall of text (a stack trace, a dumped
+                        # payload) would otherwise push the whole transcript out
+                        # of the reader's view.
+                        error = error[:_COMPACT_FAIL_REASON_MAX_CHARS].rstrip() + "…"
+                    msg = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
                 else:
                     msg = "⚠️ Compaction timed out."
                 _append_compaction_notice(state, slot, msg)
@@ -6669,11 +6857,33 @@ async def _run_chat(
             # every counter: an empty re-queue is NOT a successful turn, so it must
             # not reset the pipe-death/busy budgets (otherwise an empty interleaved
             # between transient failures would extend the intended 3-retry budget).
+            #
+            # A non-zero stall budget reaching this reset on an OK turn is a
+            # COMPLETED recovery cycle: the stall branches return early, so the
+            # only way here with an armed budget is the synthetic recovery turn
+            # finishing cleanly. Emit outcome=recovered with the attempt count
+            # read BEFORE the reset (the exhausted counterpart lives in the
+            # stall branches). Gated on the ok outcome so a user cancelling the
+            # recovery turn is never counted as a successful recovery.
+            if _turn_outcome(_stop_reason) == "ok":
+                # An armed budget whose cycle already emitted "exhausted" is
+                # not a recovery — the flag blocks the mis-emit (the budget is
+                # no longer zeroed at exhaustion, so it can reach here armed).
+                if slot._stale_recovery_retries > 0 and not slot._stale_recovery_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "stale_recover", "recovered", slot._stale_recovery_retries
+                    )
+                if slot._tool_stall_retries > 0 and not slot._tool_stall_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "tool_stall", "recovered", slot._tool_stall_retries
+                    )
             slot._empty_response_retries = 0
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0
             slot._stale_recovery_retries = 0
             slot._tool_stall_retries = 0
+            slot._stale_recovery_exhausted_emitted = False
+            slot._tool_stall_exhausted_emitted = False
             slot._transient_5xx_retries = 0
             # NOTE: the poisoned-conversation streak/one-shot
             # (_prestream_exhausted_cycles / _poisoned_reset_used) are NOT
@@ -7514,6 +7724,23 @@ async def _run_chat(
                 # so a reset that failed or was cancelled still hands back the
                 # permit rather than stranding the session.
                 state.sessions.release(session_key)
+            # This turn's identity dies WITH its session, and inside the same
+            # finally for the same reason the release is: the reset above can be
+            # cancelled, and CancelledError derives from BaseException, so a
+            # clear placed after this block is simply skipped and the slot keeps
+            # advertising a turn that is gone.
+            #
+            # It must also land before `_start_next_queued_turn` further down
+            # can install the SUCCESSOR's key — a clear after that would wipe a
+            # live turn's identity and drop the cancel routes back to mutable
+            # routing. Compare-and-clear keeps that true if the ordering is ever
+            # rearranged: only the turn that installed a key may retire it.
+            #
+            # Outside the `_acquired` guard: the identity is published before
+            # the permit is taken, so a cold start that never acquired one still
+            # has something to retire.
+            if slot._active_turn_session_key == session_key:
+                slot._active_turn_session_key = ""
         # End-of-turn fallback: catches set_project calls that fired mid-turn,
         # after the start-of-turn consume already ran. Guarded because a raise
         # here would skip the steer requeue and queue drain below, silently

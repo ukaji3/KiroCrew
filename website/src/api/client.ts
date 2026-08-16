@@ -783,13 +783,30 @@ export class ApiError extends Error {
   /** The raw response body, kept so a caller can read structured fields that
    * `friendlyErrText` collapses away when it unwraps the human message. */
   readonly body: string
-  constructor(status: number, message: string, body = '') {
+  /** The gateway rejected this call because the dashboard session no longer
+   * authenticates (403 + `X-Auth-Required`). Call sites branch on this to drop
+   * retry affordances that cannot succeed until the user re-authenticates. */
+  readonly authRequired: boolean
+  constructor(status: number, message: string, body = '', authRequired = false) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.body = body
+    this.authRequired = authRequired
   }
 }
+
+/**
+ * Whether *e* is a failure the user can only clear by signing back in.
+ *
+ * The gateway's auth denial names the cryptographic reason it rejected the
+ * token (`invalid signature`, `session revoked`), which is accurate and
+ * useless to a user: it neither says the session is what broke nor points at
+ * the re-auth banner. Call sites use this to swap a futile retry for the one
+ * action that recovers.
+ */
+export const isAuthExpiredError = (e: unknown): boolean =>
+  e instanceof ApiError && e.authRequired
 
 /**
  * Map raw edge/proxy error bodies to a human-readable message. A dashboard
@@ -827,7 +844,15 @@ export const friendlyErrText = (status: number, body: string): string => {
  * context from the message alone — see AskAgentButton / ErrorNotice.
  */
 const apiFailure = (r: Response, errText: string): ApiError => {
-  const message = friendlyErrText(r.status, errText) || `HTTP ${r.status}`
+  // An auth denial's own reason text ("invalid signature") describes HMAC
+  // verification, not anything the user can act on, and every card that renders
+  // it hides the fact that one re-auth clears all of them at once. Substitute
+  // the recovery instruction for display; the raw reason still travels in
+  // `body` and in the error report's `detail` for diagnostics.
+  const authRequired = r.status === 403 && r.headers.get('X-Auth-Required') === 'true'
+  const message = authRequired
+    ? i18nT('api.client.session_expired_sign_in_again')
+    : friendlyErrText(r.status, errText) || `HTTP ${r.status}`
   recordError({
     source: 'api',
     message,
@@ -836,7 +861,7 @@ const apiFailure = (r: Response, errText: string): ApiError => {
     endpoint: requestPath(r.url),
     detail: errText,
   })
-  return new ApiError(r.status, message, errText)
+  return new ApiError(r.status, message, errText, authRequired)
 }
 
 const j = async (r: Response) => {
@@ -1389,6 +1414,17 @@ export const api = {
    *  error) when the feature is off, so the panel can explain itself. */
   sessionSummary: (slot: string) =>
     fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/summary').then(j) as Promise<SessionSummary>,
+  /** Summarize this session NOW, on the person's explicit request.
+   *
+   *  Same path as the GET, different verb: reading a summary must stay free of
+   *  side effects, so spending tokens is a separate verb rather than a flag on
+   *  the read. Rejects with the body's `code` (`summary_in_flight`,
+   *  `too_few_turns`, `summary_unavailable`, `summary_disabled`) so the panel can
+   *  say which rather than showing one generic failure. */
+  generateSessionSummary: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/summary', {
+      method: 'POST',
+    }).then(j) as Promise<SessionSummary>,
   beaconStatus: () => fetch('/api/telemetry/beacon').then(j),
   /** Local metric-collection posture for the Privacy panel's recording switch.
    *  Separate from telemetryStartup(), which parses every shard in the window. */
@@ -1570,7 +1606,15 @@ export const api = {
   vectorContextPreview: (query?: string) => fetch('/api/memory/context-preview' + (query ? '?q=' + encodeURIComponent(query) : '')).then(j),
   memoryGraph: () => fetch('/api/memory/graph').then(j),
   consolidateMemory: (key: string, includeHistory: boolean) => post('/api/memory/consolidate', { key, include_history: includeHistory }).then(j),
-  restartSessions: () => post('/api/sessions/restart').then(j),
+  restartSessions: () =>
+    post('/api/sessions/restart').then(j) as Promise<{
+      ok: boolean
+      sessions_reset: number
+      mcp_synced: number
+      /** false when the MCP reconcile FAILED before the restart: sessions did
+       *  restart, but against a config that may not match the sources. */
+      mcp_sync_ok: boolean
+    }>,
   sessionsContext: () => fetch('/api/sessions/context').then(j),
   sessionsMemory: () => fetch('/api/sessions/memory').then(j) as Promise<{
     sessions: {
@@ -1680,6 +1724,7 @@ export const api = {
     return fetch('/api/crons/' + jobId + '/history' + (qs ? '?' + qs : ''), { headers: { ..._sk } }).then(j)
   },
   cronRunDetail: (jobId: string, runId: string) => fetch('/api/crons/' + jobId + '/history/' + encodeURIComponent(runId), { headers: { ..._sk } }).then(j),
+  cronScript: (jobId: string) => fetch('/api/crons/' + jobId + '/script').then(j),
   ackCron: (id: string, summary: string, ts?: string) => post('/api/crons/' + id + '/ack', { summary, ts }).then(j),
   cronHistoryAll: (opts?: { offset?: number; limit?: number; jobId?: string }) => {
     const p = new URLSearchParams()

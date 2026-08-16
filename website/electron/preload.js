@@ -3,6 +3,11 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
   isElectron: true,
+  // True when this window is a frameless Linux window (a runtime decision --
+  // desktop environment + operator override -- made in main.js, carried here
+  // via webPreferences.additionalArguments). The SPA reserves header space
+  // for the injected caption controls only when this is set.
+  linuxFrameless: process.argv.includes("--kc-linux-frameless"),
   // Absolute filesystem path for a File the OS handed the renderer (drag-drop,
   // file input). Browsers deliberately hide real paths, and Electron removed
   // File.path, so webUtils in the preload is the only remaining bridge. Returns
@@ -15,6 +20,11 @@ contextBridge.exposeInMainWorld("kirocrew", {
       return "";
     }
   },
+  // Caption controls for the frameless Linux window. macOS keeps its traffic
+  // lights and Windows its titleBarOverlay when frameless; Linux gets neither,
+  // so main.js injects header buttons that round-trip through this channel.
+  // The action vocabulary is validated in main.js (applyWindowControl).
+  windowControl: (action) => ipcRenderer.send("window-control", String(action || "")),
 });
 
 contextBridge.exposeInMainWorld("electronAPI", {
@@ -46,6 +56,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setTitleBarOverlayTheme: (mode) => ipcRenderer.send("titlebar-overlay-theme", String(mode || "")),
   // Dev mode IPC: renderer signals main process to show/hide DevTools menu item.
   setDevMode: (enabled) => ipcRenderer.send("dev-mode-changed", !!enabled),
+  // Windows custom titlebar: menu surfaces render in the dashboard so hover
+  // can switch between them; command execution stays in the main process.
+  getAppMenuItems: (id) => ipcRenderer.invoke("app-menu:items", id),
+  executeAppMenuItem: (id, index) => ipcRenderer.send("app-menu:execute", id, index),
   // App-menu navigation: main.js sends an in-app path ("/settings",
   // "/settings?tab=about") when the user picks Settings…/About from the
   // native application menu; the SPA routes to it (see App.tsx).

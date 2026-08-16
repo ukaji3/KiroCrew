@@ -45,6 +45,7 @@ from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_F
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
 from kiro_crew.agent_files import (
+    OWNED_KIRO_AGENT_FILES,
     REQUIRED_KIRO_AGENT_FILES,
 )
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
@@ -56,7 +57,7 @@ from kiro_crew.config.paths import (
     isolated_agents_dir,
     kiro_agents_dir,
 )
-from kiro_crew.env import augmented_path
+from kiro_crew.env import emit_env, spec_env_path, spec_path_key
 from kiro_crew.mcp_cleanup import purge_deleted_proxy_from_config
 from kiro_crew.mcp_provenance import without_marker
 from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
@@ -501,20 +502,93 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     return bin_path, [subcommand]
 
 
+def _computer_use_spec_gate() -> bool:
+    """Whether ``kirocrew-computer`` belongs in an EMITTED agent spec.
+
+    The shim's own ``enable_state.is_enabled()`` checks (in ``_list_tools`` and
+    again in the dispatcher) decide what a RUNNING backend may do; they cannot
+    decide whether it runs at all, because they execute inside the process the
+    spec already caused kiro-cli to spawn. So a disabled feature still cost a
+    full backend process — ~109 MB, per chat process including every
+    ``spawn_run`` subagent — and on Linux/Windows it cost that for a capability
+    with no driver at all (see ``backend.select_default_backend``: macOS is the
+    only platform with one). This gate is the same decision moved to the only
+    place that can act on it: spec emission.
+
+    Both in-process checks stay as defence in depth. They still cover the case
+    this gate structurally cannot — the keystone flipping OFF mid-session, after
+    the spec was written and the backend spawned.
+
+    Fails CLOSED, matching the keystone's own posture (``enable_state`` reads a
+    missing / unreadable / malformed file as DISABLED): the open position of this
+    gate hands out the operator's whole desktop, so an unreadable ceiling must
+    never be read generously.
+    """
+    if not platform_compat.IS_MACOS:
+        return False
+    try:
+        # Function-local: ``enable_state`` reaches ``config.loader`` at module
+        # scope, and agent.py imports that loader function-locally everywhere
+        # else for exactly that reason — a module-scope import here would close
+        # an import cycle through the config plane.
+        from kiro_crew.computer_use import enable_state
+
+        return enable_state.is_enabled()
+    except Exception:
+        logger.debug(
+            "computer-use keystone unreadable; omitting it from the agent spec",
+            exc_info=True,
+        )
+        return False
+
+
+def _gated_off_servers() -> frozenset[str]:
+    """Managed servers whose ``spec_gate`` is CLOSED right now.
+
+    Evaluated ONCE per rebuild and threaded through the emit path and the withhold
+    audit, rather than each re-reading the gate. The reads are cheap; agreeing is
+    the point. A keystone flip landing between the two would produce a spec and an
+    audit trail that contradict each other — the record claiming a server was
+    withheld when it was emitted, or staying silent when it was withheld. That
+    record is read during incident response, against the config it describes.
+
+    A gate that raises is treated as closed, for the same fail-closed reason the
+    computer-use gate itself is.
+    """
+    closed: set[str] = set()
+    for name, spec in _MANAGED_MCP_SERVERS.items():
+        gate = spec.get("spec_gate")
+        if gate is None:
+            continue
+        try:
+            if not gate():
+                closed.add(name)
+        except Exception:
+            logger.debug("spec gate for %s raised; treating as closed", name, exc_info=True)
+            closed.add(name)
+    return frozenset(closed)
+
+
 # ---------------------------------------------------------------------------
 # Managed MCP servers — single source of truth.
 #
 # Every server here is dynamically injected into the agent config at install
 # time (both fresh and existing configs).  Adding a new managed server =
 # one entry here.
+#
+# An entry may carry a ``spec_gate`` callable: a predicate consulted at spec
+# EMISSION time, so a capability that is off (or impossible on this platform)
+# costs no backend process rather than merely no tools.  Absent = always
+# emitted, which is what the two always-on servers want.
 # ---------------------------------------------------------------------------
 _MANAGED_MCP_SERVERS: dict[str, dict] = {
     "kirocrew-cron": {"invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-cron")},
     "kirocrew-core": {"invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-core")},
-    # Computer use (native desktop GUI automation).  Registered unconditionally —
-    # its stdio shim returns an EMPTY tools/list while the keystone primary enable
-    # is off, so a disabled feature costs the model no context and needs no
-    # per-server ``enabled_fn`` in this loop.
+    # Computer use (native desktop GUI automation).  ``spec_gate`` keeps the
+    # entry out of the emitted spec unless this is macOS AND the keystone primary
+    # enable is on, so kiro-cli never spawns the backend for a feature that is
+    # off or unsupported (see _computer_use_spec_gate).  The shim's own empty
+    # ``tools/list`` while disabled is retained as defence in depth.
     #
     # DELIBERATELY NO ``autoApprove`` KEY, and none may ever be added: kiro-cli
     # approves an autoApproved MCP tool locally and emits no permission request,
@@ -522,7 +596,27 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
     # floor, the sensitive-path check and the governance ceiling — is NEVER
     # reached for it. For a tool that can click in an already-authenticated
     # application that would be a complete gate bypass.
-    "kirocrew-computer": {"invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-computer")},
+    "kirocrew-computer": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-computer"),
+        "spec_gate": _computer_use_spec_gate,
+    },
+    # Dashboard control (sidebar folder tree + which sessions sit in it).
+    # ``opt_in``: an ASSIGNABLE SET, not an always-on capability. The two loops
+    # that write specs skip it, so the default agent's spec carries neither the
+    # entry nor an ``@kirocrew-dashboard`` ref in ``tools`` — and kiro-cli loads a
+    # server only when something references it, so a default session spends no
+    # context on tools it never uses. An agent that should reorganize the
+    # dashboard is granted the set in its own spec, and a refresh keeps that
+    # grant's command current without ever re-granting it.
+    #
+    # No ``autoApprove`` key, for the same reason the computer server has none:
+    # an autoApproved MCP tool is approved inside kiro-cli and never reaches
+    # ``hooks.on_tool_call``, so the deny floor and governance ceiling would be
+    # bypassed for tools that write to the user's session layout.
+    "kirocrew-dashboard": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-dashboard"),
+        "opt_in": True,
+    },
 }
 
 
@@ -974,11 +1068,10 @@ _INTERNAL_HOOK_KEYS = frozenset(
 )
 
 # Valid kiro-cli hook event names — the UNION of the hardcoded baseline (kiro-cli's
-# known schema) and any event key present in bundled defaults. Used as the single
-# filter on both the generation path (bundled defaults -> generated spec) and the
-# repair/validation path (on-disk repair, user-input) — a new event added to
-# defaults.json is automatically accepted on both without a matching allowlist
-# update (#3362).
+# known schema) and any event key present in bundled defaults. Used for generated
+# specs and user-input validation; startup repair is ownership-scoped and removes
+# only legacy keys Kiro Crew serialized. A new event added to defaults.json is
+# automatically accepted without a matching allowlist update (#3362).
 _VALID_HOOK_EVENTS = frozenset(
     {"preToolUse", "postToolUse", "userPromptSubmit", "agentSpawn", "stop"}
 ) | frozenset(
@@ -987,13 +1080,18 @@ _VALID_HOOK_EVENTS = frozenset(
     if k not in _INTERNAL_HOOK_KEYS
 )
 
+# Repair is subtractive against the runtime-only key Kiro Crew is known to have
+# serialized into its generated specs. Unknown keys may belong to a newer
+# kiro-cli schema or to the user.
+_LEGACY_KIROCREW_HOOK_KEYS = frozenset({"auto_approve_tools"})
+
 
 def _kiro_hooks_only(hooks: dict) -> dict:
     """Return only kiro-cli valid hook keys, stripping everything else.
 
-    Used on both the generation path (trusted bundled defaults) and the
-    repair/validation path (on-disk repair, user-supplied config) — screens
-    unknown keys that kiro-cli would reject.
+    Used on the generation path (trusted bundled defaults) and for user-supplied
+    config validation. On-disk startup repair is deliberately narrower because
+    unknown keys may belong to a newer kiro-cli schema or to the user.
     """
     return {k: v for k, v in hooks.items() if k in _VALID_HOOK_EVENTS}
 
@@ -1568,7 +1666,7 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
         logger.debug("SEL audit for kiro_hooks merge failed", exc_info=True)
 
 
-def build_agent_config() -> dict:
+def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     """Return the final agent config (shipped defaults + user overrides + dynamic fields).
 
     Security-critical ``hooks`` always use the bundled config as their base,
@@ -1578,6 +1676,11 @@ def build_agent_config() -> dict:
     hooks.py PreToolUse gate, not via the kiro agent spec. User-defined
     ``kiro_hooks`` from ``~/.kiro/crew/config.json`` are then additively merged;
     bundled hooks always run first and cannot be removed.
+
+    Args:
+        gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
+            caller's snapshot so one rebuild's emit path and its withhold audit
+            agree; omitted, it is evaluated here.
     """
     config = _load_json(_shipped_defaults())
     config = _deep_merge(config, _load_json(_user_overrides_path()))
@@ -1605,7 +1708,24 @@ def build_agent_config() -> dict:
     config["prompt"] = f"file://{_prompt_path()}"
     mcp = config.setdefault("mcpServers", {})
     registry_mode = _mcp_registry_mode()
+    if gated_off is None:
+        gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
+        if name in gated_off:
+            # The gate is the whole point of this branch: emitting the entry is
+            # what makes kiro-cli spawn the backend, so a closed gate must not
+            # emit one. ``pop`` as well as ``continue`` because the base here is
+            # shipped defaults merged with the user override file, and an entry
+            # arriving from there would otherwise slip past a platform gate that
+            # exists because the capability has no driver on this OS.
+            mcp.pop(name, None)
+            continue
+        # An opt-in server is an assignable set: it belongs to the agents whose
+        # own spec references it, so a freshly built default spec must not carry
+        # it. kiro-cli loads a server only when ``tools`` names it, and the
+        # shipped template names only the always-on ones.
+        if spec.get("opt_in"):
+            continue
         if "invocation_fn" in spec:
             cmd, args = spec["invocation_fn"]()
         else:
@@ -1644,11 +1764,18 @@ def build_agent_config() -> dict:
     return config
 
 
-def _refresh_dynamic_fields(config: dict) -> None:
+def _refresh_dynamic_fields(
+    config: dict, *, gated_off: "frozenset[str] | None" = None
+) -> None:
     """Update security-critical and dynamic fields in an existing config.
 
     Called when ``kirocrew.json`` already exists so user customizations are
     preserved while security controls and runtime paths stay current.
+
+    Args:
+        gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
+            caller's snapshot so one rebuild's emit path and its withhold audit
+            agree; omitted, it is evaluated here.
     """
     # Prompt URI — always resolve at install time
     config["prompt"] = f"file://{_prompt_path()}"
@@ -1657,8 +1784,50 @@ def _refresh_dynamic_fields(config: dict) -> None:
     # Only refresh command/args; preserve user customizations (e.g. autoApprove).
     mcp = config.setdefault("mcpServers", {})
     registry_mode = _mcp_registry_mode()
+    if gated_off is None:
+        gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
+        if name in gated_off:
+            # RETRACT, not merely skip: an earlier refresh wrote this entry while
+            # the gate was open, and leaving it would mean turning the feature
+            # off never reclaims the backend process turning it on started.
+            #
+            # The entry's user-owned fields are NOT preserved. Stashing them
+            # would need an agent-writable sidecar, and an ``autoApprove``
+            # restored from there is a self-granted auto-approve: kiro-cli
+            # approves such a tool locally, so ``hooks.on_tool_call`` never sees
+            # the call. An off/on cycle therefore resets a customized entry and
+            # the operator re-applies it — losing an approval is the safe
+            # direction, granting one from an agent-writable file is not.
+            #
+            # The server's ``@ref`` in ``tools`` is deliberately left alone. A ref
+            # whose server has no ``mcpServers`` entry resolves to nothing and
+            # mounts nothing, so withholding the entry is the whole control;
+            # removing the ref as well would destroy a grant the user may have
+            # narrowed by hand and cannot be reconstructed on re-enable.
+            mcp.pop(name, None)
+            continue
         is_new = name not in mcp
+        # An opt-in server is granted by the spec itself, so a refresh keeps an
+        # entry the user put there current but never introduces one: adding it
+        # back would re-grant a set on every gateway start.
+        if is_new and spec.get("opt_in"):
+            continue
+        if not is_new and spec.get("opt_in") and not isinstance(mcp.get(name), dict):
+            # A hand-written entry that is not an object at all. Refreshing it
+            # would raise (item assignment on a str), and rewriting it would
+            # discard whatever the user meant to say. Leave it untouched and let
+            # doctor report it — this pass repairs OUR fields, it does not
+            # adjudicate malformed user input.
+            #
+            # Only for an OPT-IN server, whose entry the user hand-wrote. An
+            # always-on entry is ours, nobody hand-writes it, and a malformed one
+            # deliberately falls through to raise: the caller catches TypeError
+            # and rebuilds from defaults, which is what restores the server.
+            # Skipping it here instead would leave it malformed, so validation
+            # drops it while its ``@ref`` stays in ``tools`` — every tool on that
+            # server silently gone.
+            continue
         entry = mcp.setdefault(name, {})
         if "invocation_fn" in spec:
             entry["command"], entry["args"] = spec["invocation_fn"]()
@@ -1751,14 +1920,7 @@ def _refresh_dynamic_fields(config: dict) -> None:
     # builds on the next refresh; the one-time migrate_agent_specs() at startup
     # handles the rest of ~/.kiro/agents/.
     name = config.get("name") or _MAIN_AGENT_NAME
-    if "model_managed" in config:
-        if agent_state.get_model_managed(name) is None:
-            agent_state.set_model_managed(name, bool(config["model_managed"]))
-        del config["model_managed"]
-    if "cc_model" in config:
-        if agent_state.get_cc_model(name) is None and config["cc_model"]:
-            agent_state.set_cc_model(name, str(config["cc_model"]))
-        del config["cc_model"]
+    agent_state.lift_and_strip_bookkeeping(config, name)
 
     # Imported lazily: config.loader imports this module, so a top-level import
     # would close the cycle. Warm by the time this runs (importing agent pulls
@@ -1846,23 +2008,28 @@ def get_shipped_tools() -> dict[str, list[str]]:
     return {k: shipped.get(k, []) for k in ("tools", "allowedTools")}
 
 
-def _load_existing_config(path: Path) -> tuple[dict, bool]:
+def _load_existing_config(
+    path: Path, *, gated_off: "frozenset[str] | None" = None
+) -> tuple[dict, bool]:
     """Load and refresh an existing kirocrew.json.
 
     Returns (config, fresh_install).  Falls back to build_agent_config()
     when the file is corrupt or refresh fails.
+
+    *gated_off* is the caller's spec-gate snapshot, forwarded so whichever branch
+    runs reads the same decision the caller's audit will report.
     """
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, ValueError):
         config = None
     if not isinstance(config, dict):
-        return build_agent_config(), True
+        return build_agent_config(gated_off=gated_off), True
     try:
-        _refresh_dynamic_fields(config)
+        _refresh_dynamic_fields(config, gated_off=gated_off)
     except (AttributeError, TypeError, RuntimeError) as exc:
         logger.error("Refresh failed, rebuilding from defaults: %s", exc)
-        return build_agent_config(), True
+        return build_agent_config(gated_off=gated_off), True
     return config, False
 
 
@@ -1994,15 +2161,7 @@ def migrate_agent_specs() -> int:
         if "model_managed" not in data and "cc_model" not in data:
             continue
         name = data.get("name") or spec_path.stem
-        if "model_managed" in data:
-            # Don't clobber an authoritative sidecar value with a stale spec one.
-            if agent_state.get_model_managed(name) is None:
-                agent_state.set_model_managed(name, bool(data["model_managed"]))
-            del data["model_managed"]
-        if "cc_model" in data:
-            if agent_state.get_cc_model(name) is None and data["cc_model"]:
-                agent_state.set_cc_model(name, str(data["cc_model"]))
-            del data["cc_model"]
+        agent_state.lift_and_strip_bookkeeping(data, name)
         try:
             _atomic_json_write(spec_path, data)
             cleaned += 1
@@ -2329,12 +2488,17 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
 
     # Managed MCP sync happens after config is fully built (see below).
 
+    # One spec-gate snapshot for the whole rebuild, so the emit path below and the
+    # withhold audit near the end describe the SAME decision (see
+    # _gated_off_servers).
+    gated_off = _gated_off_servers()
+
     if not clean and path.exists():
         # Existing config — preserve user customizations, only refresh
         # security-critical and dynamic fields.
-        config, fresh_install = _load_existing_config(path)
+        config, fresh_install = _load_existing_config(path, gated_off=gated_off)
     else:
-        config = build_agent_config()
+        config = build_agent_config(gated_off=gated_off)
         fresh_install = True
 
     # Seed default-model tracking for a fresh/clean build. A clean regen always
@@ -2374,9 +2538,9 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     for _app_srv, _app_spec in _collect_app_mcp_servers().items():
         if _app_srv not in managed_names:
             config.setdefault("mcpServers", {})[_app_srv] = _app_spec
-            # MOUNT it: a server present only in `mcpServers` is defined but never
-            # referenced, so kiro-cli never loads it and the app's tools are
-            # silently unavailable. `tools` is the unconditional mount (the final
+            # EXPOSE it: kiro-cli connects entries declared in `mcpServers`, but
+            # an unreferenced server contributes no tools to the agent. `tools`
+            # is the unconditional exposure list (the final
             # dedup below removes any duplicate); auto-approve stays governed —
             # the spec's `autoApprove` was already ceiling-filtered in
             # _collect_app_mcp_servers, and the final allowedTools pass covers the
@@ -2450,11 +2614,10 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         even when the file is fine.
 
         Searches the server's own env.PATH first, then the same augmented
-        PATH the MCP probe uses (mcp_discovery.probe_server →
-        env.augmented_path). Sharing augmented_path — instead of a hand-built
-        dir list — keeps agent-config-build resolution and probe resolution
-        from diverging: a divergence would let a server probe healthy on
-        the dashboard while being silently dropped from the generated agent
+        PATH the MCP probe uses — both via :func:`spec_env_path`, which is
+        also the value emitted into the spec, so resolution, the probe and the
+        launched child all agree. A divergence would let a server probe healthy
+        on the dashboard while being silently dropped from the generated agent
         config ("command not found: kirocrew"). augmented_path
         covers ~/.aim/mcp-servers and ~/.toolbox/bin and appends the running
         interpreter's console-scripts dir
@@ -2465,9 +2628,15 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
             return None
         if os.path.isabs(cmd) and os.path.isfile(cmd) and os.access(cmd, os.X_OK):
             return cmd
-        env_path = (env or {}).get("PATH", "")
-        base = os.pathsep.join(filter(None, [env_path, os.environ.get("PATH", "")]))
-        return shutil.which(cmd, path=augmented_path(base))
+        # Case-insensitive PATH key: a Windows-authored spec says "Path", and
+        # resolving against a DIFFERENT path than the emitted spec carries would
+        # reopen the probe/session split from the other side.
+        _env = env or {}
+        _key = spec_path_key(_env)
+        _declared = _env.get(_key, "") if _key else ""
+        return shutil.which(
+            cmd, path=spec_env_path(_declared if isinstance(_declared, str) else "")
+        )
 
     valid_servers: dict[str, Any] = {}
     # The store is keyed by its own RAW name, but ``name`` below iterates the
@@ -2600,6 +2769,15 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
                     merged["args"] = chosen["args"]
                 if "env" in chosen:
                     merged["env"] = chosen["env"]
+            # A declared env.PATH replaces the child's PATH rather than
+            # extending it, so emit the full effective one via the shared
+            # normalization point (see emit_env / spec_env_path). emit_env
+            # returns a fresh dict: ``dict(spec)`` is shallow, so the env dict
+            # here is still the source config's own and must not be mutated
+            # through.
+            spec_env = merged.get("env")
+            if isinstance(spec_env, dict):
+                merged["env"] = emit_env(spec_env)
             valid_servers[name] = merged
         elif not had_any_command:
             # No candidate defined a command at all — distinct from a command
@@ -2754,10 +2932,9 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         ]
         for mcp_name in _register_names:
             ref = f"@{mcp_name}"
-            if mcp_name in valid_servers:
-                if ref not in config.get("tools", []):
-                    config.setdefault("tools", []).append(ref)
-                    added_refs.append(ref)
+            if mcp_name in valid_servers and ref not in config.get("tools", []):
+                config.setdefault("tools", []).append(ref)
+                added_refs.append(ref)
         if added_refs:
             sel().log_api_access(
                 caller="system",
@@ -2808,6 +2985,29 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
                 source="install_agent",
                 resources=f"{cu_ref} added to tools (existing config upgrade)",
             )
+
+    # Audit the DECISION, not a config delta. Nothing in the spec changes shape
+    # when a gate closes — the ``@ref`` stays exactly where the template put it
+    # and only the ``mcpServers`` entry is withheld — so there is no delta to
+    # observe, and a reader of the audit trail would otherwise have no record
+    # that a shipped server was deliberately not emitted. Derived from the gate
+    # plus the shipped template so the fresh and existing paths record the same
+    # fact.
+    _withheld = sorted(
+        f"@{name}" for name in gated_off if f"@{name}" in get_shipped_tools().get("tools", [])
+    )
+    if _withheld:
+        sel().log_api_access(
+            caller="system",
+            operation="mcp_server_withheld",
+            outcome="ok",
+            source="install_agent",
+            resources=(
+                f"{', '.join(_withheld)} withheld from mcpServers (unsupported "
+                f"platform or capability disabled); its tools ref is retained and "
+                f"resolves to nothing"
+            ),
+        )
 
     # Final dedup (preserves order).
     for key in ("tools", "allowedTools"):
@@ -3349,7 +3549,7 @@ def sync_aim_packages() -> None:
 
 
 def repair_agent_configs() -> None:
-    """Sanitize invalid hook keys in all agent configs."""
+    """Remove legacy Kiro Crew hook keys from agent configs owned by Kiro Crew."""
     _sanitize_agent_hooks()
 
 
@@ -3357,16 +3557,19 @@ _hooks_sanitized_mtimes: dict[str, float] = {}
 
 
 def _sanitize_agent_hooks() -> None:
-    """Remove KiroCrew-internal hook keys from kiro-cli agent configs.
+    """Remove legacy Kiro Crew hook keys from agent configs owned by Kiro Crew.
 
     Kiro-cli rejects unknown variants in the ``hooks`` field (e.g.
     ``auto_approve_tools``), causing it to silently fall back to the
     default agent — losing kirocrew-core, kirocrew-cron.
 
-    Auto-repairs configs for users who already have the invalid key from
-    prior versions.
+    Auto-repairs configs carrying keys Kiro Crew wrote in prior versions. Files
+    outside :data:`OWNED_KIRO_AGENT_FILES` and unrecognized hook keys are left
+    untouched because Kiro Crew does not own their schema or contents.
     """
-    for f in kiro_agents_dir_path().glob("*.json"):
+    agents_dir = kiro_agents_dir_path()
+    for filename in OWNED_KIRO_AGENT_FILES:
+        f = agents_dir / filename
         try:
             mtime = f.stat().st_mtime
         except OSError:
@@ -3380,19 +3583,20 @@ def _sanitize_agent_hooks() -> None:
         if not isinstance(hooks, dict):
             _hooks_sanitized_mtimes[str(f)] = mtime
             continue
-        clean_hooks = _kiro_hooks_only(hooks)
-        if len(clean_hooks) == len(hooks):
+        removed_keys = [key for key in hooks if key in _LEGACY_KIROCREW_HOOK_KEYS]
+        if not removed_keys:
             _hooks_sanitized_mtimes[str(f)] = mtime
             continue
-        invalid_keys = [k for k in hooks if k not in _VALID_HOOK_EVENTS]
-        data["hooks"] = clean_hooks
+        data["hooks"] = {
+            key: value for key, value in hooks.items() if key not in _LEGACY_KIROCREW_HOOK_KEYS
+        }
         _atomic_json_write(f, data)
         _hooks_sanitized_mtimes[str(f)] = f.stat().st_mtime
-        logger.info("Removed invalid hook keys %s from %s", invalid_keys, f.name)
+        logger.info("Removed legacy Kiro Crew hook keys %s from %s", removed_keys, f.name)
         sel().log_api_access(
             caller="system",
             operation="sanitize_agent_hooks",
             outcome="ok",
             source="agent",
-            resources=f"{f.name}: removed {invalid_keys}",
+            resources=f"{f.name}: removed {removed_keys}",
         )

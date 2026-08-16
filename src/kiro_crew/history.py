@@ -235,6 +235,75 @@ def _fmt_message(m: dict) -> str:
     return f"[{m.get('ts', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
 
 
+# Normalized placeholder bodies a model emits instead of a real file body.
+# Compared after lowercasing and stripping surrounding whitespace/punctuation,
+# so e.g. "Unchanged.", "(no changes)" and "N/A" all normalize into this set.
+_PLACEHOLDER_BODIES = frozenset(
+    {
+        "unchanged",
+        "no change",
+        "no changes",
+        "no change needed",
+        "no changes needed",
+        "no changes required",
+        "no update",
+        "no updates",
+        "no update needed",
+        "no updates needed",
+        "nothing changed",
+        "nothing to update",
+        "nothing to change",
+        "none",
+        "n/a",
+        "na",
+        "empty",
+        "same",
+        "same as before",
+        "as before",
+        "see above",
+        "content unchanged",
+        "file unchanged",
+    }
+)
+
+
+def _is_plausible_memory_file(content: str, header: str) -> bool:
+    """Gate a consolidation ``*_update`` value before it overwrites a memory file.
+
+    The consolidation prompt asks for the COMPLETE updated file, but a model
+    sometimes answers with a protocol word instead — the literal string
+    ``unchanged``, ``(empty)``, ``no changes needed`` and similar. Writing that
+    placeholder destroys the file, and because the next consolidation prompt
+    embeds the file's current content verbatim, the placeholder then reads as a
+    valid example body and gets echoed into the other memory file on every
+    subsequent pass — a self-reinforcing loop that keeps both files destroyed
+    until a human rebuilds them.
+
+    Two gates:
+
+    1. The first line must be exactly the markdown header the prompt mandates
+       (not merely a prefix — ``# User Preferences (unchanged)`` is not a file).
+    2. The body below the header must not normalize into a known placeholder
+       word/phrase. Markdown emphasis wrapping (``**unchanged**``,
+       ``_unchanged_``, ``~~unchanged~~``) is stripped before the comparison so
+       a decorated placeholder cannot bypass the set. An EMPTY body after the
+       exact header is accepted: it is the legitimate COMPLETE file when the
+       last entry is deleted (e.g. the final project goes inactive), and
+       rejecting it would pin the stale entry in persistent memory forever.
+       There is deliberately no size floor either — a legitimate memory file
+       can be a single tiny bullet (``- Vim``), and rejecting it here would
+       silently lose the learned preference while the consolidation marker
+       advances past it.
+    """
+    first_line, _, body = content.strip().partition("\n")
+    if first_line.strip() != header:
+        return False
+    normalized = body.strip().lower().strip(" \t\"'`*_~.,!()[]")
+    if normalized in _PLACEHOLDER_BODIES:
+        return False
+    return True
+
+
 _SESSION_MAX_BYTES = 2 * 1024 * 1024  # 2MB
 _SESSION_KEEP_LINES = 200
 # Bounded cross-process lock acquisition. The per-session sidecar ``flock`` is
@@ -610,40 +679,213 @@ def update_metadata_off_loop(
 
 
 SEARCH_MIN_CHARS = 2  # shortest query string that triggers backend search
-SEARCH_MAX_TOKENS = 12  # distinct terms scored per query — see search_query_tokens
+SEARCH_MAX_TOKENS = 12  # distinct REQUIRED needles per query — see parse_search_query
+_SEARCH_MAX_SCORING_EXTRAS = 12  # distinct scoring-only needles (CJK bigrams) per query
 _TITLE_BOOST = 10  # field-boost multiplier for title matches in search_sessions
 _PHRASE_BOOST = 4  # extra weight per exact whole-query hit in a multi-word search
 _SEARCH_SCAN_WINDOW = 500  # cap files scanned per search to bound I/O
+# Recency boost bounds for search_sessions: a session modified now scores
+# ×(1 + _RECENCY_MAX_BOOST); the extra weight halves every
+# _RECENCY_HALF_WEIGHT_DAYS of age and decays toward ×1.0 — never a penalty
+# that could bury an old exact match, only a bounded tiebreaker toward
+# recent work. 1.5 is sized to the canonical complaint: a year-old session
+# matching TWICE must lose to today's session matching once (2 hits × ~1.11
+# aged boost ≈ 2.2 < 1 hit × 2.5 fresh ceiling), while a decisively better
+# old match (3+ hits) still wins — a 1.0 ceiling left the stated 2:1 case
+# unfixed.
+_RECENCY_MAX_BOOST = 1.5
+_RECENCY_HALF_WEIGHT_DAYS = 30.0
+# Weight of a single CJK character needle that came from a longer run. Individual
+# han/kana/hangul characters are extremely common (a function character like "的"
+# can appear hundreds of times in one transcript), so counting them at full weight
+# would let character noise drown out the bigram adjacency signal that actually
+# ranks CJK results. They still gate the AND match at full strength — the weight
+# only dampens their contribution to the relevance score.
+_CJK_CHAR_WEIGHT = 0.25
 
 
-def search_query_tokens(query: str) -> tuple[list[str], str]:
-    """Return ``(tokens, phrase)`` for a search *query*, casefolded.
+def _is_cjk_char(ch: str) -> bool:
+    """True for characters that written Chinese/Japanese/Korean does not space-separate.
 
-    ``tokens`` are the DISTINCT whitespace-separated terms in first-seen order,
-    capped at :data:`SEARCH_MAX_TOKENS`; ``phrase`` is the whole normalized
-    query. Callers requiring every token (:meth:`ConversationLog.search_sessions`)
-    and callers locating one (the snippet builders) share this so the two halves
-    of a query cannot drift apart.
+    Whitespace tokenization silently degrades for these scripts — a whole CJK
+    clause arrives as ONE "token" — so :func:`parse_search_query` segments runs
+    of them instead. The ranges cover the Han ideograph blocks (unified,
+    extension A, the astral extensions, compatibility) and the kana blocks:
+    Chinese and Japanese are written without spaces, which is the named defect.
+    Deliberately NOT Hangul — modern Korean IS space-separated, so its words
+    already arrive as ordinary whitespace tokens and the substring rule serves
+    them; segmenting them would change Korean ranking to fix a failure nobody
+    has reported. Likewise not full-width forms, punctuation, or symbols.
+    """
+    cp = ord(ch)
+    return (
+        0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0x3400 <= cp <= 0x4DBF  # CJK Extension A
+        or 0x20000 <= cp <= 0x2EBEF  # CJK Extensions B..F (astral)
+        or 0xF900 <= cp <= 0xFAFF  # CJK Compatibility Ideographs
+        or 0x3040 <= cp <= 0x30FF  # Hiragana + Katakana
+        or 0x31F0 <= cp <= 0x31FF  # Katakana Phonetic Extensions
+    )
 
-    Both bounds exist because **every token costs one full scan** of a session's
-    text, so token count multiplies search cost on a user-supplied string:
 
-    * Deduplication is free correctness — a repeated term cannot change an AND
-      match, so scanning for it twice buys nothing. A 256-character query of
-      repeated ``"a "`` would otherwise run 128 scans per session instead of 1.
-    * The cap bounds the distinct case, which dedup cannot: 100 distinct short
-      terms is still 100 scans. Truncating makes the query only LOOSER (fewer
-      required terms), so it can admit extra results but never hide a session
-      that would have matched — the safe direction when the alternative is a
-      keystroke-driven search stalling for seconds.
+class SearchNeedle(NamedTuple):
+    """One substring a session search scans for.
 
-    A whitespace-only query yields ``([], "")``; callers treat that as "matches
-    nothing" rather than "matches everything".
+    ``required=True`` needles form the AND gate — a session missing one (in
+    both title and content) is disqualified. ``required=False`` needles only
+    contribute to the relevance score. ``weight`` scales each occurrence's
+    contribution to that score.
+    """
+
+    text: str
+    weight: float
+    required: bool
+
+
+def _script_runs(token: str) -> Iterator[tuple[str, bool]]:
+    """Yield ``(run, is_cjk)`` maximal same-script runs of *token*, in order."""
+    start = 0
+    cur = _is_cjk_char(token[0])
+    for i in range(1, len(token)):
+        nxt = _is_cjk_char(token[i])
+        if nxt != cur:
+            yield token[start:i], cur
+            start, cur = i, nxt
+    yield token[start:], cur
+
+
+def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
+    """Return ``(needles, phrase, adjacency_floor)`` for a search *query*, casefolded.
+
+    ``phrase`` is the whole normalized query. ``needles`` are derived from the
+    DISTINCT whitespace-separated terms in first-seen order; every caller that
+    matches (:meth:`ConversationLog.search_sessions`) or locates
+    (:func:`snippet_needles` for the snippet builders) query text derives from
+    this one parse so the halves of a query cannot drift apart.
+
+    Non-CJK terms become one required, weight-1.0 needle each — the classic
+    substring-AND behavior (``"cont"`` hits ``"contention"``). A run of CJK
+    characters cannot keep that rule: CJK text is written without spaces, so
+    requiring the run verbatim demands the user's exact sentence and a
+    multi-word query like ``"修复内存泄漏"`` would only ever match transcripts
+    containing that literal string. Each CJK run therefore expands to:
+
+    * its individual characters as REQUIRED needles at :data:`_CJK_CHAR_WEIGHT`
+      — maximal recall, since a document discussing all the query's words
+      contains all of its characters regardless of word order; and
+    * its overlapping character bigrams as ADJACENCY needles at weight 1.0 —
+      the standard dictionary-free CJK adjacency signal. They are not
+      individually required, but when a query carries any, a session must hit
+      AT LEAST ONE to qualify (see :meth:`ConversationLog.search_sessions`):
+      individual han/kana characters are so common that a pure character
+      scatter is noise, so the adjacency floor keeps the character gate's
+      recall (words apart still match — each word IS a bigram hit) without
+      letting scatter-only sessions fill the result page. Each occurrence also
+      scores, so documents keeping more of the query adjacent rank higher.
+      A single-character run stays one required, weight-1.0 needle: it IS the
+      whole term.
+
+    Precision moves from the gate into the ranking, which is the module's
+    existing philosophy for the substring-prefix looseness on ASCII terms.
+
+    Bounds (both exist because **every needle costs one full scan** of a
+    session's text): required needles cap at :data:`SEARCH_MAX_TOKENS` and
+    scoring extras at :data:`_SEARCH_MAX_SCORING_EXTRAS`. Deduplication is free
+    correctness — a repeated term cannot change an AND match. Truncation in
+    EITHER set makes the query only LOOSER — fewer required terms, and a
+    truncated adjacency set additionally WAIVES the adjacency floor (the third
+    tuple element comes back ``False``), because enforcing "at least one bigram
+    hit" against a partial bigram set would EXCLUDE a session that matches only
+    a dropped bigram — turning a cost cap into a hidden gate for exactly the
+    long spaceless queries this parse exists to serve. Looser can admit extra
+    results but never hide a session that would have matched — the safe
+    direction when the alternative is a keystroke-driven search stalling for
+    seconds.
+
+    A whitespace-only query yields ``([], "", False)``; callers treat that as
+    "matches nothing" rather than "matches everything".
     """
     parts = query.casefold().split()
     if not parts:
-        return ([], "")
-    return (list(dict.fromkeys(parts))[:SEARCH_MAX_TOKENS], " ".join(parts))
+        return ([], "", False)
+    phrase = " ".join(parts)
+    required: dict[str, float] = {}
+    extras: dict[str, float] = {}
+    for part in dict.fromkeys(parts):
+        for run, is_cjk in _script_runs(part):
+            if not is_cjk or len(run) == 1:
+                required.setdefault(run, 1.0)
+                continue
+            for ch in run:
+                required.setdefault(ch, _CJK_CHAR_WEIGHT)
+            for i in range(len(run) - 1):
+                extras.setdefault(run[i : i + 2], 1.0)
+    needles = [
+        SearchNeedle(text, weight, True)
+        for text, weight in list(required.items())[:SEARCH_MAX_TOKENS]
+    ]
+    needles.extend(
+        SearchNeedle(text, weight, False)
+        for text, weight in list(extras.items())[:_SEARCH_MAX_SCORING_EXTRAS]
+    )
+    adjacency_floor = 0 < len(extras) <= _SEARCH_MAX_SCORING_EXTRAS
+    return (needles, phrase, adjacency_floor)
+
+
+def snippet_needles(query: str) -> list[str]:
+    """Return *query*'s needles ordered for snippet centering, phrase first.
+
+    The snippet builders try needles in order and center the excerpt on the
+    first hit, so ordering is a display-quality decision: the exact phrase is
+    the most meaningful anchor, then full-weight needles (whole terms and CJK
+    bigrams) in first-seen order — preserving the pre-CJK behavior for ASCII
+    queries, where a predictable first-typed-term fallback is part of the
+    contract — and down-weighted lone CJK characters last, the anchor of last
+    resort. Returns ``[]`` for a whitespace-only query.
+    """
+    needles, phrase, _ = parse_search_query(query)
+    if not needles:
+        return []
+    # Stable sort on weight only: within a weight class the parse's insertion
+    # order (required terms first-seen, then bigrams) is the display order.
+    ordered = sorted(needles, key=lambda n: -n.weight)
+    out: list[str] = []
+    for text in (phrase, *(n.text for n in ordered)):
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def needles_match_text(
+    needles: list[SearchNeedle], folded_text: str, adjacency_floor: bool = True
+) -> bool:
+    """True when *folded_text* satisfies the query gate that *needles* encode.
+
+    The single-string form of :meth:`ConversationLog.search_sessions`' match
+    rule, for callers that filter one text field (e.g. Discord session
+    resume's title-only fallback) and must not grow a second spelling of
+    tokenization: every REQUIRED needle must appear as a substring, and when
+    the query carries adjacency (bigram) needles at least one must hit — the
+    same adjacency floor that keeps character scatter out of content search.
+    Pass :func:`parse_search_query`'s ``adjacency_floor`` element: it is
+    ``False`` when the bigram set was truncated, which WAIVES the floor here
+    exactly as in ``search_sessions`` (a partial bigram set cannot prove
+    "no adjacency anywhere"). *folded_text* must already be casefolded
+    (needle texts are).
+    """
+    if not needles:
+        return False
+    adjacency_hit = False
+    has_adjacency = False
+    for needle in needles:
+        if needle.required:
+            if needle.text not in folded_text:
+                return False
+        else:
+            has_adjacency = True
+            if needle.text in folded_text:
+                adjacency_hit = True
+    return adjacency_hit or not has_adjacency or not adjacency_floor
 
 
 # Hard ceilings on the memory the two search memos may hold, in real retained
@@ -2715,15 +2957,26 @@ class ConversationLog:
     def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
         """Return session metadata for files whose message content matches *query*.
 
-        The query is split on whitespace into tokens, and a session matches only
-        when **every** token appears somewhere in its title or content — an AND
-        over the whole document, not a single whole-query substring. That is what
-        makes a natural multi-word query work: ``"ack contention hypotheses"``
-        finds a session discussing all three, which a whole-phrase match missed
-        because those exact words never sit adjacent. A single-token query is
-        unchanged by this — one token IS the phrase.
+        This is the ONE ranking every transcript-search consumer shares — the
+        dashboard history filter, the ``search_chat_history`` MCP tool, and
+        Discord session resume — so the recency weighting and CJK adjacency
+        floor below apply to all of them by design: "the best match for this
+        query" should not depend on which surface asked.
 
-        Each token is matched case-insensitively as a SUBSTRING (so ``"cont"``
+        The query is parsed by :func:`parse_search_query` into needles, and a
+        session matches only when **every** REQUIRED needle appears somewhere in
+        its title or content — an AND over the whole document, not a single
+        whole-query substring. That is what makes a natural multi-word query
+        work: ``"ack contention hypotheses"`` finds a session discussing all
+        three, which a whole-phrase match missed because those exact words never
+        sit adjacent. A single-token query is unchanged by this — one token IS
+        the phrase. CJK terms gate on their individual characters (CJK text has
+        no spaces to split on, so the run itself would demand the user's exact
+        sentence), rank on their character bigrams, and require at least one
+        bigram hit (the adjacency floor) — see :func:`parse_search_query` for
+        the recall/precision split.
+
+        Each needle is matched case-insensitively as a SUBSTRING (so ``"cont"``
         hits ``"contention"``, which keeps search-as-you-type responsive) using
         full Unicode case folding via :meth:`str.casefold` (so e.g. German ``ß``
         folds to ``ss``).  Matching only on parsed ``content`` avoids false
@@ -2732,18 +2985,25 @@ class ConversationLog:
 
         Ranking (higher is better)::
 
-            score = (title_hits * _TITLE_BOOST)
-                  + (content_hits / sqrt(1 + doc_chars / 1024))
+            score = ((title_hits * _TITLE_BOOST)
+                  + (content_hits / sqrt(1 + doc_chars / 1024))) * recency
 
-        where ``*_hits`` sum the per-token counts, plus ``_PHRASE_BOOST`` per
-        occurrence of the exact whole query when it has more than one token.
-        The phrase bonus rewards adjacency: at comparable token frequency, the
-        session containing the words TOGETHER as typed ranks above one that
-        merely mentions them far apart.  It is deliberately a bonus and not an
-        override — a session repeating one token far more often still wins on
-        raw term frequency, exactly as it already did for a single-token query.
-        (Saturating term frequency, BM25-style, would change that; it would also
-        re-rank every existing single-token query, so it is out of scope here.)
+        where ``*_hits`` sum the per-needle weighted counts, plus
+        ``_PHRASE_BOOST`` per occurrence of the exact whole query when it
+        carries more than a single needle. The phrase bonus rewards adjacency:
+        at comparable term frequency, the session containing the words TOGETHER
+        as typed ranks above one that merely mentions them far apart.  It is
+        deliberately a bonus and not an override — a session repeating one term
+        far more often still wins on raw term frequency, exactly as it already
+        did for a single-token query.  (Saturating term frequency, BM25-style,
+        would change that; it would also re-rank every existing single-token
+        query, so it is out of scope here.)
+
+        ``recency`` is a bounded multiplicative boost — ``1 +
+        _RECENCY_MAX_BOOST / (1 + age_days / _RECENCY_HALF_WEIGHT_DAYS)`` — so
+        at comparable relevance today's session outranks last year's, while a
+        decisively better old match still wins (the boost tops out at ×2.5 and
+        never drops below ×1).
 
         Title matches get a strong field boost - titles are short and
         intentional, so a hit there is strong evidence.  Content matches
@@ -2751,23 +3011,27 @@ class ConversationLog:
         casual mention doesn't outrank a short, focused one.  (Simpler
         than BM25's ``(1-b) + b*(dl/avgdl)`` because we avoid the
         two-pass scan needed for corpus stats.)  Sessions missing any
-        token are dropped.  Ties break by recency (existing
+        required needle are dropped.  Ties break by recency (existing
         ``list_sessions`` order - newest first).  Caps results at *limit*.
         Only the ``_SEARCH_SCAN_WINDOW`` most recent files are scored, so
         I/O stays bounded even with hundreds of sessions.
         """
         if not query or limit <= 0 or not self._dir.exists():
             return []
-        tokens, phrase = search_query_tokens(query)
-        if not tokens:
-            # Whitespace-only query: no tokens to require, so nothing can match.
+        needles, phrase, adjacency_floor = parse_search_query(query)
+        if not needles:
+            # Whitespace-only query: no needles to require, so nothing can match.
             # Returning [] keeps this from degenerating into "match everything",
             # and skips reading every session file to reach that conclusion.
             return []
-        # True when the phrase carries more than the single token does, so an
-        # exact-phrase bonus is meaningful. Not `len(tokens) > 1`: dedup collapses
-        # "a a" to one token while its phrase is still two words.
-        multi = tokens != [phrase]
+        required = [n for n in needles if n.required]
+        # True when the phrase carries more than the single needle does, so an
+        # exact-phrase bonus is meaningful. Not a token-count test: dedup
+        # collapses "a a" to one needle while its phrase is still two words, and
+        # a single CJK term expands to several needles while the phrase is what
+        # rewards its characters appearing together.
+        multi = [n.text for n in required] != [phrase]
+        now = _time.time()
         # (score, -rank, meta, needs_snippet)
         scored: list[tuple[float, int, dict, bool]] = []
         window = self.list_sessions()[:_SEARCH_SCAN_WINDOW]
@@ -2775,19 +3039,36 @@ class ConversationLog:
         for rank, meta in enumerate(window):
             doc_chars, folded = self._folded_content(meta["key"])
             title_folded = (meta.get("title") or "").casefold()
-            content_hits = 0
-            title_hits = 0
-            for token in tokens:
-                in_content = folded.count(token) if folded else 0
-                in_title = title_folded.count(token)
-                if not in_content and not in_title:
-                    # AND semantics: one absent token disqualifies the session,
-                    # so stop counting the rest.
-                    content_hits = title_hits = 0
+            content_hits = 0.0
+            title_hits = 0.0
+            adjacency_hits = 0
+            disqualified = False
+            for needle in needles:
+                in_content = folded.count(needle.text) if folded else 0
+                in_title = title_folded.count(needle.text)
+                if needle.required and not in_content and not in_title:
+                    # AND semantics: one absent required needle disqualifies the
+                    # session, so stop counting the rest.
+                    disqualified = True
                     break
-                content_hits += in_content
-                title_hits += in_title
-            if not content_hits and not title_hits:
+                if not needle.required:
+                    adjacency_hits += in_content + in_title
+                content_hits += in_content * needle.weight
+                title_hits += in_title * needle.weight
+            if disqualified or (not content_hits and not title_hits):
+                continue
+            if adjacency_floor and not adjacency_hits:
+                # Adjacency floor: a CJK query whose characters ALL appear but
+                # never once adjacently (no bigram hit anywhere) is a character
+                # scatter, not a word hit. Individual han/kana characters are
+                # common enough that ranking alone cannot keep such noise off a
+                # result page whose real hits number fewer than *limit* — so
+                # scatter-only sessions are excluded, not merely down-ranked. A
+                # document containing the query's words apart still qualifies:
+                # each word is itself a bigram hit. The parse WAIVES the floor
+                # (adjacency_floor=False) when its bigram set was truncated —
+                # judging "no adjacency anywhere" against a partial set would
+                # hide long-query matches (see parse_search_query).
                 continue
             if multi:
                 # Reward the words appearing together, in order, as typed.
@@ -2796,6 +3077,13 @@ class ConversationLog:
                 title_hits += title_folded.count(phrase) * _PHRASE_BOOST
             length_norm = math.sqrt(1 + doc_chars / 1024)
             score = title_hits * _TITLE_BOOST + content_hits / length_norm
+            # Recency boost: multiplicative and bounded to (1.0, 2.5], so a
+            # fresh session with comparable relevance outranks a stale one, but
+            # an old session with a decisively better match still wins — the
+            # boost can at most double a score, never zero one out. Halves its
+            # extra weight every _RECENCY_HALF_WEIGHT_DAYS of age.
+            age_days = max(0.0, now - meta.get("modified", 0.0)) / 86400
+            score *= 1.0 + _RECENCY_MAX_BOOST / (1.0 + age_days / _RECENCY_HALF_WEIGHT_DAYS)
             # Negate rank so a smaller (newer) rank wins ties after score desc sort.
             scored.append((score, -rank, meta, content_hits > 0))
         scored.sort(reverse=True)
@@ -3032,21 +3320,21 @@ class ConversationLog:
         an empty snippet despite a nonzero hit count), but folding can change a
         string's length, so the window may be off by a character or two.
 
-        For a multi-word query the exact phrase is tried first and each token is
-        tried as a fallback, mirroring :meth:`search_sessions`' AND-over-tokens
-        matching — otherwise every session that matched on scattered words would
-        come back with no snippet at all. Needles are tried per message, so the
-        first MESSAGE containing any of them wins rather than the best needle
-        overall; that preserves the streaming early-exit above, and this string
-        is display-only.
+        For a multi-word query the exact phrase is tried first and each needle
+        is tried as a fallback (via :func:`snippet_needles`, highest-signal
+        first), mirroring :meth:`search_sessions`' AND-over-needles matching —
+        otherwise every session that matched on scattered words would come back
+        with no snippet at all. Needles are tried per message, so the first
+        MESSAGE containing any of them wins rather than the best needle overall;
+        that preserves the streaming early-exit above, and this string is
+        display-only.
 
         Returns ``''`` when no needle is locatable in any single message, or
         when the file cannot be read (display-only — never raises at the caller).
         """
-        tokens, phrase = search_query_tokens(query)
-        if not tokens:
+        needles = snippet_needles(query)
+        if not needles:
             return ""
-        needles = [phrase] if tokens == [phrase] else [phrase, *tokens]
         try:
             for text in self._snippet_texts(key):
                 folded = text.casefold()
@@ -4695,10 +4983,29 @@ class HistoryConsolidator:
                 # holding the lock (backfill's FAISS rebuild, reconcile's bulk
                 # UPDATEs) would otherwise block the whole loop here.
                 current_semantic = await asyncio.to_thread(self._vector_store.get_all_semantic)
+
+                def _prompt_value(e: dict) -> object:
+                    # A lesson row stores a mapping; the consolidation model
+                    # should read the rule prose, not a JSON envelope whose
+                    # field names dilute the instruction it is weighing.
+                    if str(e.get("key", "")).startswith("lesson."):
+                        from kiro_crew.vector_memory import _lesson_display_text
+
+                        try:
+                            decoded = json.loads(e["value_json"])
+                        except Exception:
+                            return e["value_json"]
+                        return _lesson_display_text(decoded) or e["value_json"]
+                    return e["value_json"]
+
                 semantic_json = (
                     json.dumps(
                         [
-                            {k: e[k] for k in ("key", "value_json", "confidence")}
+                            {
+                                "key": e["key"],
+                                "value_json": _prompt_value(e),
+                                "confidence": e["confidence"],
+                            }
                             for e in current_semantic
                         ],
                         indent=1,
@@ -4735,15 +5042,22 @@ class HistoryConsolidator:
             # Markdown memory (backward compat when not migrated)
             if not self._migrated:
                 keys.append(
-                    '"preferences_update": The COMPLETE updated preferences file. '
-                    "Merge duplicates, keep only newest if contradicted, remove stale "
-                    "one-off observations. Keep '# User Preferences' header. "
-                    "Return existing content exactly if nothing changed."
+                    '"preferences_update": The COMPLETE updated preferences file, '
+                    "included ONLY if the file needs changes. Merge duplicates, keep "
+                    "only newest if contradicted, remove stale one-off observations. "
+                    "Keep '# User Preferences' header. If nothing changed, OMIT this "
+                    "key entirely — never echo the file back and never answer with a "
+                    "placeholder word like 'unchanged': the value overwrites the file, "
+                    "so when present it must be the full file body."
                 )
                 keys.append(
-                    '"projects_update": The COMPLETE updated projects file. '
-                    "Only active projects, remove stale entries, update facts. "
-                    "Keep '# Active Projects' header. Return existing if unchanged."
+                    '"projects_update": The COMPLETE updated projects file, included '
+                    "ONLY if the file needs changes. Only active projects, remove "
+                    "stale entries, update facts. Keep '# Active Projects' header. "
+                    "If nothing changed, OMIT this key entirely — never echo the file "
+                    "back and never answer with a placeholder word like 'unchanged': "
+                    "the value overwrites the file, so when present it must be the "
+                    "full file body."
                 )
 
             if include_history:
@@ -4822,14 +5136,32 @@ class HistoryConsolidator:
             if self._vector_store:
                 await run_in_embed_pool(self._write_structured_memory, result, key)
 
-            # Markdown writes (backward compat — skip if migrated)
+            # Markdown writes (backward compat — skip if migrated). Each value
+            # replaces the whole file, so a non-file answer (e.g. the literal
+            # word "unchanged") must be discarded, not written: once written it
+            # re-enters the next prompt as the file's current content and primes
+            # every later pass to repeat it (see _is_plausible_memory_file).
             if not self._migrated:
                 if prefs := result.get("preferences_update"):
-                    if prefs.strip() != current_prefs.strip():
+                    if not _is_plausible_memory_file(prefs, "# User Preferences"):
+                        logger.warning(
+                            "Discarding implausible preferences_update from "
+                            "consolidation (missing '# User Preferences' header "
+                            "or placeholder body; %d chars)",
+                            len(prefs),
+                        )
+                    elif prefs.strip() != current_prefs.strip():
                         memory.write_preferences(prefs)
 
                 if projects := result.get("projects_update"):
-                    if projects.strip() != current_projects.strip():
+                    if not _is_plausible_memory_file(projects, "# Active Projects"):
+                        logger.warning(
+                            "Discarding implausible projects_update from "
+                            "consolidation (missing '# Active Projects' header "
+                            "or placeholder body; %d chars)",
+                            len(projects),
+                        )
+                    elif projects.strip() != current_projects.strip():
                         memory.write_projects(projects)
 
             # Lesson extraction: _save_lessons calls write_lesson which embeds
@@ -5084,6 +5416,8 @@ class HistoryConsolidator:
         if isinstance(semantic_items, list):
             written = 0
             deleted = 0
+            skipped = 0
+            refused = 0
             for item in semantic_items[:_MAX_SEMANTIC_PER_CONSOLIDATION]:
                 if not isinstance(item, dict) or "key" not in item:
                     continue
@@ -5092,20 +5426,43 @@ class HistoryConsolidator:
                     if self._vector_store.delete_semantic(item["key"], source):
                         deleted += 1
                     continue
+                if "value" not in item or item["value"] is None:
+                    # Counted and logged here because this path returns before set_semantic, so
+                    # the VALUE_EMPTY reject event never fires for the omission that motivated it.
+                    skipped += 1
+                    logger.warning(
+                        "Semantic consolidation skipped %r: item carries no value", item["key"]
+                    )
+                    continue
                 conf = float(item.get("confidence", 0.5))
                 # Confidence 1.0 means user explicitly stated it — escalate source
                 # so it can overwrite previous user_explicit entries
                 item_source = "user_explicit" if conf >= 1.0 else source
                 err = self._vector_store.set_semantic(
                     key=item["key"],
-                    value=item.get("value"),
+                    value=item["value"],
                     confidence=conf,
                     source=item_source,
                 )
                 if err is None:
                     written += 1
-            if written or deleted:
-                logger.info("Semantic consolidation: %d written, %d deleted", written, deleted)
+                else:
+                    # Counted apart from `skipped`: several reject causes reach here and only
+                    # VALUE_EMPTY is a missing value, so a shared label names the wrong cause.
+                    reject_code, _reason = err
+                    refused += 1
+                    logger.warning(
+                        "Semantic consolidation refused %r: %s", item["key"], reject_code.value
+                    )
+            if written or deleted or skipped or refused:
+                logger.info(
+                    "Semantic consolidation: %d written, %d deleted, %d skipped (no value), "
+                    "%d refused",
+                    written,
+                    deleted,
+                    skipped,
+                    refused,
+                )
 
         # Episodic entries
         episodic_items = result.get("episodic")

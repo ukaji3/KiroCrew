@@ -9,7 +9,7 @@ import pytest
 from kiro_crew.discord.client import DiscordInteraction
 from kiro_crew.discord.commands import parse_command, parse_command_argument
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
-from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import _opt_out_key
 from kiro_crew.session_map import ConversationOwnershipConflict
@@ -96,6 +96,9 @@ class _Sessions:
         self.origin_links: dict[str, ChannelLink] = {}
         self.inbound_keys: set[str] = set()
         self.mirror_opt_outs: set[str] = set()
+        # Every reason a clear was made with, so a test can assert the in-channel
+        # unlink is attributed rather than landing as unattributed in the audit.
+        self.unbind_reasons: list[str] = []
         self.last_key = ""
         self.provider = _Provider()
 
@@ -105,6 +108,7 @@ class _Sessions:
         link: ChannelLink,
         *,
         accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         # Interface parity with the real SessionMap: a conversation is exclusive
         # once it is inbound-committed — this claim is inbound-capable, or an
@@ -160,11 +164,15 @@ class _Sessions:
             if candidate == link and (not inbound_only or key in self.inbound_keys)
         ]
 
-    def clear_mirror_link(self, key: str) -> bool:
+    def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
+        self.unbind_reasons.append(reason)
         self.inbound_keys.discard(key)
         return self.mirror_links.pop(key, None) is not None
 
-    def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
+    def clear_mirror_links_at(
+        self, link: ChannelLink, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> list[str]:
+        self.unbind_reasons.append(reason)
         cleared = self.find_mirror_sessions(link)
         for key in cleared:
             self.inbound_keys.discard(key)
@@ -409,6 +417,32 @@ async def test_sessions_finds_a_session_by_conversation_content() -> None:
 
     # Matched on content despite neither title containing the phrase.
     assert _picker_labels(client) == ["1. Also untitled"]
+
+
+@pytest.mark.asyncio
+async def test_sessions_cjk_query_reaches_title_fallback() -> None:
+    """A spaceless CJK query must trigger the zero-hit TITLE fallback.
+
+    The fallback used to gate on a whitespace word count, which a spaceless
+    CJK query (one "word") never satisfied — so when the shared search found
+    nothing, the fallback silently demanded the literal title substring. The
+    gate now derives from the same parse_search_query needles as the shared
+    search, so a title holding the query's words apart still resolves.
+    """
+    log = _ConversationLog(
+        [
+            {"key": "dashboard_chat-0", "title": "内存的泄漏问题排查", "memory_mode": "persistent"},
+            {"key": "dashboard_chat-1", "title": "Unrelated", "memory_mode": "persistent"},
+        ],
+        {"dashboard:chat-0": [], "dashboard:chat-1": []},
+    )
+    dispatcher, client, _ = _dispatcher({"u1"}, log)
+
+    await dispatcher.handle_message(_message("!session 内存泄漏"))
+
+    # The fake shared search misses (no literal phrase anywhere), so only the
+    # title fallback — running the REAL parse + gate — can produce this row.
+    assert _picker_labels(client) == ["1. 内存的泄漏问题排查"]
 
 
 @pytest.mark.asyncio

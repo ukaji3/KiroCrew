@@ -46,6 +46,7 @@ from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOra
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
@@ -1080,6 +1081,14 @@ _RE_USAGE_LIMIT = re.compile(
 # flipping an otherwise-terminal error.
 _RE_GENERATE_FAILED = re.compile(r"failed to generate a response", re.IGNORECASE)
 
+# kiro-cli's wording for a concurrent in-flight prompt on the session, read by
+# the user-facing formatter below and by `_raise_acp_error`'s AcpPromptBusy
+# classification. One pattern, but two haystacks: the formatter scopes to the
+# provider `data` field while the classifier also searches the JSON-RPC
+# `message`, so an echo carried only by `message` raises AcpPromptBusy under the
+# unrecognised-shape text.
+_PROMPT_BUSY_RE = re.compile(r"already in progress", re.IGNORECASE)
+
 # kiro-cli's envelope for a failure that happened mid-stream. The text after the
 # colon is the provider's own message — the same words the CLI prints in a
 # terminal — so it is what a user needs to see.
@@ -1452,7 +1461,7 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 "to a different model in the picker."
                 f"{req_id_suffix}"
             )
-        elif re.search(r"already in progress", data, re.IGNORECASE):
+        elif _PROMPT_BUSY_RE.search(data):
             # The backend still has an in-flight prompt on this session.
             # This means a previous turn didn't complete cleanly (tool stall,
             # timeout, or race between messages). The session will auto-recover
@@ -1509,9 +1518,6 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
 
 
 # ---------------------------------------------------------------------------
-_PROMPT_BUSY_RE = re.compile(r"already in progress", re.IGNORECASE)
-
-
 def _rejected_model_from_error(error: object) -> str | None:
     """Return the model id a prompt-time error reports as invalid/unavailable.
 
@@ -2092,6 +2098,17 @@ class AcpClient:
     def _is_claude(self) -> bool:
         return self.backend == ACP_BACKEND_CLAUDE
 
+    @property
+    def _is_kiro(self) -> bool:
+        """True when this client drives kiro-cli (the AcpClient default).
+
+        AcpClient serves exactly two backends — kiro-cli and the dormant claude
+        seam — so this is the positive spelling of the sites that used to read
+        ``not self._is_claude`` (harness-parity H5). KAS runs on AcpRuntime, not
+        AcpClient, so it never reaches this property.
+        """
+        return self.backend == ACP_BACKEND_KIRO
+
     def _pooled_mcp_servers(self) -> list[dict[str, Any]]:
         """Broker-stub ``mcpServers`` entries for this session's ``session/new``.
 
@@ -2154,8 +2171,19 @@ class AcpClient:
         """Set a kiro-cli session ID to restore via session/load on next ensure_ready()."""
         self._resume_session_id = sid
 
-    def rekey(self, session_key: str, channel_id: str | None = None) -> None:
-        """Re-key this client for a different session (used by warm pool)."""
+    def rekey(
+        self,
+        session_key: str,
+        channel_id: str | None = None,
+        crew_agent: str = "",
+        watchdog: object | None = None,
+    ) -> None:
+        """Re-key this client for a different session (used by warm pool).
+
+        ``crew_agent`` and ``watchdog`` exist only for signature parity with
+        AcpSessionProvider.rekey (session.py calls provider.client.rekey
+        uniformly): this client's dispatch loop carries no per-agent watchdog
+        snapshot, so both are accepted and deliberately not stored."""
         self._session_key = session_key
         self._channel_id = channel_id
         self._last_activity = time.monotonic()
@@ -2195,7 +2223,7 @@ class AcpClient:
         # instead of calling into here — otherwise the same stale setting that is
         # quietly withheld on a cold start would raise and kill a warm claim,
         # making the outcome depend on whether a pooled process happened to exist.
-        if not self._is_claude and self._model_is_unusable(model_id):
+        if self._is_kiro and self._model_is_unusable(model_id):
             _rejected_log, _ = redact_exfiltration_urls(str(model_id))
             _rejected_log, _ = redact_credentials(_rejected_log)
             raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids())
@@ -2310,7 +2338,7 @@ class AcpClient:
         if not self._model or self._model == DEFAULT_MODEL:
             logger.info("ACP model: %s (from agent config)", self._model or "auto")
             return
-        if not self._is_claude and self._model_is_unusable(self._model):
+        if self._is_kiro and self._model_is_unusable(self._model):
             _withheld_log, _ = redact_exfiltration_urls(str(self._model))
             _withheld_log, _ = redact_credentials(_withheld_log)
             logger.warning(
@@ -2611,7 +2639,7 @@ class AcpClient:
         # ONE thread hop. Guarded: the sandbox temp file is live, so a
         # cancellation here must not orphan it.
         env = await self._to_thread_guarding_sandbox(
-            functools.partial(_resolve_spawn_env, kiro_api_key=not self._is_claude), env
+            functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
         )
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
@@ -3176,7 +3204,7 @@ class AcpClient:
 
         # Seek to end of JSONL so we only read new tool results.
         # claude-agent-acp stores sessions via its own SDK, not ~/.kiro/ — skip.
-        if self._session_id and not self._is_claude:
+        if self._session_id and self._is_kiro:
             _jpath = kiro_sessions_dir() / f"{self._session_id}.jsonl"
             try:
                 self._jsonl_pos = _jpath.stat().st_size if _jpath.exists() else 0
@@ -3192,7 +3220,7 @@ class AcpClient:
         #    default (broader) mode, which for a restricted agent is a privilege
         #    escalation. Self-heal (B, in _spawn) regenerates the managed default
         #    so the common case never reaches this branch.
-        if not self._is_claude:
+        if self._is_kiro:
             if not self._modes_advertised or self._agent in self._available_mode_ids:
                 await self._send_request(
                     METHOD_SET_MODE,
@@ -5320,34 +5348,37 @@ class AcpClient:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if entry.get("kind") == "ToolResults":
-                        for c in entry.get("data", {}).get("content", []):
-                            if c.get("kind") == "toolResult":
-                                tr = c.get("data")
-                                if not isinstance(tr, dict):
-                                    continue
-                                tool_use_id = tr.get("toolUseId", "")
-                                output_parts: list[str] = []
-                                for rc in tr.get("content", []):
-                                    if isinstance(rc, dict):
-                                        if rc.get("kind") == "json":
-                                            d = rc.get("data", {})
-                                            if isinstance(d, dict) and "stdout" in d:
-                                                out = d.get("stdout", "")
-                                                if out:
-                                                    output_parts.append(out[:4000])
-                                            else:
-                                                output_parts.append(json.dumps(d, indent=2)[:4000])
-                                        elif rc.get("kind") == "text":
-                                            output_parts.append(str(rc.get("data", ""))[:4000])
-                                if output_parts:
-                                    results.append(
-                                        AcpEvent(
-                                            kind=EVENT_TOOL_RESULT,
-                                            tool_call_id=tool_use_id,
-                                            tool_output="\n".join(output_parts)[:8000],
-                                        )
-                                    )
+                    if entry.get("kind") != "ToolResults":
+                        continue
+                    for c in entry.get("data", {}).get("content", []):
+                        if c.get("kind") != "toolResult":
+                            continue
+                        tr = c.get("data")
+                        if not isinstance(tr, dict):
+                            continue
+                        tool_use_id = tr.get("toolUseId", "")
+                        output_parts: list[str] = []
+                        for rc in tr.get("content", []):
+                            if not isinstance(rc, dict):
+                                continue
+                            if rc.get("kind") == "json":
+                                d = rc.get("data", {})
+                                if isinstance(d, dict) and "stdout" in d:
+                                    out = d.get("stdout", "")
+                                    if out:
+                                        output_parts.append(out[:4000])
+                                else:
+                                    output_parts.append(json.dumps(d, indent=2)[:4000])
+                            elif rc.get("kind") == "text":
+                                output_parts.append(str(rc.get("data", ""))[:4000])
+                        if output_parts:
+                            results.append(
+                                AcpEvent(
+                                    kind=EVENT_TOOL_RESULT,
+                                    tool_call_id=tool_use_id,
+                                    tool_output="\n".join(output_parts)[:8000],
+                                )
+                            )
         except Exception:
             logger.debug("Failed to read JSONL for tool results", exc_info=True)
         if results:
@@ -5522,66 +5553,29 @@ class AcpClient:
         )
 
     def _backfill_context_window(self, pct: float) -> None:
-        """Derive window/used tokens when kiro-cli 2.10+ metadata gives only a
-        percentage (no usage_update {used, size}).
+        """Derive window/used tokens from a percentage-only reading.
 
-        Resolves the window through the central ``model_registry.model_window``
-        authority (kiro-list cache > static registry > [1m] heuristic). This now
-        works for non-Anthropic kiro models too (GPT 272k, DeepSeek 164k, …) once
-        the kiro-list cache is seeded, instead of no-op'ing. Only backfills a
-        window from a KNOWN source (``has_known_window``): a genuinely-unknown
-        model returns None and we leave the window 0 so the frontend's own
-        authoritative window (from /api/models) drives the meter rather than a
-        guess. kiro's real ``usage_update.size`` always wins when present (this
-        no-ops once it has set the window).
-
-        A surviving ``context_window_tokens`` outranks the registry: after a
-        compaction reset the counts are dropped but the SERVED window is kept
-        (the model did not change), and the served size can differ from the
-        registry's static entry (e.g. opus served at [1m] vs a 200K registry
-        row). Deriving against the kept window keeps the post-compaction
-        numbers consistent with what the adapter actually serves.
+        Thin wrapper binding this client's resolved model id; the shared logic
+        lives on ``AcpPromptStats.backfill_context_window`` (the AcpSessionHandle
+        path delegates to the same method, so the two can no longer drift).
         """
-        if self.last_prompt_stats.context_tokens_from_usage:
-            return  # a real usage_update already set authoritative counts
-        win = self.last_prompt_stats.context_window_tokens
-        if not win or win <= 0:
-            model_id = self._resolved_model_id or self._model
-            if not model_id or not model_registry.has_known_window(model_id):
-                return
-            reg_win = model_registry.model_window(model_id)
-            if not reg_win or reg_win <= 0:
-                return
-            win = int(reg_win)
-            self.last_prompt_stats.context_window_tokens = win
-        # A malformed metadata percentage (NaN, ±inf, or a huge finite value
-        # like 1e308) would overflow ``round(win * pct / 100)`` and abort the
-        # turn. Sanitize to a sane [0, 100] before deriving used tokens (NaN
-        # -> 0); this also keeps used <= window.
-        safe_pct = 0.0 if pct != pct else min(max(pct, 0.0), 100.0)
-        self.last_prompt_stats.context_used_tokens = round(win * safe_pct / 100.0)
+        self.last_prompt_stats.backfill_context_window(
+            pct, self._resolved_model_id or self._model
+        )
 
     def _track_metadata(self, msg: JsonRpcMessage) -> None:
         params = msg.params or {}
-        pct = params.get("contextUsagePercentage")
         # A real usage_update is authoritative for both the token counts AND the
         # pct derived from them. kiro's metadata percentage can measure a
         # different window, so applying it here would desync the headline % from
         # the "used / total" token text (e.g. 73% shown next to 408K / 1000K).
-        if pct is not None and not self.last_prompt_stats.context_tokens_from_usage:
-            try:
-                pct_f = float(pct)
-                # Sanitize a malformed metadata percentage (NaN/±inf/out-of-range,
-                # e.g. 1e308) at the source so context_pct is always a real
-                # [0, 100] value: keeps compaction comparisons sane and the
-                # diagnostic /api/sessions JSON standard (Infinity/NaN are not
-                # valid JSON). NaN is caught by its self-inequality.
-                pct_f = 0.0 if pct_f != pct_f else min(max(pct_f, 0.0), 100.0)
-                self.last_prompt_stats.context_pct = pct_f
-                self.last_prompt_stats.note_pct_reported()
-                self._backfill_context_window(pct_f)
-            except (TypeError, ValueError):
-                pass
+        # sanitize_pct is the shared coercion (the KAS usagePercentage path uses
+        # it too): it clamps NaN/±inf/out-of-range and returns None when absent.
+        pct_f = self.last_prompt_stats.sanitize_pct(params.get("contextUsagePercentage"))
+        if pct_f is not None and not self.last_prompt_stats.context_tokens_from_usage:
+            self.last_prompt_stats.context_pct = pct_f
+            self.last_prompt_stats.note_pct_reported()
+            self._backfill_context_window(pct_f)
         # kiro streams per-turn billing as meteringUsage entries (unit="credit").
         # Accumulate across the turn's metadata notifications; reset per turn by
         # the AcpPromptStats re-init in _dispatch_events/send_message_stream.

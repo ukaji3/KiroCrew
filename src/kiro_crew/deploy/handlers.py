@@ -36,6 +36,7 @@ from kiro_crew.deploy import pricing as pricing_mod
 from kiro_crew.deploy import profiles as profiles_mod
 from kiro_crew.deploy.render import render_standalone
 from kiro_crew.deploy.scan import Finding, is_credential_finding, scan_content, summarize
+from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_reason
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
@@ -105,10 +106,10 @@ def _sanitize_response(payload: Any) -> Any:
     """Recursively apply credential + exfiltration redaction to all str values in a response payload.
 
     Deploy handler error responses echo LLM-controlled values (local_dir,
-    site_id, profile) without BOTH redaction passes. This helper walks dict/list
-    structures and applies _redact_text to every str leaf. Applied at the three
-    chokepoint handlers (_handle_deploy, _handle_recall, _handle_destroy) so
-    ALL paths through _do_* are covered in one place.
+    site_id, profile), which need BOTH redaction passes. This helper walks
+    dict/list structures and applies _redact_text to every str leaf. Applied at
+    the three chokepoint handlers (_handle_deploy, _handle_recall,
+    _handle_destroy) so ALL paths through _do_* are covered in one place.
     """
     if isinstance(payload, str):
         return _redact_text(payload)
@@ -130,8 +131,7 @@ def _redact_profile_fields(profiles: list[dict[str, Any]]) -> list[dict[str, Any
         entry: dict[str, Any] = {}
         for k, v in p.items():
             if isinstance(v, str) and v:
-                v, _ = redact_credentials(v)
-                v, _ = redact_exfiltration_urls(v)
+                v = _redact_text(v)
             entry[k] = v
         out.append(entry)
     return out
@@ -210,10 +210,7 @@ def _safe_err(exc: BaseException) -> str:
     AWS CLI stderr can contain credential fragments (access key ids, session
     tokens, etc.) — never surface the raw exception in response payloads.
     """
-    msg = str(exc)
-    msg, _ = redact_credentials(msg)
-    msg, _ = redact_exfiltration_urls(msg)
-    return msg
+    return _redact_text(str(exc))
 
 
 # --- local_dir input validation (security-controls) ------------
@@ -303,7 +300,7 @@ def _allowed_local_roots() -> list[Path]:
                 pass
     except Exception:
         pass
-    # Always allow the deploy staging dir (for artifact staging, F2/F3).
+    # Always allow the deploy staging dir, where artifacts are staged for publish.
     try:
         sr = _staging_root()
         roots.append(sr.resolve())
@@ -1307,8 +1304,6 @@ def _internal_denied(func):  # type: ignore[no-untyped-def]
     A new handler without this decorator (and not in the allowlist) will trip the
     registration-time assertion in register_routes.
     """
-    import functools
-
     @functools.wraps(func)
     async def _wrapper(request: web.Request) -> web.Response:
         if _is_internal_secret_request(request):
@@ -1384,6 +1379,29 @@ async def _handle_deploy(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "deploy")
     if denied:
         return denied
+    # Publish-governance ceiling for THIS destination. The provider registry
+    # already hides the button when this denies, but a hidden button is not a
+    # control — the endpoint is reachable directly (and by the MCP preview path),
+    # so the decision is re-made here. Same chokepoint as artifact publish, so an
+    # operator has one place to close every publish destination.
+    #
+    # Off the loop: the decision reads the trust-root policy, every governance
+    # profile, and config.json from disk. On a slow or contended data home that
+    # walk would stall the gateway and its heartbeat for every caller, not just
+    # this request — the provider-registry call site is offloaded for the same
+    # reason.
+    reason = await asyncio.to_thread(
+        publish_denied_reason, request, DEPLOY_WEB_PROVIDER_ID
+    )
+    if reason:
+        _audit("deploy", "", "denied", error=reason)
+        return web.json_response(
+            {
+                "error": f"public web deploy is disabled by policy: {reason}",
+                "code": "publish_destination_disabled",
+            },
+            status=403,
+        )
     params = _strip_confirm_for_internal(request, await _json_body(request))
     status, payload = await _do_deploy(params)
     return web.json_response(_sanitize_response(payload), status=status)
@@ -2048,6 +2066,23 @@ async def _handle_pending_confirm(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "pending_confirm")
     if denied:
         return denied
+    # Publish-governance ceiling, re-made at confirm time: a pending entry
+    # created before the operator closed the destination must NOT still be
+    # confirmable. Checked BEFORE claim_pending so a denied confirm leaves the
+    # entry intact rather than consuming it. Off the loop for the same reason as
+    # the deploy handler — the decision reads policy, profiles and config from disk.
+    reason = await asyncio.to_thread(
+        publish_denied_reason, request, DEPLOY_WEB_PROVIDER_ID
+    )
+    if reason:
+        _audit("pending_confirm", request.match_info.get("id", ""), "denied", error=reason)
+        return web.json_response(
+            {
+                "error": f"public web deploy is disabled by policy: {reason}",
+                "code": "publish_destination_disabled",
+            },
+            status=403,
+        )
     entry_id = request.match_info["id"]
     from kiro_crew.deploy.pending import add_pending, claim_pending
     entry = await asyncio.to_thread(claim_pending, entry_id)

@@ -64,6 +64,23 @@ _CHANNEL_SESSION_PREFIXES: tuple[str, ...] = tuple(
 )
 
 
+def _in_namespace(key: str, ns: str) -> bool:
+    """True when *key* sits in namespace *ns*, in either separator spelling.
+
+    Both separators must be accepted: a live session key uses ``:`` while the
+    persisted filename stem uses ``_`` (see :data:`_CHANNEL_SESSION_PREFIXES`).
+    This is the per-namespace form, for callers that need to know WHICH
+    namespace matched; :data:`_CHANNEL_SESSION_PREFIXES` is the flattened
+    equivalent for a yes/no over every CHANNEL namespace. Also called with the
+    ``_TELEMETRY_LOCAL_PREFIXES`` names, which that tuple deliberately excludes.
+
+    ``sel.py``'s audit-source attributor and ``context._runtime_display_name``
+    spell the same pair separately, on a LOWERCASED key over a narrower set and
+    with a ``"slack"`` fallback — do not consolidate them onto this helper.
+    """
+    return key.startswith((f"{ns}:", f"{ns}_"))
+
+
 def is_channel_session_key(key: str) -> bool:
     """True when *key* is a session started on a messaging channel.
 
@@ -81,7 +98,7 @@ def is_channel_session_key(key: str) -> bool:
 def channel_namespace_of(key: str) -> str:
     """Return the channel namespace of *key*, or ``""`` if it is not a channel key."""
     for ns in CHANNEL_SESSION_NAMESPACES:
-        if key.startswith((f"{ns}:", f"{ns}_")):
+        if _in_namespace(key, ns):
             return ns
     return ""
 
@@ -147,7 +164,7 @@ def telemetry_channel_of(key: str | None) -> str:
     if ns:
         return ns
     for prefix, label in _TELEMETRY_LOCAL_PREFIXES:
-        if key.startswith((f"{prefix}:", f"{prefix}_")):
+        if _in_namespace(key, prefix):
             return label
     if _TELEMETRY_CHAT_SLOT_RE.match(key):
         return "dashboard"
@@ -185,6 +202,52 @@ class ChannelLink:
 def session_key(channel_type: str, conversation_id: str) -> str:
     """Build a namespaced session key, e.g. ``slack:123.456``."""
     return f"{channel_type}:{conversation_id}"
+
+
+# ── Unbind reasons: why an inbound resume binding was lost ───────────────────
+# The audited vocabulary, kept in this leaf module because both sides need it:
+# ``SessionMap`` stamps it on the audit event and normalizes to it, and the
+# transports that clear a binding pass it. Every clearing call site names one of
+# these constants — a bare literal grows a spelling the audit cannot group by, so
+# ``UNBIND_REASONS`` below is the closed set.
+
+# No caller named a reason. Its appearance in the trail is itself the finding: it
+# names a clearing path that has not been threaded yet.
+UNBIND_REASON_UNSPECIFIED = "unspecified"
+
+# The user asked for it in the conversation and got a reply there, so a notice
+# would be an echo. The audit still happens; only the announcement is suppressed,
+# and the suppressing side is the listener rather than the map.
+UNBIND_REASON_USER_UNLINK = "user_unlink"
+
+# The dashboard's mirror-unlink endpoint. The click happens on a surface the bound
+# channel cannot see, so this is the reason the notice exists for.
+UNBIND_REASON_DASHBOARD_UNLINK = "dashboard_unlink"
+
+# A transport re-binding the conversation it is being read in as its own origin
+# mirror, which displaces whatever binding that key held.
+UNBIND_REASON_ORIGIN_REBIND = "origin_rebind"
+
+# An explicit, irreversible session teardown; the entry and every binding on it go.
+UNBIND_REASON_SESSION_DESTROYED = "session_destroyed"
+
+# A whole-entry delete whose caller named no motive — the shape of the removal
+# rather than its cause.
+UNBIND_REASON_ENTRY_DELETED = "entry_deleted"
+
+#: The closed vocabulary. A reason outside this set is normalized to
+#: ``unspecified`` at the map's choke point, so it can neither fragment the audit
+#: trail nor reach the channel notice's phrasing map as a miss.
+UNBIND_REASONS: frozenset[str] = frozenset(
+    {
+        UNBIND_REASON_UNSPECIFIED,
+        UNBIND_REASON_USER_UNLINK,
+        UNBIND_REASON_DASHBOARD_UNLINK,
+        UNBIND_REASON_ORIGIN_REBIND,
+        UNBIND_REASON_SESSION_DESTROYED,
+        UNBIND_REASON_ENTRY_DELETED,
+    }
+)
 
 
 # ── Canonical address parsing (RFC §9 rule 4: exactly ONE parser module) ──
@@ -424,9 +487,13 @@ def release_conversation_location(
     the opt-out write) still gets a single write.
     """
     with sessions.batched_save():
-        cleared = int(sessions.clear_mirror_link(key))
-        cleared += int(sessions.clear_mirror_link(legacy_dashboard_mirror_key(key)))
-        swept = sessions.clear_mirror_links_at(location)
+        cleared = int(sessions.clear_mirror_link(key, reason=UNBIND_REASON_USER_UNLINK))
+        cleared += int(
+            sessions.clear_mirror_link(
+                legacy_dashboard_mirror_key(key), reason=UNBIND_REASON_USER_UNLINK
+            )
+        )
+        swept = sessions.clear_mirror_links_at(location, reason=UNBIND_REASON_USER_UNLINK)
     if swept:
         logger.info(
             "%s: unlink swept %d mirror binding(s) at this conversation: %s",

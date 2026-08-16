@@ -30,6 +30,7 @@ from kiro_crew import platform_compat
 from kiro_crew.acp._dispatch import (
     build_session_new_params,
     parse_session_modes,
+    redact_text,
     set_mode_params,
 )
 from kiro_crew.acp.client import (
@@ -58,6 +59,7 @@ from kiro_crew.acp.session_handle import (
     AcpRuntimeError,
     AcpRuntimeProtocol,
     AcpSessionHandle,
+    _load_watchdog_settings,
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -71,10 +73,13 @@ from kiro_crew.acp.types import (
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_MCP_SERVER_INIT_FAILURE,
     METHOD_MCP_SERVER_INITIALIZED,
+    METHOD_REQUEST_PERMISSION,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
     METHOD_SESSION_TERMINATE,
+    METHOD_SESSION_UPDATE,
     METHOD_SET_MODE,
+    METHOD_SUBAGENT_LIST_UPDATE,
     JsonRpcMessage,
     JsonRpcRequest,
 )
@@ -135,6 +140,9 @@ _REQUEST_TIMEOUT = 30.0
 # it (observed: remaining servers register within ~1s after the wait; a
 # 71-server agent with no pending OAuth completes in ~14s) — do NOT "tidy" it
 # back down to _REQUEST_TIMEOUT. See issue #2946.
+# This is the built-in default AND floor; ``agent.session_start_timeout_secs``
+# raises it for agents whose MCP fleet legitimately needs longer (see
+# _resolve_session_start_timeout below).
 _SESSION_NEW_TIMEOUT = 90.0
 _INIT_NOTIFICATION_BUFFER_LIMIT = 100
 # Teardown must be snappy: a session is usually terminated on a hot path
@@ -232,6 +240,35 @@ _DROP_NO_SESSION = "-"
 # string: an absent `method`, or a value of the wrong JSON type (see
 # _drop_key_part).
 _DROP_KEY_PLACEHOLDER = "?"
+
+
+def _reject_option_id(params: dict) -> str | None:
+    """The least-destructive reject optionId a permission request advertises.
+
+    Used when auto-answering a ``session/request_permission`` for a session
+    this client never registered (a backend-internal subagent). Prefer the
+    request's own ``reject_once``-kind option; fall back to a legacy id that
+    names reject. ``None`` means the caller must answer with the ``cancelled``
+    outcome instead — kiro-cli maps that to cancelling the child's turn, which
+    is strictly worse than a per-tool reject, so this is the last resort.
+    """
+    raw = params.get("options")
+    if not isinstance(raw, list):
+        return None
+    options = [o for o in raw if isinstance(o, dict)]
+    for want_kind in ("reject_once", "reject_always"):
+        for opt in options:
+            opt_id = opt.get("optionId") or opt.get("id")
+            if opt.get("kind") == want_kind and isinstance(opt_id, str) and opt_id:
+                return opt_id
+    # Legacy kiro payloads omit `kind` — match well-known reject ids only, so
+    # an allow option can never be picked by accident.
+    for opt in options:
+        opt_id = opt.get("optionId") or opt.get("id")
+        if isinstance(opt_id, str) and opt_id in ("reject_once", "reject_always", "reject"):
+            return opt_id
+    return None
+
 
 KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
@@ -490,6 +527,29 @@ def _get_rss_tree_mb(pid: int) -> float | None:
     return total_kib / 1024.0
 
 
+def _resolve_session_start_timeout() -> float:
+    """Snapshot ``agent.session_start_timeout_secs`` from config.
+
+    Function-level import (mirrors ``_load_watchdog_settings`` in
+    session_handle.py) avoids the config -> dashboard -> acp import cycle;
+    any failure falls back to the built-in default rather than breaking a
+    runtime. The loader clamps the on-disk value to
+    [SESSION_START_TIMEOUT_MIN, SESSION_START_TIMEOUT_MAX]; the ``max`` here
+    is belt-and-braces so a degraded load can never shrink the budget below
+    the built-in floor — a session-start budget under the backend's 30s OAuth
+    wait recreates the race issue #2946 fixed.
+    """
+    try:
+        # circular import: config.loader -> dashboard -> session -> acp
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig.load()
+        return max(_SESSION_NEW_TIMEOUT, float(cfg.agent.session_start_timeout_secs))
+    except Exception:
+        logger.debug("session-start timeout load failed — using default", exc_info=True)
+        return _SESSION_NEW_TIMEOUT
+
+
 class AcpRuntime:
     """Owns one kiro-cli acp subprocess with single-reader demux.
 
@@ -515,6 +575,7 @@ class AcpRuntime:
         model: str | None = None,
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
+        crew_agent: str = "",
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -525,6 +586,12 @@ class AcpRuntime:
 
             self._work_dir = config_dir() / "workspace"
         self._agent = agent
+        # Canonical Kiro Crew agent identity (a cfg.agents key) resolved by the
+        # surface that created this runtime — a DIFFERENT namespace from
+        # ``agent`` (the kiro template the process spawns with). Default for
+        # sessions created on this runtime; a warm-pool rekey overwrites it so
+        # later sessions inherit the claiming crew, not the pool's spawn state.
+        self._crew_agent = crew_agent
         self._acp_backend = acp_backend
         if model is not None:
             if not MODEL_ID_RE.match(model):
@@ -555,6 +622,13 @@ class AcpRuntime:
         # bound unbounded growth.
         self._max_age_secs = max_age_secs
         self._max_rss_mb = max_rss_mb
+
+        # session/new + session/load budget — resolved lazily on first use
+        # (never in __init__: KiroCrewConfig.load() is a synchronous disk
+        # read + schema validation on a cache miss, and runtimes are
+        # constructed on the event loop) and cached for the runtime's
+        # lifetime. See _session_start_budget().
+        self._session_start_timeout: float | None = None
 
         # Process state
         self._process: asyncio.subprocess.Process | None = None
@@ -603,6 +677,20 @@ class AcpRuntime:
         # dict needs no lock — asyncio.ensure_future(self._reader_loop()) is
         # called exactly once, in spawn(), and never re-entered.
         self._dropped_frames: dict[tuple[str, str], int] = {}
+        # In-flight SEL audit tasks for auto-rejected permission requests;
+        # held only to keep them alive (see _answer_unroutable_permission).
+        self._audit_tasks: set[asyncio.Task] = set()
+        # Backend-internal subagent session ids, snapshotted from each
+        # `_kiro.dev/subagent/list_update` frame (a FULL list every time, so
+        # replacement — not accumulation — keeps it bounded and current).
+        # Membership proves an unregistered sessionId is a real backend child.
+        # `_subagent_owner` records WHICH registered session was the sole
+        # consumer when the announce arrived — routing later requires the sole
+        # queue to still be that exact session, so a warm-reused runtime whose
+        # session was swapped can never inherit a stale child's approvals.
+        # Both are cleared when the owning session unregisters.
+        self._subagent_sessions: set[str] = set()
+        self._subagent_owner: str | None = None
         self._dropped_frames_flushed_at: float = 0.0
 
     @property
@@ -841,7 +929,7 @@ class AcpRuntime:
                 strip_kiro_cli_api_key,
             )
 
-            if self._acp_backend != ACP_BACKEND_KAS:
+            if self._acp_backend == ACP_BACKEND_KIRO:
                 inject_kiro_cli_api_key(env)
             else:
                 strip_kiro_cli_api_key(env)
@@ -1055,6 +1143,106 @@ class AcpRuntime:
 
     # ── Reader Task (single owner of stdout) ──
 
+    def _snapshot_subagent_sessions(self, params: dict) -> None:
+        """Replace the known backend-subagent session-id set from a list_update.
+
+        The frame carries the backend's FULL current subagent list (kiro-cli
+        rebuilds it from `orchestrated_sessions` on every change), so replacing
+        the set keeps it bounded and self-cleaning: terminated children vanish
+        from the next update. Ids are backend-controlled — length-capped and
+        type-checked so a hostile payload cannot grow memory unboundedly.
+        """
+        raw = params.get("subagents")
+        if not isinstance(raw, list):
+            return
+        ids: set[str] = set()
+        for entry in raw[:256]:
+            if not isinstance(entry, dict):
+                continue
+            sid = entry.get("sessionId") or entry.get("session_id")
+            if isinstance(sid, str) and sid and len(sid) <= 128:
+                ids.add(sid)
+        self._subagent_sessions = ids
+        # Ownership is provable only when exactly one session is registered:
+        # the announce demonstrably belongs to it. Otherwise no owner, and
+        # routing stays fail-closed.
+        self._subagent_owner = (
+            next(iter(self._session_queues)) if len(self._session_queues) == 1 else None
+        )
+
+    async def _answer_unroutable_permission(self, msg: JsonRpcMessage, session_id: str) -> None:
+        """Answer a permission REQUEST for a session with no registered queue.
+
+        The ACP contract for a server→client request is that the client always
+        replies; kiro-cli's own TUI answers even unowned-session permission
+        requests (``cancelled``) rather than dropping them. Auto-reject is
+        deliberate and conservative: never auto-approve here — no policy engine
+        has seen this tool call, and an approve would grant an invisible
+        escalation. Per-frame WARNING is safe (unlike the drop counter's flood
+        case): each request corresponds to one pending tool approval and the
+        backend cannot re-emit it without a new turn.
+        """
+        params = msg.params if isinstance(msg.params, dict) else {}
+        option_id = _reject_option_id(params)
+        if option_id is not None:
+            result = {"outcome": {"outcome": "selected", "optionId": option_id}}
+        else:
+            result = {"outcome": {"outcome": "cancelled"}}
+        tool_call = params.get("toolCall")
+        raw_title = tool_call.get("title") if isinstance(tool_call, dict) else None
+        # The title is backend/LLM-authored and may embed a credential-bearing
+        # command line — redact BEFORE truncating (truncation first could clip
+        # a secret mid-token so the redaction patterns no longer match, leaking
+        # a credential prefix into the logs).
+        title = redact_text(str(raw_title))[:120] if raw_title else "<unknown>"
+        logger.warning(
+            "auto-rejected permission request id=%s for unregistered session %s "
+            "(tool: %s): no surface on this client can answer it; answering with "
+            "%s so the backend subagent gets a tool error instead of hanging",
+            msg.id,
+            session_id,
+            title,
+            result["outcome"]["outcome"],
+        )
+        try:
+            await self.send_response(msg.id, result)
+        except AcpRuntimeDead:
+            # Runtime died mid-answer; the backend's wait dies with it.
+            return
+        # Every permission decision is SEL-audited (repo convention; the
+        # dashboard deny path does the same). Audited AFTER the response and
+        # OFF the reader task: sel() may do blocking filesystem work on first
+        # use (e.g. Windows ACLs), and this coroutine runs inline in the
+        # single-owner reader — blocking here stalls every multiplexed
+        # session. The decision is already "deny", so an audit failure must
+        # not undo or delay it; the failure is swallowed after logging.
+        # Lazy import: runtime is low-level and a module-level import of
+        # kiro_crew.sel would be circular (same pattern as sandbox.py).
+        request_id = msg.id if isinstance(msg.id, (str, int)) else ""
+
+        def _audit() -> None:
+            try:
+                from kiro_crew.sel import sel
+
+                sel().log_tool_invocation(
+                    session_key=f"acp:{session_id}",
+                    agent="kirocrew",
+                    source="acp_runtime",
+                    tool_name=title,
+                    outcome="denied",
+                    request_id=request_id,
+                    error="unregistered_session_auto_reject",
+                )
+            except Exception:
+                logger.exception("SEL audit for auto-rejected permission failed")
+
+        audit_task = asyncio.ensure_future(asyncio.to_thread(_audit))
+        # Retain the task so it cannot be garbage-collected mid-flight; the
+        # done callback drops the reference and surfaces nothing (audit
+        # failures are already logged inside _audit).
+        self._audit_tasks.add(audit_task)
+        audit_task.add_done_callback(self._audit_tasks.discard)
+
     def _note_dropped_frame(self, session_id: object, method: object) -> None:
         """Count one unroutable frame, flushing a summary at most once per interval.
 
@@ -1260,6 +1448,11 @@ class AcpRuntime:
 
                 # Route notifications by sessionId
                 session_id = (msg.params or {}).get("sessionId")
+                if not session_id and msg.is_method(METHOD_SUBAGENT_LIST_UPDATE):
+                    # Snapshot backend-internal subagent session ids before the
+                    # broadcast below delivers the frame to the UI consumers.
+                    # Each frame carries the FULL current list, so replace.
+                    self._snapshot_subagent_sessions(msg.params or {})
                 if session_id:
                     # A frame tagged with a sessionId belongs to exactly one
                     # session. Route to it if registered; otherwise DROP it.
@@ -1268,6 +1461,46 @@ class AcpRuntime:
                     queue = self._session_queues.get(session_id)
                     if queue is not None:
                         await queue.put(msg)
+                    elif (
+                        session_id in self._subagent_sessions
+                        and self._subagent_owner is not None
+                        and list(self._session_queues) == [self._subagent_owner]
+                        and (
+                            msg.is_method(METHOD_REQUEST_PERMISSION)
+                            or msg.is_method(METHOD_SESSION_UPDATE)
+                        )
+                    ):
+                        # A frame for a backend-internal subagent the backend
+                        # itself announced via `subagent/list_update`, on a
+                        # runtime with an UNAMBIGUOUS consumer (exactly one
+                        # registered session — the dashboard-slot shape).
+                        #
+                        # - session/update: routed so the consumer's
+                        #   per-toolCallId caches capture the child's REAL
+                        #   command bytes; the handle re-tags them as crew
+                        #   activity, never as parent transcript.
+                        # - session/request_permission: routed so the child's
+                        #   approval flows through the exact policy pipeline a
+                        #   main-agent approval takes — with the command bytes
+                        #   above, mode behavior (normal/read/trust/yolo) is
+                        #   IDENTICAL to the main agent's. Dropping a REQUEST
+                        #   is never an option: it strands the backend's
+                        #   response oneshot and wedges the child's whole tool
+                        #   batch until process teardown (2h incident,
+                        #   2026-08-15, 13 approvals hung invisibly).
+                        #
+                        # With several registered sessions the frame names no
+                        # owner; a permission request then falls to the
+                        # fail-closed auto-answer below and updates are
+                        # counted drops as before.
+                        await next(iter(self._session_queues.values())).put(msg)
+                    elif msg.id is not None and msg.is_method(METHOD_REQUEST_PERMISSION):
+                        # Unannounced or ambiguous: nobody on this client can
+                        # see or answer the prompt — answer NOW with the
+                        # request's own least-destructive reject option so the
+                        # backend subagent gets a tool error instead of
+                        # hanging.
+                        await self._answer_unroutable_permission(msg, session_id)
                     elif self._session_inits_in_flight and (
                         msg.is_method(METHOD_MCP_OAUTH_REQUEST)
                         or msg.is_method(METHOD_MCP_SERVER_INITIALIZED)
@@ -1529,6 +1762,13 @@ class AcpRuntime:
         stale = [k for k, v in self._routed_requests.items() if v == session_id]
         for k in stale:
             del self._routed_requests[k]
+        # The departing session takes its subagent ownership with it: a later
+        # session on this warm runtime must never inherit a stale child's
+        # approvals (the announce set is re-learned from the next
+        # subagent/list_update, which re-establishes ownership explicitly).
+        if self._subagent_owner == session_id:
+            self._subagent_owner = None
+            self._subagent_sessions = set()
         logger.debug("Removed session %s", session_id)
 
     # Alias for backward compat
@@ -1665,13 +1905,34 @@ class AcpRuntime:
                 ) from exc
         return None
 
+    async def _session_start_budget(self) -> float:
+        """The session/new + session/load budget, resolved lazily off-loop.
+
+        ``_resolve_session_start_timeout`` calls ``KiroCrewConfig.load()``,
+        which on a cache miss is a synchronous disk read + schema validation
+        — never run it on the event loop. Resolved once per runtime and
+        cached: the request paths must not re-read config per call, and a
+        changed config value applies to newly spawned runtimes (same
+        snapshot semantics as ``watchdog.*`` in session_handle.py).
+        """
+        if self._session_start_timeout is None:
+            self._session_start_timeout = await asyncio.to_thread(
+                _resolve_session_start_timeout
+            )
+        return self._session_start_timeout
+
     async def create_session(
         self,
         cwd: str | Path | None = None,
         agent: str | None = None,
         mcp_servers: list[dict[str, Any]] | None = None,
+        crew_agent: str | None = None,
     ) -> AcpSessionHandle:
-        """Create a new ACP session on this runtime. Returns a session handle."""
+        """Create a new ACP session on this runtime. Returns a session handle.
+
+        ``crew_agent`` is the canonical Kiro Crew identity for THIS session;
+        None falls back to the runtime's own (spawn-time or rekeyed) identity.
+        """
         if not self._initialized:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
 
@@ -1700,11 +1961,12 @@ class AcpRuntime:
             kas_custom_agents=kas_agents,
         )
 
+        budget = await self._session_start_budget()
         self._session_inits_in_flight += 1
         session_id = ""
         try:
             resp = await self._send_and_await(
-                METHOD_SESSION_NEW, params, timeout=_SESSION_NEW_TIMEOUT
+                METHOD_SESSION_NEW, params, timeout=budget
             )
             session_id = str(resp.get("sessionId") or "")
             if not session_id:
@@ -1718,10 +1980,19 @@ class AcpRuntime:
         for msg in buffered_init:
             queue.put_nowait(msg)
 
+        # Resolve the watchdog snapshot OFF the loop before constructing the
+        # handle: the load is config file reads + jsonschema validation on a
+        # config change, and the handle constructor is synchronous. The crew
+        # identity is canonical (a cfg.agents key) — the kiro ``agent`` name
+        # is a different namespace and is not stored on the handle.
+        _crew = crew_agent if crew_agent is not None else self._crew_agent
+        _wd = await asyncio.to_thread(_load_watchdog_settings, _crew)
         handle = AcpSessionHandle(
             session_id=session_id,
             queue=queue,
             runtime=self,
+            watchdog=_wd,
+            crew_agent=_crew,
         )
 
         # Populate state from session/new response (configOptions, available models)
@@ -1800,32 +2071,46 @@ class AcpRuntime:
         resume_sid: str,
         cwd: str | Path | None = None,
         agent: str | None = None,
+        crew_agent: str | None = None,
     ) -> AcpSessionHandle:
         """Resume a prior session via session/load — mirrors AcpClient.
 
         Unlike create_session()+handle.load(), this issues session/load
         DIRECTLY (no session/new first), using the ORIGINAL sid as sessionId
-        and passing cwd + mcpServers:[] + the full transcript path, exactly as
-        AcpClient._initialize_session does. This avoids the double-session
-        footgun (fresh session/new context replayed on top of the loaded
-        transcript) that produced stopReason='refusal'. Raises on failure so
-        the caller can fall back to create_session().
+        and passing cwd + the pooled broker stubs + the full transcript path,
+        exactly as AcpClient._initialize_session does. This avoids the
+        double-session footgun (fresh session/new context replayed on top of
+        the loaded transcript) that produced stopReason='refusal'. Raises on
+        failure so the caller can fall back to create_session().
         """
         if not self._initialized:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
         if not self._can_load_session:
             raise AcpRuntimeError("Backend does not advertise session/load support")
 
+        # Re-declare the pooled broker stubs so a resumed session keeps talking
+        # to the broker — same injection as create_session() and the AcpClient
+        # resume path (client.py). session/load re-initializes the session's MCP
+        # servers (see the budget note below), so an empty list here is APPLIED,
+        # not ignored: the stubs stop shadowing the agent spec's same-named
+        # entries and kiro-cli spawns its own copy of every pooled server,
+        # silently un-pooling the session for the rest of its life. Resolved off
+        # the event loop — the overlay lookup stats and reads files. Empty when
+        # the shared gateway is disabled, so non-pooled installs still send [].
+        mcp_servers = await asyncio.to_thread(
+            pooled_session_servers, self._mcp_gateway_overlay, agent or self._agent
+        )
         load_params: dict[str, Any] = {
             "sessionId": resume_sid,
             "cwd": str(cwd if cwd else self._work_dir),
-            "mcpServers": [],  # kiro-cli gets its servers via --agent
+            "mcpServers": mcp_servers,
         }
         if session_file:
             # Only kiro-cli is handed a transcript path. A backend that locates
             # the session itself from sessionId is called with an empty path, and
             # sending the field anyway would advertise a path that does not exist.
             load_params["_meta"] = {"_kiro.dev/session_file": session_file}
+        budget = await self._session_start_budget()
         self._session_inits_in_flight += 1
         loaded_session_id = ""
         try:
@@ -1837,7 +2122,7 @@ class AcpRuntime:
             # docs/system-specs/modules/acp-client.md "loading a session
             # triggers MCP re-initialization") — so it gets the same budget.
             resp = await self._send_and_await(
-                METHOD_SESSION_LOAD, load_params, timeout=_SESSION_NEW_TIMEOUT
+                METHOD_SESSION_LOAD, load_params, timeout=budget
             )
 
             # A genuine resume echoes "modes" in the response (same signal AcpClient
@@ -1862,10 +2147,16 @@ class AcpRuntime:
         for msg in buffered_init:
             queue.put_nowait(msg)
 
+        # Mirrors create_session: a resumed session gets the same
+        # canonical-crew watchdog snapshot, resolved off-loop.
+        _crew = crew_agent if crew_agent is not None else self._crew_agent
+        _wd = await asyncio.to_thread(_load_watchdog_settings, _crew)
         handle = AcpSessionHandle(
             session_id=resume_sid,
             queue=queue,
             runtime=self,
+            watchdog=_wd,
+            crew_agent=_crew,
         )
         handle.store_session_config(resp)
 

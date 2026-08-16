@@ -132,7 +132,7 @@ This allows `kirocrew` to find project-level agent config and skills from any di
 | `kirocrew config edit` | Open config in `$EDITOR` |
 | `kirocrew memory list/search/stats/audit` | Inspect vector memory (entries, semantic search, counts, suspicious-content scan) |
 | `kirocrew memory export/import/migrate` | Export memory to JSON, import it back, or migrate legacy markdown memory into the vector store |
-| `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile |
+| `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile. `show` also summarizes the built-in denied-command catalog as grouped counts (`--ids` lists each category's rule ids), on every install regardless of whether an enterprise policy is active — the one place an agent can learn a class of work is hard-denied before planning around it. |
 | `kirocrew pod up/down/ls/status/token/url/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
 | `kirocrew knowledge dedup [--apply]` | Collapse cross-source duplicate knowledge documents (dry-run unless `--apply`) |
 | `kirocrew cron preview <script>` | Run a script cron locally with real MCP tools; notifications are captured and printed instead of delivered |
@@ -755,6 +755,36 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
     the baked `Environment=` lines, so editing it and running `sudo systemctl
     restart kirocrew` changes a value (e.g. the port) without reinstalling.
     Uninstall removes the file and its `/etc/kirocrew` directory.
+  - **Credentials are deliberately NOT captured.** Both baked locations are
+    world-readable — the unit lives in root-owned `/etc/systemd/system` and the
+    override file is installed `0644` — so a model credential placed there
+    would be readable by every local user on the host. `service_environment()`
+    therefore carries no credential — its only installer-derived values are
+    `PATH`, `KIROCREW_KIRO_BIN` and `KIROCREW_PORT` (it also returns `HOME`,
+    `LANG` and `LC_ALL`) — and a test pins the absence so a future "just
+    propagate it" change fails.
+    Consequence: a `KIRO_API_KEY` exported in the installing shell does not
+    reach the service, the readiness probe (which forwards that variable from
+    the *gateway's own* environment) sees no credential, and unless a
+    `kiro-cli login` credential store under the baked `HOME` supplies one
+    instead, the dashboard reports a signed-out state on a host where `kiro-cli`
+    itself is authenticated. `install_service()` prints a warning naming the
+    variable and the remedy when it detects that case, and `~/.kiro/crew/.env`
+    is the supported home — `load_credentials()` reads every key from that file
+    into the gateway environment at boot and forces `0600` on it first. The
+    warning is diagnostic only: it is non-fatal by construction, since the unit
+    is already written and started by the time it runs. `kirocrew doctor` reports
+    the same condition next to its `kiro login` line — the one output where the
+    contradiction is visible, since that line runs `whoami` with the inherited
+    environment and reports signed in. Doctor's report is gated on a service
+    definition existing (`installed_unit_path()`): without one the gateway runs
+    in the foreground and inherits the invoking shell, so the credential does
+    reach it and a warning would be a false positive. It is **advisory only** —
+    never appended to doctor's `issues`, which is the exit-code channel — since
+    that gate establishes a definition on disk, not that the serving gateway
+    lacks a credential; a fall-back login store, or a stopped unit beside a
+    foreground `kirocrew gateway`, both leave the host healthy while the check
+    fires.
   - Boot survival via `WantedBy=multi-user.target` (no linger needed —
     that's a user-service concept; this is system-level).
   - Crash-loop safety: `StartLimitBurst=3 StartLimitIntervalSec=300`.

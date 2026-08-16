@@ -132,6 +132,29 @@ export default [
       // keep both modules parser-facing only.
       'src/lib/widgetSrcdoc.ts',
       'src/lib/mcpAppSrcdoc.ts',
+      // Per-app scoped CSS, injected as `<style>{APP_CSS}</style>`. Each module is
+      // ONE template literal of stylesheet text handed to the CSS parser -- selectors,
+      // lengths and `var(--…)` references. None of it is read as words, and the
+      // diff-scoped `added-lines` check reports the whole template against whoever
+      // touches a rule inside it, so any narrow-viewport or theming edit to an app's
+      // stylesheet trips a zero-tolerance gate it can never satisfy.
+      //
+      // Stated as a false-negative class, per this file's convention: user-visible
+      // copy added to one of these modules will not be reported -- keep them
+      // stylesheet-only, and put anything a person reads in the component with
+      // `i18nT`. Verified copy-free rather than assumed: none of these four
+      // imports `i18nT` or `useTranslation`.
+      //
+      // Listed as EXACT PATHS, not a `src/apps/*/styles.ts` glob, for the reason
+      // stated above for the srcdoc pair: the false-negative note is only true of
+      // files that exist today. A glob would put every future app's stylesheet
+      // outside this gate sight-unseen, including one where someone later writes
+      // `content: "…"` copy or misfiles a string. One config line per new app is
+      // the cost of keeping the ratchet's shape.
+      'src/apps/crew-companion/styles.ts',
+      'src/apps/design-critique/styles.ts',
+      'src/apps/file-explorer/styles.ts',
+      'src/apps/md-notebook/styles.ts',
       // The PPTX Maker board-preview builder — the same category as
       // `sketchSrcdoc.ts` directly above, and listed by the same exact-path rule
       // rather than a shared glob. Every literal in it is handed to a PARSER: the
@@ -651,6 +674,18 @@ export default [
               // trimed = value.trim()`), so a pattern that requires the space can never
               // match. Verified — the space-bearing version left the warning in place.
               '^Auto-Improve -$',
+              // Electron accelerator API tokens, which are the INPUT side of the key
+              // caps above: `accelerator: "CmdOrCtrl+R"` is the string Electron parses
+              // to bind the shortcut, and the Windows titlebar menu rewrites those
+              // tokens to the cap the user actually sees (`CmdOrCtrl` -> `Ctrl`). The
+              // token never reaches the screen, so it is a machine value; the cap it
+              // becomes is already exempt on do-not-translate grounds. Translating the
+              // token would break the binding, not localise anything.
+              //
+              // Anchored and enumerated rather than a PascalCase shape rule on purpose:
+              // `^[A-Z][a-z]+$` would also swallow `File`, `Edit` and `Settings`, which
+              // are genuine UI copy.
+              '^(CommandOrControl|CmdOrCtrl)$',
             ],
           },
 
@@ -900,6 +935,32 @@ export default [
     },
   },
 
+  // Developer diagnostics for the APP AUTHOR, printed to the browser console when
+  // an app subscribes to a WS event its manifest has not declared a scope for.
+  // Translating them would be actively wrong, not merely wasteful: each one quotes
+  // the scope identifier the author must paste into `permissions.events`
+  // (`"slots:user"`, `"notification:system"`, `"<scope>:all"`), and those are
+  // compared BY VALUE against the manifest — localised advice would name a scope
+  // the gateway does not recognise.
+  //
+  // `console.*` is already callee-exempt, so the three call sites are covered; the
+  // strings are flagged because they are composed in `checkSubscribeAllowed`, one
+  // pure predicate that centralises the diagnosis for all three. Inlining the prose
+  // into the calls to earn the callee exemption would duplicate its branch logic
+  // three times — a worse module for a lint technicality.
+  //
+  // Scoped to this one file for the same reason as the two above: the module is the
+  // SDK's protocol surface (event tables, hooks, provider) and holds no other prose.
+  // The pieces that DO render copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` —
+  // are separate files and stay covered. Copy added here later belongs in the
+  // catalog, not under this exemption; keep this module protocol-and-diagnostics.
+  {
+    files: ['src/app-sdk/index.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // PROTOCOL VALUES ONLY: the server's own action names, provider merge-state enums,
   // and the literals a user must TYPE to arm an irreversible action. Every string in
   // that module is compared by value against something outside the dashboard, so
@@ -965,20 +1026,6 @@ export default [
   // any copy later added here belongs in the catalog, not behind this exemption.
   {
     files: ['src/components/Strands.tsx'],
-    rules: {
-      'i18next/no-literal-string': 'off',
-    },
-  },
-
-  // PROTOCOL VALUES ONLY, same category as `wireValues.ts` above: the two
-  // Aperture-registered literals for the session-pulse survey (a radio
-  // question's response values, and the question text itself). Both are
-  // compared/sent by value against Aperture's registered form template
-  // (category=KiroCrew, name=SessionFeedback, version=1.0.1) — ingestion  // brand-ok: registered category id
-  // 400s on any text/type mismatch, so translating either would break the
-  // submission rather than localize it. See the module's own header.
-  {
-    files: ['src/components/sessionPulseWireValues.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

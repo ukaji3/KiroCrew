@@ -96,7 +96,11 @@ if TYPE_CHECKING:
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, PROVIDER_LABEL_DEFAULT
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    PROVIDER_LABEL_CLAUDE,
+    PROVIDER_LABEL_DEFAULT,
+)
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import spec_model
 from kiro_crew.config import KiroCrewConfig
@@ -110,6 +114,8 @@ from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
 from kiro_crew.messaging.link import (
+    UNBIND_REASON_SESSION_DESTROYED,
+    UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
     canonical_key,
     legacy_key,
@@ -122,6 +128,7 @@ from kiro_crew.sel import sel
 from kiro_crew.session_map import _kiro_sessions_dir  # noqa: F401
 from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG
 from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
+from kiro_crew.session_map import UnbindListener, set_unbind_listener
 from kiro_crew.session_pid import (
     _build_child_map,
     _cleanup_orphaned_mcp_servers,
@@ -173,7 +180,7 @@ def _is_claude_backend(provider: Any) -> bool:
     if not isinstance(provider, AcpProvider):
         return False
     backend = getattr(provider.client, "backend", "")
-    return backend == "claude"
+    return backend == ACP_BACKEND_CLAUDE
 
 
 def _provider_label(provider: Any) -> str:
@@ -647,7 +654,12 @@ class _Session:
     resumed_armed: bool = False
     prompt_count: int = 0
     consecutive_failures: int = 0
-    semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+    # Bounded rather than plain: a release() call that lands on this object
+    # after get_or_create() has already replaced it at the session key (see
+    # SessionManager.release) must raise instead of silently pushing the
+    # counter above 1, which would let a second turn acquire concurrently
+    # with one still in flight.
+    semaphore: asyncio.BoundedSemaphore = field(default_factory=lambda: asyncio.BoundedSemaphore(1))
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
     # Slack message queue: FIFO of (msg_ts, text, kwargs) waiting for the semaphore
@@ -743,6 +755,24 @@ class _ProviderBgSession:
         # down here. Just release the turn semaphore deterministically so the
         # next _bg caller isn't blocked on generator finalization.
         self._release()
+
+
+def unlink_queued_temp_paths(kwargs: dict) -> None:
+    """Unlink the temp files a queue entry tracks in ``image_temp_paths``.
+
+    Queued Slack messages defer temp-image cleanup to whichever code path
+    consumes the entry, so the queued turn's text can still resolve its image
+    paths at dispatch time. Every path that consumes an entry — dispatch, or
+    any discard (cancel, queue clear, cancelled-skip on dequeue) — must unlink
+    here, or the files sit on disk until external cleanup. Already-missing
+    files are ignored: a discard can benignly follow a dispatch that already
+    cleaned up.
+    """
+    for p in kwargs.get("image_temp_paths") or []:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
 
 class SessionManager:
@@ -2649,7 +2679,45 @@ class SessionManager:
                 )
 
                 if isinstance(provider, AcpProvider):
-                    provider.client.rekey(key, channel_id)
+                    # The claiming session's canonical crew identity travels
+                    # with the claim: a kiro-shared client rebinds the handle's
+                    # per-agent watchdog windows; the AcpClient path accepts it
+                    # for parity. Pool claims are default-agent-only, so the
+                    # caller-supplied kwarg (the dashboard slot's resolved
+                    # alias) is the only possible source. The snapshot is
+                    # resolved OFF the loop and handed in as data — the load
+                    # is file reads + jsonschema validation on a config
+                    # change, and passing it explicitly (instead of a cache
+                    # pre-warm) means no future rekey caller can silently put
+                    # that I/O back on the event loop.
+                    # circular import: session -> acp.session_handle at module
+                    # scope would loop through acp.client -> session.
+                    from kiro_crew.acp.session_handle import _load_watchdog_settings
+                    from kiro_crew.config.loader import resolve_crew_identity
+
+                    _claim_kwarg = extra_factory_kwargs.get("crew_agent")
+
+                    def _resolve_claim_watchdog() -> tuple[str, object]:
+                        # Same identity rule as the provider factory (a claim
+                        # must match the cold start it replaces), on a FRESH
+                        # config so a crew added since factory build resolves.
+                        _cfg = KiroCrewConfig.load()
+                        _crew = resolve_crew_identity(
+                            _cfg,
+                            agent,
+                            None if _claim_kwarg is None else str(_claim_kwarg),
+                        )
+                        return _crew, _load_watchdog_settings(_crew)
+
+                    _claim_crew, _claim_wd = await asyncio.to_thread(
+                        _resolve_claim_watchdog
+                    )
+                    provider.client.rekey(
+                        key,
+                        channel_id,
+                        crew_agent=_claim_crew,
+                        watchdog=_claim_wd,
+                    )
                     # Switch model post-claim if caller requested non-default.
                     if model:
                         _pool_model = (
@@ -3582,7 +3650,7 @@ class SessionManager:
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
         finally:
-            self._session_map.delete(key)
+            self._session_map.delete(key, reason=UNBIND_REASON_SESSION_DESTROYED)
             logger.info("Destroyed session (map deleted): %s", key)
 
     async def discard_conversation(self, key: str) -> None:
@@ -4062,7 +4130,19 @@ class SessionManager:
                         asyncio.ensure_future(self._safe_cleanup(session.provider, session_id))
                 except Exception:
                     logger.debug("Failed to get session_id for cleanup", exc_info=True)
-            session.semaphore.release()
+            try:
+                session.semaphore.release()
+            except ValueError:
+                # This key's session was popped and replaced (e.g. by reset())
+                # between our caller's acquire and this release — releasing
+                # the NEW occupant's semaphore would let a second turn run
+                # concurrently with one already in flight on it. Drop it.
+                logger.warning(
+                    "release(%s): session was replaced under us; dropping "
+                    "stray semaphore release instead of over-releasing the "
+                    "new occupant's",
+                    key,
+                )
 
     async def _safe_cleanup(self, provider: LLMProvider, session_id: str) -> None:
         """Best-effort session file cleanup."""
@@ -4131,6 +4211,9 @@ class SessionManager:
             if msg_ts not in session.cancelled:
                 return msg_ts, text, kwargs
             session.cancelled.discard(msg_ts)
+            # A skipped entry never reaches _dispatch_queued's cleanup, so its
+            # temp files must be unlinked here or they leak.
+            unlink_queued_temp_paths(kwargs)
         return None
 
     def cancel_queued(self, key: str, msg_ts: str) -> bool:
@@ -4143,8 +4226,11 @@ class SessionManager:
         session = self._sessions.get(key)
         if not session:
             return False
-        for i, (ts, _, _) in enumerate(session.queue):
+        for i, (ts, _, kwargs) in enumerate(session.queue):
             if ts == msg_ts:
+                # The entry will never reach _dispatch_queued's cleanup, so its
+                # temp files must be unlinked here or they leak.
+                unlink_queued_temp_paths(kwargs)
                 del session.queue[i]
                 return True
         # Not in queue — only mark cancelled if something is actually in-flight
@@ -4164,10 +4250,16 @@ class SessionManager:
         return False
 
     def clear_queue(self, key: str) -> None:
-        """Clear all queued messages and cancelled set for a session."""
+        """Clear all queued messages and cancelled set for a session.
+
+        Unlinks each discarded entry's temp files: cleared entries never reach
+        ``_dispatch_queued``'s cleanup, so skipping this leaks them on disk.
+        """
         key = self._fold_key(key)
         session = self._sessions.get(key)
         if session:
+            for _, _, kwargs in session.queue:
+                unlink_queued_temp_paths(kwargs)
             session.queue.clear()
             session.cancelled.clear()
 
@@ -4259,17 +4351,20 @@ class SessionManager:
         link: ChannelLink | None,
         *,
         accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         """Bind (or clear) a session's channel-neutral mirror target.
 
         ``accepts_inbound`` upgrades a non-Slack outbound mirror into a
         persisted session-resume binding. Slack owns its dedicated reverse
-        index; other channels use :meth:`find_mirror_sessions`.
+        index; other channels use :meth:`find_mirror_sessions`. ``reason`` is
+        recorded when this call ends an existing inbound binding.
         """
         self._session_map.set_mirror_link(
             key,
             link,
             accepts_inbound=accepts_inbound,
+            reason=reason,
         )
 
     def get_mirror_link(self, key: str) -> ChannelLink | None:
@@ -4391,13 +4486,24 @@ class SessionManager:
         """Sessions that must stop *key* from binding *link*, or [] if it is free."""
         return self._session_map.mirror_claim_blockers(key, link, accepts_inbound=accepts_inbound)
 
-    def clear_mirror_link(self, key: str) -> bool:
+    def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         """Remove a session's outbound mirror binding. Returns True iff present."""
-        return self._session_map.clear_mirror_link(key)
+        return self._session_map.clear_mirror_link(key, reason=reason)
 
-    def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
+    def clear_mirror_links_at(
+        self, link: ChannelLink, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> list[str]:
         """Clear every session mirroring to an exact location; return cleared keys."""
-        return self._session_map.clear_mirror_links_at(link)
+        return self._session_map.clear_mirror_links_at(link, reason=reason)
+
+    @staticmethod
+    def set_unbind_listener(callback: UnbindListener | None) -> None:
+        """Register the sink notified when an inbound resume binding is removed.
+
+        The registry it writes is the session map's, shared by every instance, so
+        a removal performed through a throwaway map is announced too.
+        """
+        set_unbind_listener(callback)
 
     def set_mirror_paused(self, key: str, paused: bool, *, origin: bool = False) -> bool:
         """Set whether turns reach one non-Slack delivery; return the prior state.

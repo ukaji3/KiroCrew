@@ -182,6 +182,18 @@ _TURN_BUCKETS_MS: list[float] = [
     1800000, 2700000, 3600000,
 ]
 
+# Watchdog idle-at-decision. The watchdog consults the oracle from
+# check_after_secs (60s) and the default hard cap is 1h (3600s,
+# tool_stall_hard_cap_secs), so the range is 1s .. 4h — headroom above the cap
+# because per-agent overrides can raise it; densest around the window
+# boundaries (300s stale / 900s model-silent / 3600s cap) that the
+# distribution is meant to tune. Sub-minute bounds exist because tests and
+# per-agent overrides can legitimately act earlier than the default 60s gate.
+_WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
+    1000, 5000, 15000, 30000, 60000, 120000, 180000, 300000, 450000,
+    600000, 900000, 1800000, 3600000, 5400000, 7200000, 10800000, 14400000,
+]
+
 # Instrument name -> boundaries. This map is the COMPLETE set of kirocrew
 # duration histograms: the Views below are built from it and there is no
 # catch-all, because the OTEL SDK applies EVERY matching View rather than the
@@ -191,7 +203,9 @@ _TURN_BUCKETS_MS: list[float] = [
 # Consequence: a new histogram missing from this map falls back to OTEL's
 # default 10s-ceiling boundaries. `test/metrics/test_provider_bucket_views.py`
 # fails when a histogram metric name in the source has no entry here — add the
-# instrument to this map when you add the metric.
+# instrument to this map when you add the metric. All values are ms — the
+# dashboard's generic aggregation reports every histogram under *_ms keys, so
+# a non-ms instrument would surface 1000x off there.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.gateway.request.duration": _FAST_BUCKETS_MS,
     "kirocrew.db.query.duration": _FAST_BUCKETS_MS,
@@ -216,6 +230,7 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.mcp.lazy_load.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.gateway.boot.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.turn.duration": _TURN_BUCKETS_MS,
+    "kirocrew.watchdog.idle.duration": _WATCHDOG_IDLE_BUCKETS_MS,
 }
 
 _lock = threading.Lock()
@@ -701,14 +716,57 @@ def shutdown() -> None:
         _flush_detached_provider(doomed)
 
 
+# reset_for_testing() waits at most this long for an in-flight consent-check
+# worker to finish before returning. The worker is a daemon thread whose
+# ``finally`` unconditionally clears ``_check_in_flight`` (see
+# ``_consent_worker``), so under normal load this bound is never approached;
+# it exists so a genuinely stuck worker fails the test loudly instead of
+# reset_for_testing() handing back a "clean" state while a stale thread can
+# still mutate module globals underneath the next test.
+_RESET_WAIT_BOUND_SECS = 10.0
+_RESET_WAIT_POLL_SECS = 0.01
+
+
+def _wait_for_in_flight_consent_worker() -> None:
+    """Block until ``_check_in_flight`` is False, or raise past the bound.
+
+    Test-only: called from ``reset_for_testing`` so every test starts from a
+    state with no consent-check worker still running. Polling a plain bool
+    under ``_lock`` matches how ``_check_in_flight`` is read and written
+    everywhere else in this module, and keeps this seam simple since it only
+    ever runs between tests, never on a request path.
+    """
+    deadline = time.monotonic() + _RESET_WAIT_BOUND_SECS
+    while True:
+        with _lock:
+            if not _check_in_flight:
+                return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "reset_for_testing: a consent-check worker is still in flight "
+                f"after {_RESET_WAIT_BOUND_SECS}s; a test must never proceed "
+                "with a live stale worker able to mutate module state"
+            )
+        time.sleep(_RESET_WAIT_POLL_SECS)
+
+
 def reset_for_testing() -> None:
     """Drop the cached recorder + provider so the next get_recorder() rebuilds.
 
     Also clears ``_ever_built``, so the next build is synchronous and a test can
     assert on the result without polling. Production keeps that flag set, which is
     what pushes a post-shutdown rebuild off the calling thread.
+
+    Waits (bounded) for any in-flight consent-check worker to finish before
+    returning. ``shutdown()`` alone does not stop that worker — it only bumps
+    the generation the worker checks before installing its result — so a
+    worker started by an earlier test can still be mid-run here. Owning that
+    wait in this one seam, rather than in each test's own helpers, is what
+    guarantees every test starts from a state with no worker able to mutate
+    module globals underneath it.
     """
     global _ever_built
     shutdown()
+    _wait_for_in_flight_consent_worker()
     with _lock:
         _ever_built = False

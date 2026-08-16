@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re as _re
+import shutil
 import stat as _stat
 import threading
 import uuid
@@ -101,12 +102,15 @@ from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort, model_supports_effo
 from kiro_crew.instances.constants import CONNECT_TIMEOUT_CEILING_SECS as _CONNECT_TIMEOUT_CEILING
 from kiro_crew.instances.constants import DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _DEFAULT_MAX_RECOVERY
+from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS as _DEFAULT_MINT_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_PROBE_FAILURE_THRESHOLD as _DEFAULT_PROBE_FAILS
 from kiro_crew.instances.constants import DEFAULT_RECOVER_BACKOFF_MAX_SECS as _DEFAULT_BACKOFF_MAX
 from kiro_crew.instances.constants import DEFAULT_SSH_COMPRESSION as _DEFAULT_SSH_COMPRESSION
 from kiro_crew.instances.constants import DEFAULT_TUNNEL_BASE_PORT as _DEFAULT_TUNNEL_BASE_PORT
 from kiro_crew.instances.constants import DEFAULT_WARM_SET_CAP as _DEFAULT_WARM_SET_CAP
 from kiro_crew.instances.constants import MAX_RECOVERY_ATTEMPTS_CEILING as _MAX_RECOVERY_CEILING
+from kiro_crew.instances.constants import MINT_TIMEOUT_CEILING_SECS as _MINT_TIMEOUT_CEILING
+from kiro_crew.instances.constants import MINT_TIMEOUT_FLOOR_SECS as _MINT_TIMEOUT_FLOOR
 from kiro_crew.instances.constants import (
     RECOVER_BACKOFF_MAX_CEILING_SECS as _RECOVER_BACKOFF_CEILING,
 )
@@ -188,6 +192,7 @@ CRED_MICROSOFT_APP_ID = "MICROSOFT_APP_ID"
 CRED_MICROSOFT_APP_PASSWORD = "MICROSOFT_APP_PASSWORD"
 CRED_MICROSOFT_APP_TENANT_ID = "MICROSOFT_APP_TENANT_ID"
 CRED_WEIXIN_TOKEN = "WEIXIN_TOKEN"  # iLink bot credential from the Settings QR flow
+CRED_JIRA_API_TOKEN = "JIRA_API_TOKEN"  # Jira Cloud/Server API token (resolved from .env)
 # kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
 # above, its rightful consumer is the agent subprocess itself (and the whoami
 # identity probe), so it is deliberately NOT in sandbox._AGENT_DENIED_ENV_KEYS:
@@ -207,8 +212,12 @@ _CREDENTIAL_KEYS = (
     CRED_MICROSOFT_APP_PASSWORD,
     CRED_MICROSOFT_APP_TENANT_ID,
     CRED_WEIXIN_TOKEN,
+    CRED_JIRA_API_TOKEN,
     CRED_KIRO_API_KEY,
 )
+
+# Keys from .env that were already warned about (fire once per gateway boot).
+_warned_env_keys: set[str] = set()
 
 DEFAULT_MODEL = "auto"
 DEFAULT_SESSION_TIMEOUT = 3600  # 60 min
@@ -477,6 +486,46 @@ def config_path() -> Path:
 def config_local_path() -> Path:
     """Return path to config.local.json — user overrides that survive upgrades."""
     return config_dir() / "config.local.json"
+
+
+def _write_migration_backup(path: Path) -> None:
+    """Copy the pre-migration config aside, but ONLY inside our own data home.
+
+    ``load()`` reads whatever ``config_path()`` resolves to, and callers can
+    redirect that at a file they own — tests and embedders point it at a
+    ``tempfile`` entry in the shared ``TMPDIR``. Writing ``<path>.bak`` beside
+    such a path leaks a file nobody collects: the caller unlinks the path it
+    created and never learns a sibling appeared. One dev host accumulated 72k
+    orphaned ``tmpXXXXXXXX.json.bak`` files this way, 7% of a tmpfs inode
+    budget whose exhaustion fails every process on the box.
+
+    So the copy is gated on the config living in ``config_dir()``, the one
+    directory whose contents we own. In production that is always true
+    (``config_path()`` is ``config_dir() / "config.json"``), which keeps the
+    real backup exactly where it has always been; for a redirected path we
+    write nothing rather than litter a directory belonging to someone else.
+
+    Only the LOCATION decision is contained here. A failing copy still
+    propagates, because the caller's ``except`` is what skips the migration
+    ``save()`` -- so a config we could not copy aside is not rewritten either,
+    and the migration retries on the next load.
+    """
+    try:
+        inside_data_home = path.parent.resolve() == config_dir().resolve()
+    except OSError:
+        # Containment is unprovable (symlink loop, vanished parent): treat the
+        # path as foreign, since writing on a failed check is the worse error.
+        inside_data_home = False
+    if not inside_data_home:
+        # info, not debug: the migration save that follows rewrites this
+        # caller-owned file in place, and that now happens with no backup.
+        logger.info("Config migrated; no backup written for %s (outside the data home)", path)
+        return
+    # NOT with_suffix(".json.bak"): that REPLACES the final suffix, so a
+    # config path which is not *.json would be renamed rather than backed up.
+    backup = Path(str(path) + ".bak")
+    shutil.copy2(path, backup)
+    logger.info("Config migrated — backup saved to %s", backup)
 
 
 def denied_commands_path() -> Path:
@@ -1405,6 +1454,18 @@ class AgentConfig:
             "at all. Should be <= resource_pressure_gb. 0 disables the critical tier.",
         ),
     )
+    admission_gate: bool = field(
+        default=True,
+        metadata=_meta(
+            "Posture Admission Gate",
+            "While available memory is at or below resource_critical_gb, defer "
+            "scheduled cron firings to the next tick and refuse new subagent "
+            "spawns until memory frees. Manually triggered cron runs, in-flight "
+            "subagents, and direct chat turns are never gated; an unreadable "
+            "probe admits (fail-open). Set false to make the critical posture "
+            "advisory-only.",
+        ),
+    )
     workflow_run_timeout_secs: int = field(
         default=3600,
         metadata=_meta(
@@ -1435,6 +1496,21 @@ class AgentConfig:
             "Hitting the ceiling is visible: the turn ends with a card naming "
             "the limit. For work spanning days, prefer monitor/goal loops — "
             "they end the turn between cycles and survive restarts.",
+        ),
+    )
+    session_start_timeout_secs: int = field(
+        default=90,
+        metadata=_meta(
+            "Session Start Timeout (secs)",
+            "Budget for ACP session/new and session/load on the shared "
+            "runtime. kiro-cli blocks the response while it initializes the "
+            "agent's MCP servers, so session start scales with server count "
+            "and per-server cold-start cost (sandboxed launchers, remote "
+            "servers, loaded hosts). Raise this when a large agent "
+            "legitimately needs longer than the 90s default. The floor is "
+            "the default itself: the budget must stay comfortably above the "
+            "backend's 30s OAuth authorization wait, so values below 90 are "
+            "clamped up.",
         ),
     )
     tool_approval_timeout_secs: int = field(
@@ -2426,6 +2502,33 @@ def _tailscale_config_from(raw: object) -> TailscaleConfig:
 
 
 @dataclass
+class JiraAuthEntry:
+    """Connection metadata for one Jira instance (Cloud or Server/DC).
+
+    The API token is NOT stored here — it lives in the protected .env file
+    as JIRA_API_TOKEN (same isolation pattern as Slack/Discord/Telegram tokens).
+    This dataclass holds only non-sensitive connection metadata.
+    """
+
+    host: str = field(
+        default="",
+        metadata=_meta(
+            "Host",
+            "Jira instance hostname (e.g. 'myorg.atlassian.net' or "
+            "'jira.internal.corp:8443'). Must match the host in the issue URL.",
+        ),
+    )
+    email: str = field(
+        default="",
+        metadata=_meta(
+            "Email",
+            "Atlassian account email for Cloud instances (used in Basic auth "
+            "header). Leave empty for Server/DC instances that use a PAT.",
+        ),
+    )
+
+
+@dataclass
 class DashboardConfig:
     url: str = field(
         default="",
@@ -2616,6 +2719,20 @@ class DashboardConfig:
             "side panel instead of inline in the chat bubble. The panel opens "
             "automatically and can be expanded; the chat keeps a compact "
             "placeholder linking to it.",
+        ),
+    )
+    # Off by default because the panel's dismissal marker is keyed by slot and a
+    # new session inherits `dashboard.default_project`: with this on, every new
+    # chat in a git project opens the panel, which is not the once-per-project
+    # nudge the behaviour looks like. That reasoning is the flag's rationale, not
+    # something a user reading the setting needs, so it stays out of `help`.
+    auto_open_git_panel: bool = field(
+        default=False,
+        metadata=_meta(
+            "Auto-open Git in the side panel",
+            "Expand the chat's right side panel to its Git tab each time a session "
+            "starts in a project directory that is a git repository. The Git tab "
+            "itself is always created either way, so it is one click away.",
         ),
     )
     terminal: dict = field(
@@ -2830,6 +2947,18 @@ class DashboardConfig:
             "here. Suffixes and wildcards are not matched.",
         ),
     )
+    jira_auth: list[JiraAuthEntry] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Jira Authentication",
+            "Per-host credentials for the Jira REST API so the Issues panel "
+            "can fetch issue details inline. Each entry pairs a host with an "
+            "API token. Atlassian Cloud (*.atlassian.net) uses email + API "
+            "token (Basic auth); Jira Server/Data Center uses a Personal "
+            "Access Token (Bearer). When no entry matches the issue host, the "
+            "panel falls back to the link-out 'Open in Jira' behavior.",
+        ),
+    )
 
 
 @dataclass
@@ -2871,6 +3000,30 @@ class KiroCrewAgentConfig:
     source: str = field(
         default="kirocrew",
         metadata=_meta("Source", "Agent origin: kirocrew or builtin."),
+    )
+    # Per-agent watchdog window overrides. The global ``watchdog.tool_stall_*``
+    # defaults (1h) are build-scale forbearance; an agent that never runs a long
+    # build (a pure-LLM reviewer, read-only git) can declare much lower windows
+    # here. 0 (the default) inherits the global value — mirrors the
+    # empty-inherits convention of ``model`` above.
+    watchdog_tool_stall_suspect_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Tool stall suspect override (s)",
+            "Per-agent override for watchdog.tool_stall_suspect_secs on sessions "
+            "running this agent. 0 inherits the global window (default 1h, tuned "
+            "for long builds). Set low (e.g. 900) for a pure-LLM agent whose "
+            "longest legitimate silent gap is minutes, not hours.",
+        ),
+    )
+    watchdog_tool_stall_hard_cap_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Tool stall hard cap override (s)",
+            "Per-agent override for watchdog.tool_stall_hard_cap_secs on sessions "
+            "running this agent. 0 inherits the global cap (default 1h). Applies "
+            "ONLY to UNKNOWN verdicts — a WORKING session is never acted on.",
+        ),
     )
     telegram_account: str = field(
         default="",
@@ -3390,6 +3543,21 @@ POOL_SIZE_MAX = 10  # session.pool_size — pre-warmed process pool
 CHAT_TURN_TIMEOUT_MIN = 300
 CHAT_TURN_TIMEOUT_MAX = 86400
 
+# agent.session_start_timeout_secs — budget for ACP session/new + session/load
+# on the shared runtime (acp/runtime.py ``_SESSION_NEW_TIMEOUT`` is the built-in
+# default). kiro-cli blocks the session/new response while it initializes the
+# session's MCP servers, so start time scales with the agent's server count and
+# per-server cold-start cost (observed: a 71-server agent with no pending OAuth
+# completes in ~14s; a 17-server agent behind a sandboxed per-server launcher on
+# a loaded host takes ~50s). The floor IS the default: the budget must stay
+# comfortably ABOVE the backend's 30s OAuth authorization wait (issue #2946) —
+# a lower value recreates the session-start race the dedicated budget exists to
+# prevent, so out-of-range values clamp UP to it. The max bounds a typo'd
+# value: a session start slower than 15 minutes is pathological and should
+# surface as a timeout, not wait forever.
+SESSION_START_TIMEOUT_MIN = 90
+SESSION_START_TIMEOUT_MAX = 900
+
 # agent.tool_approval_timeout_secs — how long a chat turn parks waiting for a
 # human to answer a tool-approval prompt. The floor keeps the window long enough
 # for a human who is actually present to reach the dashboard. The max is pinned
@@ -3445,6 +3613,12 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
     ("agent", "max_subagents", 0, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "subagent_max_turns", 1, SUBAGENT_MAX_TURNS_CEILING),
     ("agent", "chat_turn_timeout_secs", CHAT_TURN_TIMEOUT_MIN, CHAT_TURN_TIMEOUT_MAX),
+    (
+        "agent",
+        "session_start_timeout_secs",
+        SESSION_START_TIMEOUT_MIN,
+        SESSION_START_TIMEOUT_MAX,
+    ),
     (
         "agent",
         "tool_approval_timeout_secs",
@@ -3730,10 +3904,26 @@ def _read_skip_permissions(agent_data: dict) -> bool:
     ``dangerouslySkipPermissions`` (the camelCase form used by other agent tools,
     so a config copied from one still works) and the legacy ``yolo`` (so no
     existing config silently loses auto-approve on upgrade).
+
+    Requires a REAL ``bool``, not Python truthiness: a stringly-typed value
+    from a templated/generated config — ``"false"``, ``"0"``, ``"no"``, or any
+    other non-empty string a hand-edit or a config generator might write — is
+    truthy in Python, so a bare ``bool(...)`` here would silently turn
+    "explicitly disabled" into the standing, unattended tool-auto-approve
+    grant this key controls. A non-bool value is never treated as an
+    affirmative grant; it falls through to check the next spelling, then to
+    the ``False`` default.
     """
     for key in ("dangerously_skip_permissions", "dangerouslySkipPermissions", "yolo"):
         if key in agent_data:
-            return bool(agent_data.get(key))
+            value = agent_data[key]
+            if isinstance(value, bool):
+                return value
+            logger.warning(
+                "agent.%s must be a real boolean, got %r — treating as unset",
+                key,
+                value,
+            )
     return False
 
 
@@ -4217,9 +4407,9 @@ class InstancesConfig:
     since enabling it allows the gateway to open SSH ``-L`` forwards and relaxes
     the dashboard CSP ``frame-src`` for the active loopback tunnel ports.
 
-    The numeric tunables default to constants defined in
-    ``kiro_crew.instances.constants`` so the canonical default lives in one
-    place and cannot drift from this dataclass.
+    Numeric transport defaults and bounds live in
+    ``kiro_crew.instances.constants`` so their canonical values cannot drift
+    from this dataclass.
     """
 
     enabled: bool = field(
@@ -4261,18 +4451,31 @@ class InstancesConfig:
             "on a fast/local link where compression CPU outweighs the bandwidth win.",
         ),
     )
-    connect_timeout_secs: float = field(
-        default=_DEFAULT_CONNECT_TIMEOUT,
+    connect_timeout_secs: float | None = field(
+        default=None,
         metadata=_meta(
             "Connect Timeout (secs)",
             "How long to wait for the local forward port to accept connections "
-            "before declaring a connect attempt failed. The default (15s) is "
-            "sufficient for a direct ssh TCP connect, but hosts behind a "
+            "before declaring a connect attempt failed. When unset, SSH uses "
+            "15s and SSM uses 25s. Fifteen seconds is sufficient for a direct "
+            "ssh TCP connect, but hosts behind a "
             "ProxyCommand or jump host routinely need longer (the proxy handshake "
             "runs before ssh begins the forward). Raise this if connecting a "
             "remote instance times out while the same ssh forward succeeds by hand. "
-            "The SSM transport uses its own higher default (25s) unless this value "
-            "is explicitly set. Clamped to [1, 120].",
+            "An explicit value applies to both transports. Clamped to [1, 120].",
+        ),
+    )
+    mint_timeout_secs: float | None = field(
+        default=None,
+        metadata=_meta(
+            "Mint Timeout (secs)",
+            "How long to wait for the remote `kirocrew token` mint to return "
+            "before failing a connect. When unset, SSH uses 30s and SSM uses "
+            "90s (its dispatch latency is higher). The mint runs over the same "
+            "ssh transport as the tunnel, so a host behind a ProxyCommand or "
+            "jump host pays the proxy handshake here too. An explicit value "
+            "applies to both transports, so size it for the slowest transport "
+            "you use. Clamped to [10, 120].",
         ),
     )
     max_recovery_attempts: int = field(
@@ -4314,14 +4517,16 @@ class InstancesConfig:
                 _DEFAULT_TUNNEL_BASE_PORT,
             )
             object.__setattr__(self, "tunnel_base_port", _DEFAULT_TUNNEL_BASE_PORT)
-        if self.connect_timeout_secs < 1.0:
+        if self.connect_timeout_secs is not None and self.connect_timeout_secs < 1.0:
             logger.warning(
-                "instances.connect_timeout_secs %s < 1, using %s",
+                "instances.connect_timeout_secs %s < 1, using the transport default",
                 self.connect_timeout_secs,
-                _DEFAULT_CONNECT_TIMEOUT,
             )
-            object.__setattr__(self, "connect_timeout_secs", _DEFAULT_CONNECT_TIMEOUT)
-        elif self.connect_timeout_secs > _CONNECT_TIMEOUT_CEILING:
+            object.__setattr__(self, "connect_timeout_secs", None)
+        elif (
+            self.connect_timeout_secs is not None
+            and self.connect_timeout_secs > _CONNECT_TIMEOUT_CEILING
+        ):
             logger.warning(
                 "instances.connect_timeout_secs %s > %s, clamping to %s",
                 self.connect_timeout_secs,
@@ -4329,6 +4534,24 @@ class InstancesConfig:
                 _CONNECT_TIMEOUT_CEILING,
             )
             object.__setattr__(self, "connect_timeout_secs", _CONNECT_TIMEOUT_CEILING)
+        if self.mint_timeout_secs is not None and self.mint_timeout_secs < _MINT_TIMEOUT_FLOOR:
+            logger.warning(
+                "instances.mint_timeout_secs %s < %s, using the transport default",
+                self.mint_timeout_secs,
+                _MINT_TIMEOUT_FLOOR,
+            )
+            object.__setattr__(self, "mint_timeout_secs", None)
+        elif (
+            self.mint_timeout_secs is not None
+            and self.mint_timeout_secs > _MINT_TIMEOUT_CEILING
+        ):
+            logger.warning(
+                "instances.mint_timeout_secs %s > %s, clamping to %s",
+                self.mint_timeout_secs,
+                _MINT_TIMEOUT_CEILING,
+                _MINT_TIMEOUT_CEILING,
+            )
+            object.__setattr__(self, "mint_timeout_secs", _MINT_TIMEOUT_CEILING)
         if self.max_recovery_attempts < 1:
             logger.warning(
                 "instances.max_recovery_attempts %d < 1, using %d",
@@ -5631,6 +5854,8 @@ class KiroCrewConfig:
         instances_data = data.get("instances", {})
         if not isinstance(instances_data, dict):
             instances_data = {}
+        connect_timeout_raw = instances_data.get("connect_timeout_secs")
+        mint_timeout_raw = instances_data.get("mint_timeout_secs")
         mcp_gateway_data = data.get("mcp_gateway", {})
         if not isinstance(mcp_gateway_data, dict):
             mcp_gateway_data = {}
@@ -5687,6 +5912,17 @@ class KiroCrewConfig:
                         description=entry.get("description", ""),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
+                        # Same guard family as model/triggers: config.json is
+                        # hand-editable, so a junk value must collapse to 0
+                        # (inherit the global window), never crash the load.
+                        # lo=0 keeps a negative override from arming an
+                        # instant-cancel window.
+                        watchdog_tool_stall_suspect_secs=_safe_float(
+                            entry.get("watchdog_tool_stall_suspect_secs", 0.0), 0.0, lo=0.0
+                        ),
+                        watchdog_tool_stall_hard_cap_secs=_safe_float(
+                            entry.get("watchdog_tool_stall_hard_cap_secs", 0.0), 0.0, lo=0.0
+                        ),
                         telegram_account=entry.get("telegram_account", ""),
                     )
 
@@ -5776,6 +6012,12 @@ class KiroCrewConfig:
                     CHAT_TURN_TIMEOUT_MIN,
                     CHAT_TURN_TIMEOUT_MAX,
                 ),
+                session_start_timeout_secs=_safe_int(
+                    agent_data.get("session_start_timeout_secs", 90),
+                    90,
+                    SESSION_START_TIMEOUT_MIN,
+                    SESSION_START_TIMEOUT_MAX,
+                ),
                 tool_approval_timeout_secs=_safe_int(
                     agent_data.get("tool_approval_timeout_secs", 600),
                     600,
@@ -5792,6 +6034,7 @@ class KiroCrewConfig:
                 ),
                 resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
                 resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
+                admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
                 subagent_max_turns=agent_data.get("subagent_max_turns", 100),
                 subagent_timeout_secs=agent_data.get("subagent_timeout_secs", 1800),
                 subagent_stall_idle_secs=_safe_int(
@@ -6137,6 +6380,7 @@ class KiroCrewConfig:
                 quick_send=dashboard_data.get("quick_send", False),
                 session_grid=dashboard_data.get("session_grid", False),
                 mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
+                auto_open_git_panel=_safe_bool(dashboard_data.get("auto_open_git_panel"), False),
                 widget_density=dashboard_data.get("widget_density", "more"),
                 verbosity=dashboard_data.get("verbosity", "default"),
                 link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
@@ -6186,6 +6430,14 @@ class KiroCrewConfig:
                 ),
                 gitlab_hosts=_coerce_gitlab_hosts(dashboard_data.get("gitlab_hosts")),
                 jira_hosts=_coerce_jira_hosts(dashboard_data.get("jira_hosts")),
+                jira_auth=[
+                    JiraAuthEntry(
+                        host=str(entry.get("host", "")),
+                        email=str(entry.get("email", "")),
+                    )
+                    for entry in (dashboard_data.get("jira_auth") or [])
+                    if isinstance(entry, dict) and entry.get("host")
+                ],
             ),
             tunnel=TunnelConfig(
                 enabled=bool(tunnel_data.get("enabled", False)),
@@ -6361,9 +6613,15 @@ class KiroCrewConfig:
                 ssh_compression=bool(
                     instances_data.get("ssh_compression", _DEFAULT_SSH_COMPRESSION)
                 ),
-                connect_timeout_secs=_safe_float(
-                    instances_data.get("connect_timeout_secs", _DEFAULT_CONNECT_TIMEOUT),
-                    _DEFAULT_CONNECT_TIMEOUT,
+                connect_timeout_secs=(
+                    _safe_float(connect_timeout_raw, _DEFAULT_CONNECT_TIMEOUT)
+                    if connect_timeout_raw is not None
+                    else None
+                ),
+                mint_timeout_secs=(
+                    _safe_float(mint_timeout_raw, _DEFAULT_MINT_TIMEOUT)
+                    if mint_timeout_raw is not None
+                    else None
                 ),
                 max_recovery_attempts=_safe_int(
                     instances_data.get("max_recovery_attempts", _DEFAULT_MAX_RECOVERY),
@@ -6465,14 +6723,7 @@ class KiroCrewConfig:
                 needs_migration = True
 
             if needs_migration:
-                backup = path.with_suffix(".json.bak")
-                import shutil
-
-                shutil.copy2(path, backup)
-                logger.info(
-                    "Config migrated — backup saved to %s",
-                    backup,
-                )
+                _write_migration_backup(path)
                 cfg.save()
         except Exception as e:
             # Migration write-back is best-effort; never block startup.
@@ -6651,6 +6902,23 @@ class KiroCrewConfig:
                     k, v = line.split("=", 1)
                     creds[k.strip()] = v.strip()
 
+            # Warn once per boot about keys not in the recognised allowlist.
+            # These keys still propagate (operators use them for proxy/feature
+            # settings), but the warning makes the behavior visible rather than
+            # silently surprising.  The encrypted vault (PR 1+) will provide a
+            # proper agent-isolated path for secrets.
+            unknown = set(creds) - set(_CREDENTIAL_KEYS) - _warned_env_keys
+            if unknown:
+                _warned_env_keys.update(unknown)
+                for uk in sorted(unknown):
+                    logger.warning(
+                        "Unknown key %s in .env is not a recognised credential"
+                        " -- it will propagate to child processes but is NOT"
+                        " agent-isolated. Recognised keys: %s",
+                        uk,
+                        ", ".join(sorted(_CREDENTIAL_KEYS)),
+                    )
+
         for key in _CREDENTIAL_KEYS:
             val = os.environ.get(key)
             if val:
@@ -6732,9 +7000,14 @@ class KiroCrewConfig:
             cwd: str | None = None,
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
+            crew_agent: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
+            # Canonical crew identity for the session (keys per-agent watchdog
+            # windows on the handle) — one shared resolution rule, see
+            # resolve_crew_identity.
+            crew_agent = resolve_crew_identity(self, agent, crew_agent)
             # Resolve the model, highest tier first:
             #   1. model_override — the caller's explicit pick. The dashboard
             #      passes the slot's own model, else the KiroCrew agent's
@@ -6792,6 +7065,7 @@ class KiroCrewConfig:
                 work_dir=wdir,
                 model=m,
                 agent=agent,
+                crew_agent=crew_agent,
                 sandbox_mode=sandbox,
                 session_key=session_key,
                 channel_id=channel_id,
@@ -7173,6 +7447,35 @@ def _project_declares_agent(agent_name: str, project_dir: str) -> bool:
     except Exception:  # noqa: BLE001 — a probe failure only costs a fallback
         logger.debug("Project agent probe failed for %r", agent_name, exc_info=True)
         return False
+
+
+def resolve_crew_identity(
+    config: "KiroCrewConfig", agent: str | None, crew_agent: str | None
+) -> str:
+    """Canonical Kiro Crew identity (a ``config.agents`` key) for a session.
+
+    One rule shared by every session-granting path (provider factory, warm-pool
+    claim) so cold starts and claims can never disagree. An explicit
+    ``crew_agent`` wins verbatim — including "" ("no crew"), which is how the
+    dashboard, the one kiro-name-passing surface, opts out of the fallback.
+    When absent, the surface convention documented on
+    :func:`_resolve_model_for_agent` applies: Slack threads, cron jobs and
+    spawned agents pass a CREW name as ``agent``, so crew-namespace membership
+    makes it canonical — a membership check on names the surface owns, not a
+    cross-namespace match.
+    """
+    if crew_agent is not None:
+        return crew_agent
+    if agent and agent in config.agents:
+        # DEBUG, not INFO: every Slack/cron session resolves here routinely.
+        # The line exists so a kiro-template name that collides with a crew
+        # key (which would silently inherit that crew's watchdog windows) is
+        # diagnosable from logs.
+        logger.debug(
+            "crew_agent %r resolved by crew-namespace fallback", agent
+        )
+        return agent
+    return ""
 
 
 def resolve_agent_bindings(
