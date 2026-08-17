@@ -83,6 +83,8 @@ from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _run_chat
 from kiro_crew.dashboard.chat_utils import (
+    CRON_NOTIFICATION_KIND,
+    SUBAGENT_COMPLETION_KIND,
     dashboard_slot_key,
     mint_options_token,
     remember_slack_options,
@@ -1166,6 +1168,17 @@ class GatewayOrchestrator:
 
         async def _approve(event: LLMEvent, parent_session_key: str = "") -> bool:
             request_id = str(event.request_id)
+            # Low-fidelity CHILD request: the structured security context is
+            # absent, so every field a shortcut below would judge (title,
+            # read-only classification, trust patterns) is agent-authored.
+            # Such a request may ONLY be approved by the human prompt at the
+            # end of this callback — every non-human auto-approve shortcut
+            # (auto_approve_sources, --approval yolo/reads, YOLO override,
+            # slot trust) is skipped for it. Strict ``is True``: real events
+            # (AcpEvent) return a genuine bool; anything else (e.g. a mock
+            # or a foreign event type) must not accidentally enter the
+            # restricted path on a truthy non-bool.
+            _child_lf = getattr(event, "child_low_fidelity", False) is True
             # Background callers pass the authoritative parent session key. Prefer it
             # over a request-ID resolver because tool permission IDs are opaque UUIDs,
             # unlike spawn approvals (``spawn:<agent_id>``). Treating a tool request ID
@@ -1203,13 +1216,27 @@ class GatewayOrchestrator:
 
             # Per-source auto-approve (e.g. cron, taskrunner, subagent)
             if source in self._cfg.hooks.get("auto_approve_sources", []):
+                if _child_lf:
+                    # The operator explicitly configured this source to run
+                    # UNATTENDED — nobody is watching the interactive window,
+                    # so parking a low-fidelity child request there would
+                    # stall the run for the full approval timeout and then
+                    # deny anyway. Fail closed fast instead (an approve is
+                    # still never allowed on agent-authored context).
+                    logger.warning(
+                        "Fast-denying low-fidelity child request under "
+                        "auto-approve source %s (unattended; title is "
+                        "agent-authored)",
+                        source,
+                    )
+                    return False
                 logger.info("Auto-approving tool %s from source %s", event.title, source)
                 return True
 
             # CLI --approval flag override (composable test mode).
             # 'yolo' auto-approves all; 'reads' auto-approves read-only tools;
             # 'interactive' falls through to the standard flow.
-            if self._approval_mode in ("yolo", "reads"):
+            if self._approval_mode in ("yolo", "reads") and not _child_lf:
                 approve = self._approval_mode == "yolo" or (
                     self._approval_mode == "reads" and _is_read_only_tool(event.title or "")
                 )
@@ -1232,7 +1259,7 @@ class GatewayOrchestrator:
                     return True
 
             # Check both YOLO sources: Slack handler (!yolo on) and dashboard UI
-            if safety_override().is_active():
+            if safety_override().is_active() and not _child_lf:
                 return True
 
             if self.dashboard_state:
@@ -1262,7 +1289,18 @@ class GatewayOrchestrator:
 
                 if _parent_slot_key:
                     _ps = (self.dashboard_state._slots or {}).get(_parent_slot_key)
-                    if _ps and _ps._trust:
+                    if _ps and _ps._trust and _child_lf:
+                        # Slot IS trusted; the fidelity gate is what blocks
+                        # the auto-approve. A distinct audit reason — an
+                        # auditor reading "not_trusted" for a trusted slot
+                        # would reconstruct the wrong cause.
+                        _sel_log(
+                            caller=f"slot:{_parent_slot_key}",
+                            operation=f"{source}.scoped_trust_blocked_low_fidelity_child",
+                            outcome="not_auto_approved",
+                            resources=_safe_title,
+                        )
+                    elif _ps and _ps._trust:
                         _sel_log(
                             caller=f"slot:{_parent_slot_key}",
                             operation=f"{source}.scoped_trust_auto_approve",
@@ -1430,6 +1468,11 @@ class GatewayOrchestrator:
                     slot=approval_slot,
                     is_background=is_background,
                 )
+            if _child_lf:
+                # No human surface answered and none of the (skipped)
+                # shortcuts may speak for an agent-authored request:
+                # fail closed.
+                return False
             return True  # no UI → auto-approve
 
         return _approve
@@ -2221,7 +2264,7 @@ class GatewayOrchestrator:
                         wrapped = f'[Cron notification: "{label}"]\n{message}\n[/Cron notification]'
                         inject_cls = json.dumps({"cronLabel": label})
                         if slot.running:
-                            qid = slot.queue_append(wrapped)
+                            qid = slot.queue_append(wrapped, kind=CRON_NOTIFICATION_KIND)
                             _cls = json.loads(inject_cls)
                             _cls["queue_id"] = qid
                             slot.append("queued", wrapped, json.dumps(_cls))
@@ -5178,7 +5221,9 @@ class GatewayOrchestrator:
                                 # drained row is a card without re-parsing the
                                 # prose (#1792); _start_next_queued_turn reads them.
                                 _injection_slot.queue_append(
-                                    announce, meta={SUBAGENT_COMPLETION_META_KEY: sub_meta}
+                                    announce,
+                                    kind=SUBAGENT_COMPLETION_KIND,
+                                    meta={SUBAGENT_COMPLETION_META_KEY: sub_meta},
                                 )
                                 self.dashboard_state.push_slots_update()
                                 logger.info("Subagent %s → queued in %s", info.id, _slot_name)

@@ -216,6 +216,12 @@ _CREDENTIAL_KEYS = (
     CRED_KIRO_API_KEY,
 )
 
+# Per-host Jira tokens use a hex-encoded host suffix: JIRA_TOKEN_<HEX>.
+# Only hex chars are valid — restricting the pattern prevents forged key names
+# injected via multiline env values from reaching the eval-based value reader
+# in the Docker entrypoint.
+_JIRA_TOKEN_RE = _re.compile(r"^JIRA_TOKEN_[0-9A-Fa-f]+$")
+
 # Keys from .env that were already warned about (fire once per gateway boot).
 _warned_env_keys: set[str] = set()
 
@@ -587,13 +593,37 @@ def oauth_endpoints_path() -> Path:
     return config_dir() / "oauth_endpoints.json"
 
 
-def read_local_secret() -> str:
-    """Read ``<config_dir>/.local_secret`` (the gateway IPC secret), or ``""``.
+def read_local_secret(port: int) -> str:
+    """Read the internal-API credential for the gateway on *port*.
 
-    Single home for the secret-file read that callers (cron scripts, MCP tool
-    bridges, CLI) need to authenticate to the gateway's internal API. Returns
-    empty string if the file is absent/unreadable.
+    Single home for the secret read that callers (cron scripts, MCP tool bridges,
+    CLI) need to authenticate to the gateway's internal API. Returns empty string
+    when no credential can be read.
+
+    Resolution is per LISTENER first: ``run/gateway-<port>.secret``, then the
+    shared ``.local_secret``. That order is the invariant, and it lives here rather
+    than in each reader because the credential identifies ONE gateway generation
+    while the shared file has one slot per data home, last-writer-wins. A caller
+    that reads the shared file while a different generation owns the port it dials
+    gets 403 on every internal call.
+
+    *port* is REQUIRED, and deliberately so: the credential is a function of the
+    dial target, so inferring the target here would let a caller dial one gateway
+    while authenticating for another -- the exact desync this helper exists to
+    close, reintroduced one call site at a time and invisible at the call site. A
+    caller with no port must resolve one explicitly and pass it, where the choice
+    is reviewable.
     """
+    # Function-local: port_resolution imports this module, so a module-level
+    # import would be circular.
+    from kiro_crew.instances import run_marker
+
+    try:
+        per_port = run_marker.read_secret(int(port))
+    except Exception:
+        per_port = ""
+    if per_port:
+        return per_port
     try:
         return (config_dir() / ".local_secret").read_text().strip()
     except OSError:
@@ -2630,6 +2660,14 @@ class DashboardConfig:
             "'more' encourages widgets for any visual content; "
             "'less' limits to only when markdown is clearly insufficient.",
             enum=["more", "less"],
+        ),
+    )
+    use_builtin_browser: bool = field(
+        default=True,
+        metadata=_meta(
+            "Use Built-in Browser",
+            "When on, the browser tool opens pages in Kiro Crew's built-in panel "
+            "(desktop app only). When off, the agent browses via playwright-cli.",
         ),
     )
     verbosity: str = field(
@@ -6032,6 +6070,7 @@ class KiroCrewConfig:
                 subagent_spawn_stagger_secs=_safe_float(
                     agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
                 ),
+                spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
                 resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
                 resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
                 admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
@@ -6330,6 +6369,9 @@ class KiroCrewConfig:
                 reactions_enabled=bool(slack_data.get("reactions_enabled", True)),
                 use_tunnel_url=bool(slack_data.get("use_tunnel_url", False)),
                 show_thinking=bool(slack_data.get("show_thinking", True)),
+                home_tab_sessions_per_kind=_safe_int(
+                    slack_data.get("home_tab_sessions_per_kind", 5), 5
+                ),
             ),
             publish=PublishConfig(
                 allowed_destinations=[
@@ -6382,6 +6424,7 @@ class KiroCrewConfig:
                 mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
                 auto_open_git_panel=_safe_bool(dashboard_data.get("auto_open_git_panel"), False),
                 widget_density=dashboard_data.get("widget_density", "more"),
+                use_builtin_browser=_safe_bool(dashboard_data.get("use_builtin_browser"), True),
                 verbosity=dashboard_data.get("verbosity", "default"),
                 link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
                 usage_text_scrape_enabled=_safe_bool(
@@ -6944,7 +6987,9 @@ class KiroCrewConfig:
         for k, v in creds.items():
             if not v:
                 continue
-            if scrubbed and k in _CREDENTIAL_KEYS:
+            if scrubbed and (
+                k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)
+            ):
                 continue
             os.environ.setdefault(k, v)
 

@@ -45,6 +45,7 @@
     "k_search_for_anything": "⌘K — कुछ भी खोजें…",
     "kiro_credit_usage_checking": "Kiro क्रेडिट उपयोग — जाँचा जा रहा है…",
     "kiro_credit_usage_checking_2": "Kiro क्रेडिट उपयोग — जाँचा जा रहा है",
+    "kiro_credit_usage_unavailable": "Kiro क्रेडिट उपयोग — अनुपलब्ध",
     "kiro_discord_community": "Kiro Discord कम्युनिटी",
     "main_navigation": "मुख्य नेविगेशन",
     "manage_account": "खाता प्रबंधित करें",
@@ -635,32 +636,24 @@
           "step_why_it_matters": "यह क्यों मायने रखता है"
         },
         "reviewChat": {
-          "closed_notice": "यह बातचीत समाप्त हो गई और समीक्षक अब लोड नहीं है, इसलिए वह कुछ नया उत्तर नहीं दे सकता। ऊपर के प्रश्न सुरक्षित रहते हैं।",
-          "empty_hint": "यह समीक्षक अपने निष्कर्षों के पीछे का तर्क अब भी रखता है। पूछें कि कोई निष्कर्ष क्यों उठाया गया, या उसने क्या जाँचा।",
-          "end_chat": "बातचीत समाप्त करें",
-          "error_busy": "वह अभी पिछले प्रश्न का उत्तर दे रहा है।",
-          "error_empty": "पहले प्रश्न लिखें।",
-          "error_expired": "समीक्षक अब लोड नहीं है, इसलिए उत्तर नहीं दे सकता। और पूछने के लिए इस पुल रिक्वेस्ट की फिर समीक्षा करें।",
-          "error_generic": "प्रश्न का उत्तर नहीं मिल सका। फिर कोशिश करें।",
-          "error_needs_override": "यह बातचीत जारी रखने के लिए YOLO चालू करें — उत्तर देने में टूल चलाना पड़ सकता है।",
-          "error_override_expiring": "उत्तर पूरा होने से पहले ही टूल अनुमति समाप्त हो जाएगी। इसे बढ़ाएँ और फिर पूछें।",
-          "error_override_lapsed": "समीक्षक के उत्तर देते समय टूल अनुमति समाप्त हो गई, इसलिए उत्तर रोक दिया गया। दोबारा अनुमति दें और फिर पूछें।",
-          "error_persist_failed": "उत्तर सहेजा नहीं जा सका, इसलिए वह इस बातचीत का हिस्सा नहीं है। फिर पूछें।",
-          "error_tool_denied": "समीक्षक ने ऐसा टूल उपयोग करने की कोशिश की जिसे आपकी सुरक्षा नीति रोकती है, इसलिए उत्तर रोक दिया गया। कुछ भी नहीं चला।",
-          "error_transcript_unsafe": "यह बातचीत सुरक्षित रूप से सहेजी नहीं जा सकती, इसलिए इसे लिखा नहीं गया। समीक्षा का फ़ोल्डर जाँचें।",
+          "error_generic": "फ़ॉलो-अप सेशन नहीं खोला जा सका। पुनः प्रयास करें।",
           "error_run_deleted": "यह समीक्षा हटा दी गई, इसलिए बातचीत समाप्त हो गई।",
-          "error_too_long": "यह प्रश्न बहुत लंबा है। छोटा करके फिर भेजें।",
-          "needs_override_notice": "समीक्षक अब भी लोड है, लेकिन टूल की अनुमति के बिना उत्तर नहीं दे सकता — उत्तर देने के लिए उसे कोड पढ़ना पड़ सकता है। जारी रखने के लिए YOLO चालू करें।",
-          "placeholder": "पूछें कि यह निष्कर्ष क्यों उठाया गया…",
           "ran_tools": "देखा गया: {{tools}}",
           "reasoning": "तर्क",
           "refused_notice": "पूरा उत्तर देने के लिए उसे एक टूल चलाना था, जिसकी अनुमति नहीं मिली, इसलिए यह उत्तर सीमित है। अनुमति देने के लिए YOLO चालू करें।",
           "role_reviewer": "समीक्षक",
           "role_you": "आप",
-          "send": "भेजें",
-          "sending": "पूछ रहे हैं…",
           "title": "समीक्षक से पूछें",
-          "unsent_label": "भेजा नहीं गया"
+          "earlier_questions": "पिछले प्रश्न",
+          "resume_hint": "एक चैट खोलता है जो समीक्षक को फिर से शुरू करता है, इसलिए निष्कर्षों के पीछे का तर्क बना रहता है।",
+          "open_session": "फ़ॉलो-अप सेशन खोलें",
+          "opening": "खोल रहे हैं…",
+          "not_recorded_notice": "इस समीक्षा ने समीक्षक सेशन नहीं रखा, इसलिए फिर से खोलने के लिए कुछ नहीं है। सवाल पूने के लिए इस पुल रिक्वेस्ट की समीक्षा दोबारा करें।",
+          "transcript_gone_notice": "समीक्षक का सेशन अब डिस्क पर नहीं है, इसलिए फिर से खोलने के लिए कुछ नहीं है। सवाल पूछने के लिए इस पुल रिक्वेस्ट की समीक्षा दोबारा करें।",
+          "continue_hint": "इस समीक्षक से बातचीत चैट टैब में जारी रहती है।",
+          "continue_session": "फ़ॉलो-अप सेशन जारी रखें",
+          "run_live_notice": "यह समीक्षा अफी चल रही है। पूरी होने तक निष्कर्ष बदल सकते हैं, इसलिए अबी पूछने के लिए कुछ नहीं है।",
+          "loading": "लोड हो रहा है…"
         },
         "runCard": {
           "cancel": "रद्द करो",
@@ -1539,6 +1532,9 @@
           "regenerate_summary": "सारांश फिर से तैयार करें",
           "retry": "पुनः प्रयास करें"
         },
+        "detailOverflowMenu": {
+          "more_actions": "और कार्रवाइयां"
+        },
         "filterRow": {
           "sign_in_with_the_gh_cli_to_use_this_filter": "इस फ़िल्टर का उपयोग करने के लिए gh CLI से साइन इन करें"
         },
@@ -1572,10 +1568,8 @@
           "assignees": "असाइनी",
           "by": "· द्वारा",
           "changed_the_title": "ने शीर्षक बदला",
-          "close": "बंद करें",
           "close_as_completed": "पूर्ण के रूप में बंद करें",
           "close_as_not_planned": "नियोजित नहीं के रूप में बंद करें",
-          "close_this_issue": "यह इश्यू बंद करें",
           "closed": "बंद",
           "closed_as_not_planned": "नियोजित नहीं के रूप में बंद किया गया",
           "closed_this": "ने इसे बंद किया",
@@ -1583,7 +1577,6 @@
           "copy_link_to_this_issue": "इस इश्यू का लिंक कॉपी करें",
           "couldn_t_load_activity": "गतिविधि लोड नहीं हो सकी:",
           "dates": "तिथियाँ",
-          "dismiss_menu": "मेनू बंद करें",
           "done": "पूर्ण",
           "edit": "संपादित करें",
           "finding_suggestions": "सुझाव खोजे जा रहे हैं…",
@@ -1607,7 +1600,6 @@
           "opened": "ने खोला",
           "opened_2": "खोला गया",
           "opened_this_issue": "ने यह इश्यू खोला",
-          "re_fetch_issue_and_timeline_from": "{{provider}} से यह इश्यू और इसकी टाइमलाइन दोबारा लाओ",
           "read_only_connect_with_triage_push_access_to_app": "केवल पढ़ने के लिए — लागू करने के लिए triage/push एक्सेस के साथ कनेक्ट करें।",
           "read_only_connect_with_triage_push_access_to_app_2": "केवल पढ़ने के लिए — लागू करने के लिए triage/push एक्सेस के साथ कनेक्ट करें",
           "referenced_this_in": "ने इसका उल्लेख इसमें किया:",
@@ -1616,7 +1608,6 @@
           "removed_the": "ने हटाया:",
           "removed_this_from_the": "ने इसे इससे हटाया:",
           "reopen": "फिर से खोलें",
-          "reopen_this_issue": "इस इश्यू को फिर से खोलें",
           "reopened_this": "ने इसे फिर से खोला",
           "self_assigned_this": "ने इसे स्वयं को असाइन किया",
           "suggested": "सुझाए गए",
@@ -1815,7 +1806,6 @@
           "opened": "खोला",
           "opened_2": "खोला गया",
           "passed": "पास",
-          "re_fetch_this_and_its_timeline_from": "{{provider}} से यह {{subject}} और इसकी टाइमलाइन दोबारा लाओ",
           "referenced_this_in": "इसका संदर्भ दिया:",
           "refresh_details": "{{subject}} का विवरण रिफ़्रेश करो",
           "removed_the": "हटाया",
@@ -2438,6 +2428,9 @@
         "viewSection": "दृश्य",
         "view_folders": "फ़ोल्डर",
         "view_list": "सपाट सूची"
+      },
+      "preview": {
+        "mermaidError": "अमान्य Mermaid आरेख — स्रोत दिखाया जा रहा है।"
       },
       "row": {
         "delete": "नोट हटाएँ",
@@ -4337,6 +4330,20 @@
     "viewPr": "पुल रिक्वेस्ट"
   },
   "components": {
+    "crewWakeSection": {
+      "active": "चालू",
+      "could_not_load_this_crew_s_schedules_so_what_wak": "इस Crew के शेड्यूल लोड नहीं हो सके, इसलिए इसे क्या जगाता है यह अज्ञात है।",
+      "no_schedules_run_this_crew_automatically": "कोई शेड्यूल इस Crew को अपने आप नहीं चलाता।",
+      "open_schedule": "शेड्यूल खोलो",
+      "pause_named": "{{name}} रोको",
+      "paused": "रुका हुआ",
+      "resume_named": "{{name}} फिर शुरू करो",
+      "run_named_now": "{{name}} अभी चलाओ",
+      "running": "चल रहा है",
+      "schedule": "शेड्यूल",
+      "schedules_that_run_this_crew_without_you_asking": "वे शेड्यूल जो तुम्हारे कहे बिना इस Crew को चलाते हैं। ऊपर दिए Triggers से अलग, जो केवल यह तय करता है कि ऑर्केस्ट्रेटर इस Crew को कब चुनेगा।",
+      "what_wakes_this_crew": "इस Crew को क्या जगाता है"
+    },
     "kiroAccountModal": {
       "account_details_unavailable": "खाता विवरण उपलब्ध नहीं है",
       "checking_account": "खाता जाँचा जा रहा है…",
@@ -5122,6 +5129,7 @@
       "invalid_json": "अमान्य JSON:",
       "items": "आइटम",
       "lines": "पंक्तियाँ",
+      "media_preview_failed": "प्लेबैक विफल रहा। ब्राउज़र इस फ़ाइल को डिकोड नहीं कर सकता।",
       "more": "और",
       "null": "null",
       "office_download_hint": "Office दस्तावेज़ों का इनलाइन पूर्वावलोकन नहीं किया जा सकता। Word, Excel, PowerPoint या किसी संगत व्यूअर में खोलने के लिए डाउनलोड करें।",
@@ -5305,7 +5313,7 @@
       "provider_github": "GitHub",
       "provider_jira": "Jira",
       "provider_gitlab": "GitLab",
-      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN in your .env file."
+      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
     "jobForm": {
       "a_short_label_for_this_job": "इस जॉब के लिए एक छोटा लेबल",
@@ -6112,6 +6120,10 @@
       "move_to_folder": "फ़ोल्डर में ले जाएँ…",
       "pin": "पिन करें",
       "pop_out_to_window": "अलग विंडो में खोलें",
+      "reload_blocked_running": "टर्न चल रहा है",
+      "reload_blocked_subagents": "उप-एजेंट कार्यरत",
+      "reload_session": "सत्र फिर से लोड करें",
+      "reload_session_tooltip": "MCP/कॉन्फ़िगरेशन परिवर्तनों को लागू करने के लिए एजेंट प्रक्रिया को फिर से शुरू करता है। बातचीत बनी रहती है।",
       "rename": "नाम बदलें",
       "reveal_in_sidebar": "साइडबार में दिखाएँ",
       "switch_to_autopilot": "ऑटोपायलट पर जाएँ",
@@ -6405,8 +6417,13 @@
       "no_noun_match": "कोई {{noun}} मेल नहीं"
     },
     "updateModal": {
+      "back_to_dashboard": "डैशबोर्ड पर वापस जाएँ",
       "dismiss": "खारिज करें",
       "dismiss_update_dialog": "अपडेट डायलॉग बंद करें",
+      "install_failed": "अपडेट इंस्टॉल नहीं हो सका",
+      "install_failed_body": "अपडेट लागू नहीं किया जा सका। Kiro Crew लोकल गेटवे बहाल कर रहा है — इसी वर्शन का उपयोग जारी रखो और सेटिंग्स > अबाउट से फिर से कोशिश करो।",
+      "installing_update": "अपडेट इंस्टॉल हो रहा है...",
+      "installing_update_body": "Kiro Crew लोकल गेटवे रोककर अपडेट इंस्टॉल कर रहा है। इसमें एक मिनट लग सकता है — ऐप बंद मत करो; यह अपने आप फिर से शुरू हो जाएगा।",
       "is_downloaded_and_ready_to_install": "डाउनलोड हो गया है और इंस्टॉल के लिए तैयार है।",
       "kirocrew": "Kiro Crew",
       "later": "बाद में",
@@ -6639,6 +6656,14 @@
       "refresh": "रिफ़्रेश करें",
       "title": "Git",
       "uncommitted": "{{count}} अनकमिटेड"
+    },
+    "skillsMultiSelect": {
+      "add_skill": "Add skill",
+      "remove_skill": "Remove {{name}}",
+      "filter_skills": "Filter skills...",
+      "no_matching_skills": "No matching skills",
+      "skills_hint": "Skills loaded when this hook matches — no command needed.",
+      "selected": "Selected"
     }
   },
   "hooks": {
@@ -6653,6 +6678,8 @@
     },
     "useCronActions": {
       "failed_to_cancel_job": "जॉब रद्द करने में विफल",
+      "failed_to_pause_job": "जॉब रोकने में विफल",
+      "failed_to_resume_job": "जॉब फिर शुरू करने में विफल",
       "failed_to_open_in_chat": "चैट में खोलने में विफल",
       "failed_to_run_job": "जॉब चलाने में विफल"
     },
@@ -6699,7 +6726,8 @@
       "subagents": "सब-एजेंट",
       "summary": "सारांश",
       "workflows": "वर्कफ़्लो",
-      "git": "Git"
+      "git": "Git",
+      "pins": "पिन"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "सभी स्लॉट भरे हुए हैं",
@@ -6736,6 +6764,8 @@
     },
     "useSessionActions": {
       "close_this_session": "यह सेशन बंद करें?",
+      "reload_failed": "सत्र फिर से लोड नहीं हो सका। एजेंट व्यस्त हो सकता है या गेटवे उपलब्ध नहीं है; सत्र निष्क्रिय होने पर पुनः प्रयास करें।",
+      "reload_failed_subagents": "इस सत्र पर उप-एजेंट अभी भी काम कर रहे हैं। उनके समाप्त होने पर पुनः प्रयास करें।",
       "switch_to_autopilot_mode_future_messages_will_us": "ऑटोपायलट मोड पर स्विच करें? आगे के संदेश ऑटोपायलट व्यवहार (योजना → अनुमोदन → निष्पादन) का उपयोग करेंगे।",
       "switch_to_normal_chat_mode_future_messages_will": "सामान्य चैट मोड पर स्विच करें? आगे के संदेश मानक चैट व्यवहार का उपयोग करेंगे।"
     },
@@ -7795,7 +7825,9 @@
         "this_app_render_is_no_longer_available": "यह ऐप रेंडर अब उपलब्ध नहीं है। इसे देखने के लिए टूल फिर से चलाएँ।",
         "turn_diff": "टर्न डिफ़",
         "menu_git": "Git",
-        "menu_git_desc": "ब्रांच, परिवर्तन और हाल के कमिट"
+        "menu_git_desc": "ब्रांच, परिवर्तन और हाल के कमिट",
+        "menu_pins": "पिन",
+        "menu_pins_desc": "इस सेशन में पिन किए गए संदेश"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "रोकना विफल, सत्र रीसेट",
@@ -7915,9 +7947,8 @@
       },
       "pins": {
         "pinned_messages": "पिन किए गए संदेश",
-        "close_panel": "पिन किए गए संदेश पैनल बंद करें",
         "loading": "लोड हो रहा है…",
-        "no_pinned_messages": "अभी तक कोई पिन किया गया संदेश नहीं। महत्वपूर्ण संदेशों को जल्दी खोजने के लिए पिन करें।",
+        "no_pinned_messages": "अभी कोई पिन किया गया संदेश नहीं है। चैट में किसी संदेश पर कर्सर ले जाकर पिन आइकन पर क्लिक करने से वह यहाँ सहेजा जाएगा।",
         "message_unavailable": "यह पिन किया गया संदेश लोड किए गए इतिहास में अब उपलब्ध नहीं है।",
         "pin_failed": "संदेश पिन नहीं किया जा सका। फिर से कोशिश करें।",
         "unpin_failed": "संदेश से पिन नहीं हटाया जा सका। फिर से कोशिश करें।",
@@ -7930,7 +7961,6 @@
         "copy_preview": "टेक्स्ट कॉपी करें",
         "copy_link": "संदेश का लिंक कॉपी करें",
         "unpin": "अनपिन",
-        "open_pinned_messages": "पिन किए गए संदेश खोलें",
         "jump_to_message": "संदेश पर जाएं"
       },
       "sessionSummary": {
@@ -8209,6 +8239,7 @@
       "show_collapsed_folders": "समेटे गए फ़ोल्डर दिखाएं:",
       "show_folder": "फ़ोल्डर दिखाएँ",
       "show_in_flat_view": "{{name}} को सपाट व्यू में दिखाओ",
+      "show_only_sessions_tagged": "केवल {{name}} टैग वाले सत्र दिखाएँ",
       "show_the_folder_list": "फ़ोल्डर सूची दिखाएँ",
       "skip": "छोड़ें",
       "sort_and_filter_sessions": "सत्र क्रमित और फ़िल्टर करें",
@@ -8222,6 +8253,7 @@
       "sort_oldest": "सबसे पुराने",
       "started_in_channel": "यह बातचीत {{channel}} में शुरू हुई थी।",
       "started_in_direct_message": "यह बातचीत एक डायरेक्ट मैसेज में शुरू हुई थी।",
+      "stop_filtering_by_tag": "{{name}} से फ़िल्टर करना बंद करें",
       "streaming": "स्ट्रीमिंग",
       "switch_all_sessions": "सभी सत्र बदलें",
       "switch_all_to_model": "सभी को इस मॉडल पर बदलें…",
@@ -8231,6 +8263,7 @@
       "switch_to_folder_view": "फ़ोल्डर दृश्य पर जाएँ",
       "switch_to_list_view": "सूची दृश्य पर जाएँ",
       "switching": "स्विच हो रहा है…",
+      "tags": "टैग",
       "temporary_no_memory_reads_or_writes": "अस्थायी — मेमोरी में कोई पठन या लेखन नहीं",
       "thinking": "सोच रहा है…",
       "today": "आज",
@@ -8346,6 +8379,7 @@
       "build_pending": "बिल्ड बाकी है",
       "build_pending_restart_gateway_to_apply_kirocrew": "बिल्ड बाकी है — लागू करने के लिए गेटवे रीस्टार्ट करें (kirocrew restart)",
       "building": "बिल्ड हो रहा है…",
+      "build_finished_restarting_gateway": "बिल्ड पूरा हुआ — गेटवे पुनः प्रारंभ हो रहा है…",
       "built": "बिल्ड हो गया",
       "built_and_ready_spin_up_a_pod_from_the_row_menu": "बिल्ड होकर तैयार — इस ब्रांच का QA करने के लिए रो मेन्यू से पॉड शुरू करें",
       "built_but_pods_cannot_run_on_this_host_preview_i": "बिल्ड हो गया — लेकिन इस होस्ट पर पॉड नहीं चल सकते; इसके बजाय ./dev-backend.sh से प्रीव्यू करें",
@@ -8468,7 +8502,7 @@
       "pull_build_failed_to_start": "पुल+बिल्ड शुरू नहीं हो सका",
       "pull_build_main": "main पुल + बिल्ड करें",
       "pulls_main_and_rebuilds_6_min_does_not_restart": "main पुल करके दोबारा बिल्ड करता है (~6 मिनट)। पुनः आरंभ नहीं करता।",
-      "pulls_main_rebuilds_then_restarts_automatically": "Pulls main, rebuilds (~6 min), then restarts the gateway automatically.",
+      "pulls_main_rebuilds_then_restarts_keep_page_open": "main खींचता है, रीबिल्ड करता है (~6 मिनट), फिर गेटवे स्वतः पुनः प्रारंभ करता है। बिल्ड पूरा होने तक यह पृष्ठ खुला रखें।",
       "purpose": "उद्देश्य:",
       "qa_pod_is_running_but_failing_its_health_check": "QA पॉड चल रहा है पर उसकी हेल्थ जाँच विफल हो रही है",
       "qa_pod_is_running_click_open_to_use_it": "QA पॉड चल रहा है — इसे उपयोग करने के लिए खोलें पर क्लिक करें",
@@ -8653,7 +8687,8 @@
       "timeout": "टाइमआउट",
       "total": "कुल",
       "total_runs": "कुल रन",
-      "user": "उपयोगकर्ता"
+      "user": "उपयोगकर्ता",
+      "matcher_mode": "Matcher mode"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "इस वर्कस्पेस के लिए एक अनूठा पहचानकर्ता। एजेंट वर्कस्पेस को नाम से संदर्भित करते हैं।",
@@ -9018,6 +9053,36 @@
       "without_gateway_per_session_copies": "गेटवे के बिना (हर सत्र की अलग कॉपी)"
     },
     "mcpManagement": {
+      "assessment": {
+        "col_assessment": "आकलन",
+        "col_evidence": "प्रमाण",
+        "col_running_as": "किस रूप में चल रहा है",
+        "connections_link": "Connections",
+        "how_measured": "कोई सर्वर तब तक बिना मापा दिखता है जब तक Kiro Crew उसे जाँच न ले, और यह जाँच {{link}} में MCP सर्वर सूची ताज़ा करने पर एक बार में दो सर्वर पर होती है।",
+        "lede": "Kiro Crew हर सर्वर के बारे में जो देख सका, और वह अभी सर्वर जिस रूप में चल रहा है उससे यह कैसे मेल खाता है। इस व्यू में कुछ भी बदलने से कोई असर नहीं होता — स्विच सर्वर वाले हिस्से में हैं।",
+        "legend": "साझा बैकएंड की सिफ़ारिश करने के लिए सर्वर को यह बताना होता है कि वह अपने कॉलर्स को अलग-अलग पहचान सकता है, और बहुत कम सर्वर यह बताते हैं — इसलिए ज़्यादातर स्वस्थ सर्वर 'कोई आपत्ति नहीं मिली' पर ठहरे रहते हैं। यह सतर्क जवाब है, कोई कमी नहीं, और साझा करना तुम्हारे ही हाथ में है।",
+        "open_servers": "Servers खोलो",
+        "reason_all_tools_read_only": "हर टूल खुद को केवल-पढ़ने वाला घोषित करता है",
+        "reason_caller_sensitive": "दो अलग-अलग कॉलर्स के लिए हैंडशेक का जवाब अलग-अलग दिया",
+        "reason_declares_caller_identity": "घोषित करता है कि वह अपने कॉलर्स को अलग-अलग पहचान सकता है",
+        "reason_first_party": "एक Kiro Crew सर्वर, जो डिज़ाइन से ही एक ही सत्र से बंधा है",
+        "reason_no_objection_found": "अयोग्य ठहराने वाला कुछ नहीं मिला, जो इस प्रमाण से कमज़ोर है कि साझा करना सुरक्षित है",
+        "reason_no_tool_annotations": "किसी टूल ने नहीं बताया कि वह केवल पढ़ता है या नहीं",
+        "reason_no_tools_listed": "जाँच के लिए कोई टूल पेश नहीं किया",
+        "reason_not_probed": "कभी मापा नहीं गया, इसलिए किसी भी ओर से कुछ दावा नहीं किया जाता",
+        "reason_not_stdio": "यह stdio सर्वर नहीं है, इसलिए स्टब को आगे रखने के लिए कोई पाइप ही नहीं है",
+        "reason_observed_hazard": "साझा रहते हुए हर कॉलर के लिए अलग व्यवहार करते पहले ही देखा गया",
+        "reason_per_client_capability": "किसी एक क्लाइंट की क्षमता का प्रचार करता है",
+        "reason_preflight_not_run": "इसे घोषित करता है, पर अभी तक मापा नहीं गया",
+        "reason_preflight_passed": "दो अलग-अलग कॉलर्स के साथ मापा गया और एक ही तरह जवाब दिया",
+        "reason_rotating_secret_env": "एक ऐसा क्रेडेंशियल पढ़ता है जिसका मान हर सत्र में अलग होता है",
+        "shared_without_support": "बैकएंड साझाकरण उन सर्वरों पर पहले से लागू है जिनके प्रमाण इसके विरुद्ध हैं। प्रभावित सर्वर: {{count}}",
+        "strength_declared": "साझा करने के लिए बना",
+        "strength_disqualified": "साझा करने के लिए अनुपयुक्त",
+        "strength_no_objection": "कोई आपत्ति नहीं मिली",
+        "strength_refuted": "साझा करने पर असुरक्षित",
+        "strength_unknown": "मापा नहीं गया"
+      },
       "cancel": "रद्द करें",
       "col_server": "सर्वर",
       "col_state": "स्थिति",
@@ -9029,6 +9094,7 @@
       "confirm_stateful": "प्रति-सेशन स्थिति रखने वाले सर्वर पर केवल स्टब रहने दें, या सह-किरायेदारों की अपेक्षा रखें।",
       "confirm_title": "सेशनों के बीच बैकएंड साझा करें?",
       "confirm_turn_on": "साझा करना चालू करें",
+      "confirm_unsupported": "इनमें से {{count}} के प्रमाण साझा करने के विरुद्ध हैं।",
       "learn_more": "और जानें",
       "learn_more_docs": "दस्तावेज़ में और जानें",
       "lede": "Kiro Crew हर सेशन को MCP सर्वर खुद शुरू करने देने के बजाय उसके आगे अपना स्टब रख सकता है। स्टब ही सर्वर को अपना UI बनाने (MCP Apps) देता है, और साझा बैकएंड को केवल उसी के ज़रिये रूट किया जा सकता है — इसलिए यह हर सर्वर के लिए अलग से चुना जाता है। {{link}}",
@@ -9050,7 +9116,10 @@
       "stub_failed": "बदलाव लागू नहीं हो सका। यह सहेजा जा चुका हो सकता है पर लागू नहीं — नीचे के स्विच अब सहेजी गई स्थिति दिखाते हैं।",
       "stub_not_live": "सहेज लिया गया, लेकिन यह अभी लागू नहीं है — गेटवे शुरू नहीं हो सका। स्विच सहेजा गया मान दिखाता है, चल रही स्थिति नहीं।",
       "stubbed_of_total": "{{total}} में से {{stubbed}} पर स्टब",
-      "unsupported_platform": "बैकएंड साझा करने के लिए Unix डोमेन सॉकेट चाहिए, इसलिए यह इस प्लैटफ़ॉर्म पर उपलब्ध नहीं है।"
+      "unsupported_platform": "बैकएंड साझा करने के लिए Unix डोमेन सॉकेट चाहिए, इसलिए यह इस प्लैटफ़ॉर्म पर उपलब्ध नहीं है।",
+      "view_assessment": "साझाकरण आकलन",
+      "view_servers": "सर्वर",
+      "views_aria": "MCP प्रबंधन दृश्य"
     },
     "migrationPage": {
       "app_migration": "ऐप माइग्रेशन",
@@ -9459,7 +9528,8 @@
         "version_range": "(v{{from}} → v{{to}})",
         "workspace": "वर्कस्पेस",
         "auto_create_hint": "Kiro Crew पूर्ण सत्रों से स्वचालित रूप से कौशल का मसौदा भी तैयार कर सकता है — डिफ़ॉल्ट रूप से बंद, <settingRef/> द्वारा नियंत्रित।",
-        "approval_required_hint": "उम्मीदवार आपकी स्वीकृति तक यहाँ प्रतीक्षा करते हैं — <settingRef/> द्वारा आवश्यक।"
+        "approval_required_hint": "उम्मीदवार यहाँ आपकी स्वीकृति की प्रतीक्षा करते हैं। जब <settingRef/> बंद हो, तो केवल-गद्य स्किल्स अपने आप लाइव हो सकती हैं — स्क्रिप्ट वाली स्किल्स की हमेशा समीक्षा आवश्यक है।",
+        "scripts_always_require_review": "बंडल की गई स्क्रिप्ट्स की हमेशा मैन्युअल समीक्षा आवश्यक है, भले ही स्किल स्वीकृति बंद हो।"
       },
       "steeringTab": {
         "always_on_markdown_conventions_injected_into_eve": "हमेशा चालू रहने वाली markdown कन्वेंशन, जो हर सेशन में डाली जाती हैं। ग्लोबल फ़ाइलें ~/.kiro/steering में रहती हैं और हर जगह लागू होती हैं; वर्कस्पेस फ़ाइलें <project>/.kiro/steering में रहती हैं और सिर्फ़ उसी प्रोजेक्ट पर लागू होती हैं।",
@@ -10206,6 +10276,9 @@
         "session_folder_name_desc": "इन सेटिंग्स को सेव करने पर यह बन जाता है, अगर पहले से मौजूद न हो।"
       },
       "browserPanel": {
+        "use_builtin_label": "बिल्ट-इन ब्राउज़र का उपयोग करें",
+        "use_builtin_desc": "Kiro Crew के बिल्ट-इन पैनल में पेज खोलें। इसके बजाय playwright-cli से ब्राउज़ करने के लिए बंद करें।",
+        "use_builtin_desktop_only": "केवल डेस्कटॉप ऐप में काम करता है। ब्राउज़र में या रिमोट गेटवे पर एजेंट playwright-cli का उपयोग करता है।",
         "browsing": "ब्राउज़िंग",
         "cannot_load": "ब्राउज़र की स्थिति लोड नहीं हो सकी। क्या गेटवे चल रहा है?",
         "available": "एजेंट वेब पेज ब्राउज़ कर सकता है।",

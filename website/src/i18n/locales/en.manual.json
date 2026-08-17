@@ -22,6 +22,7 @@
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
+    "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "metrics_are_stale_latest_fetch_failed": "Metrics are stale, latest fetch failed",
     "resource_critical": "Critical",
@@ -320,7 +321,6 @@
           "issue": "Issue",
           "link_copied": "Link copied",
           "opened_this_issue": "opened this issue",
-          "re_fetch_issue_and_timeline_from": "Re-fetch this issue + its timeline from {{provider}}",
           "read_only_connect_with_triage_push_access_to_app_2": "Read-only — connect with triage/push access to apply"
         },
         "issueList": {
@@ -350,7 +350,6 @@
           "no_automated_checks": "No automated checks",
           "approved_these_changes": "approved these changes",
           "dismissed_a_review": "dismissed a review",
-          "re_fetch_this_and_its_timeline_from": "Re-fetch this {{subject}} + its timeline from {{provider}}",
           "refresh_details": "Refresh {{subject}} details",
           "requested_changes": "requested changes",
           "reviewed": "reviewed",
@@ -1128,6 +1127,14 @@
     }
   },
   "components": {
+    "crewWakeSection": {
+      "active": "active",
+      "pause_named": "Pause {{name}}",
+      "paused": "paused",
+      "resume_named": "Resume {{name}}",
+      "run_named_now": "Run {{name}} now",
+      "running": "running"
+    },
     "kiroAccountModal": {
       "account_details_unavailable": "Account details unavailable",
       "checking_account": "Checking account…",
@@ -1459,6 +1466,7 @@
       "video": "Video: {{name}}"
     },
     "fileRenderers": {
+      "media_preview_failed": "Playback failed — the browser cannot decode this file.",
       "scroll_for_more_count": "Scroll for more… ({{count}} remaining)",
       "showing_raw_content_count": "Showing raw content ({{count}} chars)",
       "showing_raw_content_truncated_count": "Showing raw content ({{count}} chars, first {{shown}} shown)"
@@ -1596,7 +1604,7 @@
       "provider_github": "GitHub",
       "provider_jira": "Jira",
       "provider_gitlab": "GitLab",
-      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN in your .env file."
+      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
     "jobForm": {
       "add": "Add",
@@ -1934,6 +1942,10 @@
       "mark_as_read": "Mark as read",
       "mark_as_unread": "Mark as unread",
       "pin": "Pin",
+      "reload_blocked_running": "turn running",
+      "reload_blocked_subagents": "sub-agents working",
+      "reload_session": "Reload session",
+      "reload_session_tooltip": "Restarts the agent process to pick up MCP/config changes. The conversation is kept.",
       "switch_to_autopilot": "Switch to Autopilot",
       "switch_to_chat": "Switch to Chat",
       "unpin": "Unpin"
@@ -2038,6 +2050,11 @@
     },
     "updateModal": {
       "restart_update": "Restart & Update",
+      "installing_update": "Installing update…",
+      "installing_update_body": "Kiro Crew is stopping the local gateway and installing the update. This can take a minute — don’t quit the app; it will relaunch itself.",
+      "install_failed": "Update failed to install",
+      "install_failed_body": "The update could not be applied. Kiro Crew is restoring the local gateway — you can keep using this version and retry from Settings > About.",
+      "back_to_dashboard": "Back to dashboard",
       "restarting": "Restarting..."
     },
     "voiceDisabledModal": {
@@ -2228,6 +2245,14 @@
       "subtitle": "Start from a pre-made schedule — you review and save before anything runs.",
       "title": "Schedule templates",
       "use_template": "Use the {{title}} template"
+    },
+    "skillsMultiSelect": {
+      "add_skill": "Add skill",
+      "remove_skill": "Remove {{name}}",
+      "filter_skills": "Filter skills...",
+      "no_matching_skills": "No matching skills",
+      "skills_hint": "Skills loaded when this hook matches — no command needed.",
+      "selected": "Selected"
     }
   },
   "hooks": {
@@ -2239,6 +2264,8 @@
     },
     "useCronActions": {
       "failed_to_cancel_job": "Failed to cancel job",
+      "failed_to_pause_job": "Failed to pause job",
+      "failed_to_resume_job": "Failed to resume job",
       "failed_to_open_in_chat": "Failed to open in chat",
       "failed_to_run_job": "Failed to run job"
     },
@@ -2295,6 +2322,8 @@
     },
     "useSessionActions": {
       "close_this_session": "Close this session?",
+      "reload_failed": "Session reload failed. The agent may be mid-turn or the gateway unreachable; try again when the session is idle.",
+      "reload_failed_subagents": "Sub-agents are still working on this session. Try again when they finish.",
       "switch_to_autopilot_mode_future_messages_will_us": "Switch to Autopilot mode? Future messages will use autopilot behavior (plan → approve → execute).",
       "switch_to_normal_chat_mode_future_messages_will": "Switch to normal Chat mode? Future messages will use standard chat behavior."
     },
@@ -2326,6 +2355,7 @@
       "files": "Files",
       "issues": "Issues",
       "logs": "Logs",
+      "pins": "Pins",
       "side": "Side",
       "subagents": "Subagents",
       "summary": "Summary",
@@ -2700,6 +2730,8 @@
         "menu_issues_desc": "Issues mentioned in this session",
         "menu_logs": "Logs",
         "menu_logs_desc": "Gateway log stream",
+        "menu_pins": "Pins",
+        "menu_pins_desc": "Messages you bookmarked in this session",
         "menu_side": "Side",
         "menu_side_desc": "Parallel chat, shared context",
         "menu_subagents": "Subagents",
@@ -2993,6 +3025,7 @@
     "devFleetPage": {
       "applies_the_last_pull_build_the_dashboard_will_b": "Applies the last Pull+Build. The dashboard will briefly disconnect and reconnect on its own.",
       "building": "Building…",
+      "build_finished_restarting_gateway": "Build finished — restarting the gateway…",
       "built": "built",
       "built_and_ready_spin_up_a_pod_from_the_row_menu": "Built and ready — spin up a pod from the row menu to QA this branch",
       "built_but_pods_cannot_run_on_this_host_preview_i": "Built — but pods cannot run on this host; preview it with ./dev-backend.sh instead",
@@ -3058,7 +3091,7 @@
       "pull_build_2": "Pull+Build",
       "pull_build_failed_to_start": "Pull+Build failed to start",
       "pulls_main_and_rebuilds_6_min_does_not_restart": "Pulls main and rebuilds (~6 min). Does NOT restart.",
-      "pulls_main_rebuilds_then_restarts_automatically": "Pulls main, rebuilds (~6 min), then restarts the gateway automatically.",
+      "pulls_main_rebuilds_then_restarts_keep_page_open": "Pulls main, rebuilds (~6 min), then restarts the gateway automatically. Keep this page open until the build finishes.",
       "qa_pod_is_running_but_failing_its_health_check": "QA pod is running but failing its health check",
       "qa_pod_is_running_click_open_to_use_it": "QA pod is running — click Open to use it",
       "qa_video": "QA + video",
@@ -3182,7 +3215,8 @@
       "script_hooks_fire_shell_commands_on_chat_lifecyc": "Script hooks fire shell commands on chat lifecycle events. PreToolUse/PostToolUse hooks can filter by tool name pattern.",
       "source": "Source",
       "total": "Total",
-      "total_runs": "Total Runs"
+      "total_runs": "Total Runs",
+      "matcher_mode": "Matcher mode"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "A unique identifier for this workspace. Agents reference workspaces by name.",
@@ -3318,6 +3352,36 @@
       "wrap_on": "Wrap: on"
     },
     "mcpManagement": {
+      "assessment": {
+        "col_assessment": "Assessment",
+        "col_evidence": "Evidence",
+        "col_running_as": "Running as",
+        "connections_link": "Connections",
+        "how_measured": "A server reads as not measured until Kiro Crew probes it, which happens two at a time when the MCP server list under {{link}} is refreshed.",
+        "lede": "What Kiro Crew managed to observe about each server, and how that lines up with what the server is running as right now. Nothing on this view changes anything — the switches live under Servers.",
+        "legend": "Recommending a shared backend needs the server to say that it can tell its callers apart, and few servers say it — so most healthy servers rest at no objection found. That is the conservative answer, not a missing one, and sharing remains your call.",
+        "open_servers": "Open Servers",
+        "reason_all_tools_read_only": "Every tool declares itself read-only",
+        "reason_caller_sensitive": "Answered the handshake differently for two different callers",
+        "reason_declares_caller_identity": "Declares that it can tell its callers apart",
+        "reason_first_party": "A Kiro Crew server, bound to a single session by design",
+        "reason_no_objection_found": "Nothing disqualifying was found, which is weaker than evidence that sharing is safe",
+        "reason_no_tool_annotations": "No tool declared whether it only reads",
+        "reason_no_tools_listed": "Offered no tools to inspect",
+        "reason_not_probed": "Never measured, so nothing is claimed either way",
+        "reason_not_stdio": "Not a stdio server, so there is no pipe to put a stub in front of",
+        "reason_observed_hazard": "Already seen behaving differently per caller while shared",
+        "reason_per_client_capability": "Advertises a capability that belongs to one client",
+        "reason_preflight_not_run": "Declares it, but has not been measured yet",
+        "reason_preflight_passed": "Measured under two different callers and answered the same way",
+        "reason_rotating_secret_env": "Reads a credential whose value differs per session",
+        "shared_without_support": "Backend sharing is already in effect for servers whose evidence argues against it. Servers affected: {{count}}",
+        "strength_declared": "built for sharing",
+        "strength_disqualified": "unsuitable for sharing",
+        "strength_no_objection": "no objection found",
+        "strength_refuted": "unsafe when shared",
+        "strength_unknown": "not measured"
+      },
       "cancel": "Cancel",
       "col_server": "Server",
       "col_state": "State",
@@ -3329,6 +3393,7 @@
       "confirm_stateful": "A server that holds per-session state should stay stub-only, or expect co-tenants.",
       "confirm_title": "Share backends across sessions?",
       "confirm_turn_on": "Turn on sharing",
+      "confirm_unsupported": "Of those, {{count}} have evidence that argues against sharing.",
       "learn_more": "Learn more",
       "learn_more_docs": "Learn more in the docs",
       "lede": "Kiro Crew can put its own stub in front of an MCP server instead of letting every session launch that server itself. The stub is what makes server-authored UI (MCP Apps) possible, and it is the only thing a shared backend can be routed through — so it is opt-in, per server. {{link}}",
@@ -3350,7 +3415,10 @@
       "stub_failed": "Could not apply the change. It may already be saved without being live — the switches below now show the stored state.",
       "stub_not_live": "Saved, but the change is not live yet — the gateway could not start. The switch shows what is stored, not what is running.",
       "stubbed_of_total": "{{stubbed}} of {{total}} stubbed",
-      "unsupported_platform": "Backend sharing needs Unix-domain sockets, so it is unavailable on this platform."
+      "unsupported_platform": "Backend sharing needs Unix-domain sockets, so it is unavailable on this platform.",
+      "view_assessment": "Sharing assessment",
+      "view_servers": "Servers",
+      "views_aria": "MCP management views"
     },
     "migrationPage": {
       "clean_up_old_entry": "Clean up old entry",
@@ -3473,7 +3541,8 @@
         "budget_renamed": "(renamed)",
         "budget_footnote": "A pinned (always: true) or package-owned skill shows its cost but has no switch.",
         "budget_empty_title": "No budget data yet",
-        "budget_empty_subtitle": "No skills installed yet."
+        "budget_empty_subtitle": "No skills installed yet.",
+        "scripts_always_require_review": "Bundled scripts always require manual review, even when skill approval is turned off."
       },
       "steeringTab": {
         "delete_confirm": "Delete \"{{path}}\"?",

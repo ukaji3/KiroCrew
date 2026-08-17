@@ -108,7 +108,21 @@ def _make_app(state: DashboardState) -> web.Application:
         api_chat_slots_cleanup,
     )
 
-    app = web.Application()
+    @web.middleware
+    async def _test_auth_middleware(request: web.Request, handler):
+        """Simulate token_auth_middleware for tests: dashboard owner claims.
+
+        Only sets defaults if not already populated by a test-specific
+        middleware inserted earlier (e.g. app-isolation tests that inject
+        a specific app identity).
+        """
+        if "app" not in request:
+            request["app"] = ""  # dashboard user, not an app
+        if "user" not in request:
+            request["user"] = "local-app"  # recognized as owner
+        return await handler(request)
+
+    app = web.Application(middlewares=[_test_auth_middleware])
     app["state"] = state
     app.router.add_post("/api/chat", api_chat)
     app.router.add_get("/api/chat/slots", api_chat_slots)
@@ -137,6 +151,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
         api_chat_slot_create,
         api_chat_slot_delete,
         api_chat_slot_detail,
+        api_chat_slot_reload,
         api_chat_slot_rename,
         api_chat_slot_resume,
         api_chat_slot_workspace,
@@ -151,6 +166,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
     app.router.add_post("/api/chat/slots/{slot}/approve", api_chat_slot_approve)
     app.router.add_post("/api/chat/slots/{slot}/agent", api_chat_slot_agent)
     app.router.add_post("/api/chat/slots/{slot}/workspace", api_chat_slot_workspace)
+    app.router.add_post("/api/chat/slots/{slot}/reload", api_chat_slot_reload)
     app.router.add_delete("/api/chat/slots/{slot}", api_chat_slot_delete)
     app.router.add_post("/api/chat/slots/{slot}/resume", api_chat_slot_resume)
     app.router.add_patch("/api/chat/slots/{slot}/title", api_chat_slot_rename)

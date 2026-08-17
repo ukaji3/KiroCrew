@@ -9,6 +9,7 @@ import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeAppro
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
 import { createSlot, appendMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { queryComposer } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
@@ -104,7 +105,7 @@ import ShortcutsModal from './components/ShortcutsModal'
 import CommandPalette from './components/CommandPalette'
 import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
-import KiroAccountModal from './components/KiroAccountModal'
+import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
 import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
 
 import { i18nT } from './i18n/t'
@@ -1315,7 +1316,12 @@ export default function App() {
     mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
     onSuccess: () => {
       navigate('/chat')
-      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus())
+      // Unguarded on purpose: this mutation only fires from the new-chat
+      // keyboard shortcut, and a pressed shortcut proves a keyboard exists —
+      // focusComposer()'s touch-device skip would wrongly suppress focus on a
+      // tablet with a physical keyboard. Next frame, so the new slot's
+      // composer has been committed to the DOM.
+      requestAnimationFrame(() => queryComposer()?.focus())
     },
   })
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
@@ -1430,7 +1436,12 @@ export default function App() {
   // credits_covered on top — that double-counts the in-plan portion and is the
   // bug that rendered a capped 10K plan as "20.0K". Returns null until the
   // background cache warms.
-  const { data: kiroUsage } = useQuery<KiroCreditUsage | 'none' | null>({
+  //
+  // `isError` is read alongside `data` because `data` alone cannot tell "the
+  // backend cache has not warmed yet" (null) apart from "the request failed"
+  // (undefined) — both are falsy. Without it a failing endpoint renders as a
+  // spinner that never resolves, since the 30s refetch keeps retrying forever.
+  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | null>({
     queryKey: ['kiro-usage'],
     queryFn: () => api.sessionsUsage().then(d => {
       const u: KiroUsagePayload = d?.usage || {}
@@ -1510,6 +1521,13 @@ export default function App() {
   useEffect(() => {
     if (kiroUsage === 'none') setKiroUsageOpen(false)
   }, [kiroUsage])
+  // ONE derivation feeds both the capsule segment and the account modal, so the
+  // drill-in can never report a different state from the pill that opened it —
+  // the modal spinning on "checking account" behind a pill that already says
+  // "unavailable" is the same falsy-collapse defect one level down.
+  const kiroUsageState: KiroAccountUsage = kiroUsageFailed && !kiroUsage
+    ? 'failed'
+    : (kiroUsage ?? null)
   const [metricsOpen, setMetricsOpen] = useState(() => localStorage.getItem('mc-topbar-metrics') === '1')
   // Readout capsule collapse: clicking the connection dot folds the capsule
   // down to just the dot; clicking again restores the full readout.
@@ -1820,7 +1838,16 @@ export default function App() {
             visibility rule — it renders nothing unless >=1 remote instance
             exists, so the common single-instance header-left is empty (only the
             macOS traffic-light clearance remains). */}
-        <div className={`tb-left relative h-full ${isMobile ? 'px-2' : ''}`}>
+        {/* No mobile-only `px-2` here on purpose. The icon buttons inside carry
+            their own 8px, so this padding stacked on top of the header's `pl-3`
+            and pushed the hamburger GLYPH to 28px -- 20px right of the page title,
+            which is why the hamburger read as indented against every page's left
+            edge. Dropping it lands the glyph at 12 + 8 = 20px, the line the title
+            and the card text also sit on. Deliberately only the LEFT cluster:
+            `.tb-right` carries a padding/negative-margin pair that keeps the
+            notification badge's 4px overhang from being clipped, and re-tuning
+            that needs a real WebKit check, not a local one. */}
+        <div className="tb-left relative h-full">
           {/* Windows only: the application menu shares this cluster. It needs no
               width reservation of its own: the identity group is sized by its own
               grid track, and the menu growing from the hamburger to its six
@@ -1833,12 +1860,12 @@ export default function App() {
               <Menu size={20} />
             </button>
           )}
-          {!isMobile && <InstanceTabBar variant="inline" />}
+          <InstanceTabBar variant="inline" />
         </div>
         {/* Centre track: the ⌘K trigger. A flow item, not an overlay — its width
             is the track's width, so it can never sit under a sibling cluster and
-            never has to be dropped to stay clear of one. On mobile the centre
-            track holds nothing and the trigger moves into the actions group. */}
+            never has to be dropped to stay clear of one. On mobile the same
+            track holds the icon-only form below. */}
         {!isMobile && (
           <button
             type="button"
@@ -1851,10 +1878,12 @@ export default function App() {
             <span className="text-[13px] truncate min-w-0">{i18nT('app.k_search_for_anything')}</span>
           </button>
         )}
-        {/* Mobile centre track: the same trigger in its icon-only form. A grid
-            child of its own, not a third sibling inside the actions group --
-            three action controls in one horizontal row is what
-            website/AUTOSDE.yaml's max-two-buttons-per-row forbids. */}
+        {/* Mobile centre track: the same trigger in its icon-only form, in the
+            same window-centred track the desktop one uses, so the control does
+            not change place at the breakpoint. A grid child of its own, not a
+            third sibling inside the actions group -- three action controls in one
+            horizontal row is what website/AUTOSDE.yaml's max-two-buttons-per-row
+            forbids. */}
         {isMobile && (
           <button
             type="button"
@@ -1998,23 +2027,51 @@ export default function App() {
                 </button>)
               }
             }
+            // Mobile: show metrics as a passive readout (not a button) when the
+            // capsule is expanded and data is available. No independent toggle —
+            // visibility is tied to the capsule expand/collapse state.
+            if (isMobile && sysMetrics) {
+              const m = sysMetrics
+              const memPct = m.memTotal > 0 ? m.memUsed / m.memTotal : 0
+              const dskUsed = m.diskTotal - m.diskFree
+              const dskPct = m.diskTotal > 0 ? dskUsed / m.diskTotal : 0
+              const cpuValid = typeof m.cpuPct === 'number' && Number.isFinite(m.cpuPct)
+              const memValid = m.memTotal > 0
+              const dskValid = m.diskTotal > 0
+              segments.push(<span key="metrics-mobile" className={`${seg} gap-2 text-[11px] font-mono tabular-nums`} aria-label={i18nT('app.system_metrics')}>
+                <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'}>{i18nT('app.cpu')} {cpuValid ? fmtPercent(m.cpuPct / 100) : '\u2014'}</span>
+                <span className={memValid ? metricColor(memPct) : 'text-muted'}>{i18nT('app.mem')} {memValid ? fmtPercent(memPct) : '\u2014'}</span>
+                <span className={dskValid ? metricColor(dskPct) : 'text-muted'}>{i18nT('app.dsk')} {dskValid ? fmtPercent(dskPct) : '\u2014'}</span>
+              </span>)
+            }
             // Usage segment — Kiro credit plan from KiroCrew's own usage
-            // cache. Spinner while the cache warms; hidden when unavailable.
-            if (kiroUsage !== 'none') {
-              if (!kiroUsage) {
+            // cache. Spinner while the cache warms, a dash when the fetch
+            // failed, hidden when the provider has no credit plan at all.
+            if (kiroUsageState !== 'none') {
+              if (kiroUsageState === 'failed') {
+                // Failed with nothing cached to fall back on. A dash says that;
+                // a spinner would claim a fetch is still in flight. A failure
+                // that arrives while a prior value is held keeps that value —
+                // the payload's own `stale` flag dims it instead.
+                //
+                // The dash renders on mobile too, where the reading and the
+                // spinner are both dropped: without it the failed and warming
+                // states are one coin glyph apart in opacity alone.
+                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_unavailable')} aria-label={i18nT('app.kiro_credit_usage_unavailable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+              } else if (!kiroUsageState) {
                 segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_checking')} aria-label={i18nT('app.kiro_credit_usage_checking_2')}><Coins size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
               } else {
                 // Pool every bonus grant into the compact readout. Bonus is
                 // drawn down before the plan, so excluding it looks like a
                 // frozen counter while promotional credits are active.
-                const bonusUsed = kiroUsage.bonusCredits.reduce((sum, grant) => sum + grant.used, 0)
-                const bonusLimit = kiroUsage.bonusCredits.reduce((sum, grant) => sum + grant.total, 0)
-                const totalUsed = kiroUsage.used + bonusUsed
-                const totalLimit = kiroUsage.limit + bonusLimit
+                const bonusUsed = kiroUsageState.bonusCredits.reduce((sum, grant) => sum + grant.used, 0)
+                const bonusLimit = kiroUsageState.bonusCredits.reduce((sum, grant) => sum + grant.total, 0)
+                const totalUsed = kiroUsageState.used + bonusUsed
+                const totalLimit = kiroUsageState.limit + bonusLimit
                 const usedStr = fmtCompact(totalUsed)
                 const limitStr = fmtCompact(totalLimit)
                 const title = i18nT('components.kiroAccountModal.kiro_credit_usage')
-                segments.push(<button key="usage" className={kiroUsage.stale ? `${seg} opacity-60` : seg} onClick={() => setKiroUsageOpen(true)} title={title} aria-label={title}>
+                segments.push(<button key="usage" className={kiroUsageState.stale ? `${seg} opacity-60` : seg} onClick={() => setKiroUsageOpen(true)} title={title} aria-label={title}>
                   <Coins size={12} /> {!isMobile && <span className="tb-drop-usage font-mono text-[11px] whitespace-nowrap tabular-nums">{usedStr}<span className="text-muted">/{limitStr}</span></span>}
                 </button>)
               }
@@ -2692,7 +2749,7 @@ export default function App() {
     )}
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
-    <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsage ?? null} />
+    <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
     <CommandPalette
       open={commandPalette.open}
       onClose={commandPalette.close}

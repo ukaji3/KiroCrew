@@ -45,6 +45,7 @@
     "k_search_for_anything": "⌘K — Rechercher n'importe quoi…",
     "kiro_credit_usage_checking": "Utilisation des crédits Kiro — vérification…",
     "kiro_credit_usage_checking_2": "Utilisation des crédits Kiro — vérification",
+    "kiro_credit_usage_unavailable": "Utilisation des crédits Kiro — indisponible",
     "kiro_discord_community": "Communauté Discord Kiro",
     "main_navigation": "Navigation principale",
     "manage_account": "Gérer le compte",
@@ -649,32 +650,24 @@
           "step_why_it_matters": "Pourquoi c’est important"
         },
         "reviewChat": {
-          "closed_notice": "Cette conversation est terminée et le relecteur n'est plus chargé : il ne peut plus répondre. Les questions ci-dessus sont conservées.",
-          "empty_hint": "Ce relecteur garde le raisonnement derrière ses constats. Demande-lui pourquoi l'un a été signalé, ou ce qu'il a vérifié.",
-          "end_chat": "Terminer la conversation",
-          "error_busy": "Il répond encore à la question précédente.",
-          "error_empty": "Saisis d'abord une question.",
-          "error_expired": "Le relecteur n'est plus chargé et ne peut pas répondre. Relance la relecture de cette pull request pour poser d'autres questions.",
-          "error_generic": "La question n'a pas pu être traitée. Réessaie.",
-          "error_needs_override": "Active YOLO pour poursuivre cette conversation : répondre peut nécessiter un outil.",
-          "error_override_expiring": "L’autorisation des outils expire avant la fin d’une réponse. Prolonge-la, puis pose à nouveau la question.",
-          "error_override_lapsed": "L’autorisation des outils a expiré pendant la réponse, qui a donc été interrompue. Autorise à nouveau, puis repose la question.",
-          "error_persist_failed": "La réponse n'a pas pu être enregistrée : elle ne fait donc pas partie de cette conversation. Repose la question.",
-          "error_tool_denied": "Le relecteur a tenté d’utiliser un outil bloqué par ta politique de sécurité ; la réponse a été interrompue. Rien n’a été exécuté.",
-          "error_transcript_unsafe": "Cette conversation ne peut pas être enregistrée en toute sécurité ; elle n’a pas été écrite. Vérifie le dossier de la relecture.",
+          "error_generic": "La session de suivi n'a pas pu être ouverte. Réessayez.",
           "error_run_deleted": "Cette relecture a été supprimée, la conversation est donc terminée.",
-          "error_too_long": "Cette question est trop longue. Raccourcis-la et renvoie-la.",
-          "needs_override_notice": "Le relecteur est encore chargé mais ne peut pas répondre sans autorisation d'outil — répondre peut exiger de lire du code. Active YOLO pour continuer.",
-          "placeholder": "Demande pourquoi un constat a été signalé…",
           "ran_tools": "Consulté : {{tools}}",
           "reasoning": "Raisonnement",
           "refused_notice": "Il lui fallait exécuter un outil pour répondre pleinement, ce qui n'a pas été autorisé : cette réponse est donc limitée. Active YOLO pour l'autoriser.",
           "role_reviewer": "Relecteur",
           "role_you": "Toi",
-          "send": "Envoyer",
-          "sending": "Question en cours…",
           "title": "Interroger le relecteur",
-          "unsent_label": "Non envoyé"
+          "earlier_questions": "Questions précédentes",
+          "resume_hint": "Ouvre un chat qui reprend le relecteur, avec le raisonnement à l'origine de ses constats.",
+          "open_session": "Ouvrir une session de suivi",
+          "opening": "Ouverture…",
+          "not_recorded_notice": "Cette relecture n'a pas conservé de session du relecteur : il n'y a rien à réouvrir. Relancez la relecture de cette pull request pour poser des questions.",
+          "transcript_gone_notice": "La session du relecteur n'est plus sur le disque : il n'y a rien à réouvrir. Relancez la relecture de cette pull request pour poser des questions.",
+          "continue_hint": "La conversation avec ce relecteur se poursuit dans l'onglet Chat.",
+          "continue_session": "Reprendre la session de suivi",
+          "run_live_notice": "Cette relecture est encore en cours. Ses constats peuvent changer jusqu'à la fin, il n'y a donc rien à demander pour l'instant.",
+          "loading": "Chargement…"
         },
         "runCard": {
           "cancel": "Annuler",
@@ -1568,6 +1561,9 @@
           "regenerate_summary": "Régénérer le résumé",
           "retry": "Réessayer"
         },
+        "detailOverflowMenu": {
+          "more_actions": "Plus d'actions"
+        },
         "filterRow": {
           "sign_in_with_the_gh_cli_to_use_this_filter": "Connectez-vous avec la CLI gh pour utiliser ce filtre"
         },
@@ -1601,10 +1597,8 @@
           "assignees": "Personnes assignées",
           "by": "· par",
           "changed_the_title": "a modifié le titre",
-          "close": "Fermer",
           "close_as_completed": "Fermer comme terminé",
           "close_as_not_planned": "Fermer comme non planifié",
-          "close_this_issue": "Fermer ce ticket",
           "closed": "Fermé",
           "closed_as_not_planned": "Fermé comme non planifié",
           "closed_this": "a fermé ceci",
@@ -1612,7 +1606,6 @@
           "copy_link_to_this_issue": "Copier le lien vers ce ticket",
           "couldn_t_load_activity": "Impossible de charger l'activité :",
           "dates": "Dates",
-          "dismiss_menu": "Fermer le menu",
           "done": "Terminé",
           "edit": "Modifier",
           "finding_suggestions": "Recherche de suggestions…",
@@ -1636,7 +1629,6 @@
           "opened": "a ouvert",
           "opened_2": "Ouvert",
           "opened_this_issue": "a ouvert ce ticket",
-          "re_fetch_issue_and_timeline_from": "Récupérer à nouveau ce ticket et sa chronologie depuis {{provider}}",
           "read_only_connect_with_triage_push_access_to_app": "Lecture seule — connectez-vous avec un accès triage/push pour appliquer.",
           "read_only_connect_with_triage_push_access_to_app_2": "Lecture seule — connectez-vous avec un accès triage/push pour appliquer",
           "referenced_this_in": "a référencé ceci dans",
@@ -1645,7 +1637,6 @@
           "removed_the": "a supprimé le",
           "removed_this_from_the": "a supprimé ceci du",
           "reopen": "Réouvrir",
-          "reopen_this_issue": "Réouvrir ce ticket",
           "reopened_this": "a réouvert ceci",
           "self_assigned_this": "s'est assigné ceci",
           "suggested": "Suggéré",
@@ -1854,7 +1845,6 @@
           "opened": "a ouvert",
           "opened_2": "Ouverte le",
           "passed": "réussi",
-          "re_fetch_this_and_its_timeline_from": "Récupérer à nouveau cette {{subject}} et sa chronologie depuis {{provider}}",
           "referenced_this_in": "a référencé ceci dans",
           "refresh_details": "Actualiser les détails de la {{subject}}",
           "removed_the": "a retiré",
@@ -2480,6 +2470,9 @@
         "viewSection": "Affichage",
         "view_folders": "Dossiers",
         "view_list": "Liste simple"
+      },
+      "preview": {
+        "mermaidError": "Diagramme Mermaid invalide — sa source est affichée."
       },
       "row": {
         "delete": "Supprimer la note",
@@ -4401,6 +4394,20 @@
     "viewPr": "Pull request"
   },
   "components": {
+    "crewWakeSection": {
+      "active": "actif",
+      "could_not_load_this_crew_s_schedules_so_what_wak": "Impossible de charger les planifications de ce crew : ce qui le réveille est donc inconnu.",
+      "no_schedules_run_this_crew_automatically": "Aucune planification n’exécute ce crew automatiquement.",
+      "open_schedule": "Ouvrir la planification",
+      "pause_named": "Mettre {{name}} en pause",
+      "paused": "en pause",
+      "resume_named": "Reprendre {{name}}",
+      "run_named_now": "Exécuter {{name}} maintenant",
+      "running": "en cours",
+      "schedule": "planification",
+      "schedules_that_run_this_crew_without_you_asking": "Planifications qui exécutent ce crew sans que vous le demandiez. Distinct de Triggers ci-dessus, qui décide seulement quand l'orchestrateur sélectionne ce crew.",
+      "what_wakes_this_crew": "Ce qui réveille ce crew"
+    },
     "kiroAccountModal": {
       "account_details_unavailable": "Les détails du compte ne sont pas disponibles",
       "checking_account": "Vérification du compte…",
@@ -5200,6 +5207,7 @@
       "invalid_json": "JSON non valide :",
       "items": "éléments",
       "lines": "lignes",
+      "media_preview_failed": "Échec de la lecture : le navigateur ne peut pas décoder ce fichier.",
       "more": "de plus",
       "null": "null",
       "office_download_hint": "Les documents Office ne peuvent pas être prévisualisés en ligne. Téléchargez-le pour l'ouvrir dans Word, Excel, PowerPoint ou une visionneuse compatible.",
@@ -5386,7 +5394,7 @@
       "provider_github": "GitHub",
       "provider_jira": "Jira",
       "provider_gitlab": "GitLab",
-      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN in your .env file."
+      "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
     "jobForm": {
       "a_short_label_for_this_job": "Un libellé court pour cette tâche",
@@ -6199,6 +6207,10 @@
       "move_to_folder": "Déplacer vers un dossier…",
       "pin": "Épingler",
       "pop_out_to_window": "Détacher dans une fenêtre",
+      "reload_blocked_running": "tour en cours",
+      "reload_blocked_subagents": "sous-agents au travail",
+      "reload_session": "Recharger la session",
+      "reload_session_tooltip": "Redémarre le processus de l'agent pour prendre en compte les changements MCP/configuration. La conversation est conservée.",
       "rename": "Renommer",
       "reveal_in_sidebar": "Afficher dans la barre latérale",
       "switch_to_autopilot": "Passer en Autopilote",
@@ -6493,8 +6505,13 @@
       "no_noun_match": "Aucun(e) {{noun}} correspondant(e)"
     },
     "updateModal": {
+      "back_to_dashboard": "Retour au tableau de bord",
       "dismiss": "Ignorer",
       "dismiss_update_dialog": "Ignorer la boîte de dialogue de mise à jour",
+      "install_failed": "Échec de l’installation de la mise à jour",
+      "install_failed_body": "La mise à jour n’a pas pu être appliquée. Kiro Crew restaure la passerelle locale — vous pouvez continuer avec cette version et réessayer depuis Paramètres > À propos.",
+      "installing_update": "Installation de la mise à jour...",
+      "installing_update_body": "Kiro Crew arrête la passerelle locale et installe la mise à jour. Cela peut prendre une minute — ne quittez pas l’application ; elle redémarrera d’elle-même.",
       "is_downloaded_and_ready_to_install": "a été téléchargé et est prêt à être installé.",
       "kirocrew": "Kiro Crew",
       "later": "Plus tard",
@@ -6727,6 +6744,14 @@
       "refresh": "Actualiser",
       "title": "Git",
       "uncommitted": "{{count}} non validé(s)"
+    },
+    "skillsMultiSelect": {
+      "add_skill": "Add skill",
+      "remove_skill": "Remove {{name}}",
+      "filter_skills": "Filter skills...",
+      "no_matching_skills": "No matching skills",
+      "skills_hint": "Skills loaded when this hook matches — no command needed.",
+      "selected": "Selected"
     }
   },
   "hooks": {
@@ -6741,6 +6766,8 @@
     },
     "useCronActions": {
       "failed_to_cancel_job": "Échec de l’annulation de la tâche",
+      "failed_to_pause_job": "Échec de la mise en pause de la tâche",
+      "failed_to_resume_job": "Échec de la reprise de la tâche",
       "failed_to_open_in_chat": "Échec de l’ouverture dans le chat",
       "failed_to_run_job": "Échec de l’exécution de la tâche"
     },
@@ -6787,7 +6814,8 @@
       "subagents": "Sous-agents",
       "summary": "Résumé",
       "workflows": "Workflows",
-      "git": "Git"
+      "git": "Git",
+      "pins": "Épinglés"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "Tous les emplacements sont occupés",
@@ -6824,6 +6852,8 @@
     },
     "useSessionActions": {
       "close_this_session": "Fermer cette session ?",
+      "reload_failed": "Échec du rechargement de la session. L'agent est peut-être en train de répondre ou la passerelle est injoignable ; réessayez quand la session est inactive.",
+      "reload_failed_subagents": "Des sous-agents travaillent encore sur cette session. Réessayez quand ils auront terminé.",
       "switch_to_autopilot_mode_future_messages_will_us": "Passer en mode autopilote ? Les prochains messages utiliseront le comportement autopilote (planifier → approuver → exécuter).",
       "switch_to_normal_chat_mode_future_messages_will": "Passer en mode Chat normal ? Les prochains messages utiliseront le comportement de chat standard."
     },
@@ -7897,7 +7927,9 @@
         "this_app_render_is_no_longer_available": "Ce rendu d'application n'est plus disponible. Exécutez à nouveau l'outil pour l'afficher.",
         "turn_diff": "Diff du tour",
         "menu_git": "Git",
-        "menu_git_desc": "Branche, modifications et commits récents"
+        "menu_git_desc": "Branche, modifications et commits récents",
+        "menu_pins": "Épinglés",
+        "menu_pins_desc": "Messages que vous avez épinglés dans cette session"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "Échec de l'arrêt, session réinitialisée",
@@ -8017,9 +8049,8 @@
       },
       "pins": {
         "pinned_messages": "Messages épinglés",
-        "close_panel": "Fermer le panneau des messages épinglés",
         "loading": "Chargement…",
-        "no_pinned_messages": "Aucun message épinglé. Épinglez des messages importants pour les retrouver rapidement.",
+        "no_pinned_messages": "Aucun message épinglé. Survolez un message dans la conversation et cliquez sur l’icône d’épingle pour l’enregistrer ici.",
         "message_unavailable": "Ce message épinglé n’est plus disponible dans l’historique chargé.",
         "pin_failed": "Impossible d’épingler le message. Réessayez.",
         "unpin_failed": "Impossible de désépingler le message. Réessayez.",
@@ -8032,7 +8063,6 @@
         "copy_preview": "Copier le texte",
         "copy_link": "Copier le lien vers le message",
         "unpin": "Désépingler",
-        "open_pinned_messages": "Ouvrir les messages épinglés",
         "jump_to_message": "Aller au message"
       },
       "sessionSummary": {
@@ -8318,6 +8348,7 @@
       "show_collapsed_folders": "Afficher les dossiers réduits :",
       "show_folder": "Afficher le dossier",
       "show_in_flat_view": "Afficher {{name}} dans la vue à plat",
+      "show_only_sessions_tagged": "Afficher uniquement les sessions avec l'étiquette {{name}}",
       "show_the_folder_list": "Afficher la liste des dossiers",
       "skip": "Ignorer",
       "sort_and_filter_sessions": "Trier et filtrer les sessions",
@@ -8331,6 +8362,7 @@
       "sort_oldest": "Plus anciennes",
       "started_in_channel": "Cette conversation a commencé dans {{channel}}.",
       "started_in_direct_message": "Cette conversation a commencé dans un message privé.",
+      "stop_filtering_by_tag": "Arrêter de filtrer par {{name}}",
       "streaming": "Diffusion en cours",
       "switch_all_sessions": "Basculer toutes les sessions",
       "switch_all_to_model": "Basculer toutes vers le modèle…",
@@ -8340,6 +8372,7 @@
       "switch_to_folder_view": "Passer à la vue par dossiers",
       "switch_to_list_view": "Passer à la vue liste",
       "switching": "Changement…",
+      "tags": "Étiquettes",
       "temporary_no_memory_reads_or_writes": "Temporaire — aucune lecture ni écriture en mémoire",
       "thinking": "Réflexion…",
       "today": "Aujourd’hui",
@@ -8455,6 +8488,7 @@
       "build_pending": "build en attente",
       "build_pending_restart_gateway_to_apply_kirocrew": "build en attente — redémarrez la passerelle pour appliquer (kirocrew restart)",
       "building": "Compilation…",
+      "build_finished_restarting_gateway": "Build terminé — redémarrage du gateway…",
       "built": "compilé",
       "built_and_ready_spin_up_a_pod_from_the_row_menu": "Compilé et prêt — démarre un pod depuis le menu de la ligne pour tester cette branche",
       "built_but_pods_cannot_run_on_this_host_preview_i": "Compilé — mais les pods ne peuvent pas tourner sur cet hôte ; utilise plutôt ./dev-backend.sh pour prévisualiser",
@@ -8578,7 +8612,7 @@
       "pull_build_failed_to_start": "Pull+Build n’a pas démarré",
       "pull_build_main": "Pull + Build de main",
       "pulls_main_and_rebuilds_6_min_does_not_restart": "Récupère main et recompile (~6 min). NE redémarre PAS.",
-      "pulls_main_rebuilds_then_restarts_automatically": "Pulls main, rebuilds (~6 min), then restarts the gateway automatically.",
+      "pulls_main_rebuilds_then_restarts_keep_page_open": "Télécharge main, recompile (~6 min) puis redémarre le gateway automatiquement. Gardez cette page ouverte jusqu'à la fin du build.",
       "purpose": "Objectif :",
       "qa_pod_is_running_but_failing_its_health_check": "Le pod de QA tourne mais échoue à son contrôle de santé",
       "qa_pod_is_running_click_open_to_use_it": "Le pod de QA tourne — clique sur Ouvrir pour l’utiliser",
@@ -8763,7 +8797,8 @@
       "timeout": "Délai d'expiration",
       "total": "Total",
       "total_runs": "Exécutions totales",
-      "user": "utilisateur"
+      "user": "utilisateur",
+      "matcher_mode": "Matcher mode"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Un identifiant unique pour cet espace de travail. Les agents référencent les espaces de travail par leur nom.",
@@ -9130,6 +9165,36 @@
       "without_gateway_per_session_copies": "Sans passerelle (copies par session)"
     },
     "mcpManagement": {
+      "assessment": {
+        "col_assessment": "Évaluation",
+        "col_evidence": "Preuves",
+        "col_running_as": "Exécuté en tant que",
+        "connections_link": "Connections",
+        "how_measured": "Un serveur reste non mesuré jusqu'à ce que Kiro Crew le sonde, ce qui se produit deux à la fois lors de l'actualisation de la liste des serveurs MCP sous {{link}}.",
+        "lede": "Ce que Kiro Crew a pu observer sur chaque serveur, et comment cela correspond à ce que le serveur exécute en ce moment. Rien sur cette vue ne change quoi que ce soit — les commutateurs se trouvent sous Serveurs.",
+        "legend": "Recommander un backend partagé nécessite que le serveur déclare qu’il peut distinguer ses appelants, et peu de serveurs le déclarent — donc la plupart des serveurs sains en restent à aucune objection trouvée. C’est la réponse prudente, pas une réponse manquante, et le partage reste ton choix.",
+        "open_servers": "Ouvrir Servers",
+        "reason_all_tools_read_only": "Chaque outil se déclare en lecture seule",
+        "reason_caller_sensitive": "A répondu différemment à la poignée de main pour deux appelants différents",
+        "reason_declares_caller_identity": "Déclare qu’il peut distinguer ses appelants",
+        "reason_first_party": "Un serveur Kiro Crew, lié à une seule session par conception",
+        "reason_no_objection_found": "Rien de disqualifiant n’a été trouvé, ce qui est plus faible qu’une preuve que le partage est sûr",
+        "reason_no_tool_annotations": "Aucun outil n'a indiqué s'il se contente de lire",
+        "reason_no_tools_listed": "N’a proposé aucun outil à inspecter",
+        "reason_not_probed": "Jamais mesuré, donc rien n’est affirmé dans un sens ou dans l’autre",
+        "reason_not_stdio": "Pas un serveur stdio, il n’y a donc aucun tube devant lequel placer un stub",
+        "reason_observed_hazard": "Déjà observé en train de se comporter différemment selon l’appelant lorsqu’il est partagé",
+        "reason_per_client_capability": "Annonce une capacité qui appartient à un seul client",
+        "reason_preflight_not_run": "Le déclare, mais n’a pas encore été mesuré",
+        "reason_preflight_passed": "Mesuré avec deux appelants différents et a répondu de la même manière",
+        "reason_rotating_secret_env": "Lit un identifiant dont la valeur diffère selon la session",
+        "shared_without_support": "Le partage de backend est déjà actif pour des serveurs dont les indices le déconseillent. Serveurs concernés : {{count}}",
+        "strength_declared": "conçu pour le partage",
+        "strength_disqualified": "inadapté au partage",
+        "strength_no_objection": "aucune objection trouvée",
+        "strength_refuted": "risqué en partage",
+        "strength_unknown": "non mesuré"
+      },
       "cancel": "Annuler",
       "col_server": "Serveur",
       "col_state": "État",
@@ -9141,6 +9206,7 @@
       "confirm_stateful": "Un serveur qui conserve un état par session devrait garder seulement le stub, ou s'attendre à des colocataires.",
       "confirm_title": "Partager les backends entre les sessions ?",
       "confirm_turn_on": "Activer le partage",
+      "confirm_unsupported": "Parmi eux, {{count}} présentent des indices qui déconseillent le partage.",
       "learn_more": "En savoir plus",
       "learn_more_docs": "En savoir plus dans la documentation",
       "lede": "Kiro Crew peut placer son propre stub devant un serveur MCP au lieu de laisser chaque session lancer ce serveur elle-même. Le stub est ce qui permet au serveur de dessiner sa propre interface (MCP Apps) et la seule chose vers laquelle un backend partagé peut être routé — il s'active donc serveur par serveur. {{link}}",
@@ -9162,7 +9228,10 @@
       "stub_failed": "Impossible d'appliquer le changement. Il est peut-être déjà enregistré sans être actif : les interrupteurs ci-dessous montrent désormais l'état enregistré.",
       "stub_not_live": "Enregistré, mais pas encore actif : la passerelle n'a pas pu démarrer. L'interrupteur montre ce qui est enregistré, pas ce qui tourne.",
       "stubbed_of_total": "{{stubbed}} sur {{total}} avec stub",
-      "unsupported_platform": "Le partage de backend nécessite des sockets de domaine Unix et n'est pas disponible sur cette plateforme."
+      "unsupported_platform": "Le partage de backend nécessite des sockets de domaine Unix et n'est pas disponible sur cette plateforme.",
+      "view_assessment": "Évaluation du partage",
+      "view_servers": "Serveurs",
+      "views_aria": "Vues de gestion MCP"
     },
     "migrationPage": {
       "app_migration": "Migration de l'app",
@@ -9574,7 +9643,8 @@
         "version_range": "(v{{from}} → v{{to}})",
         "workspace": "espace de travail",
         "auto_create_hint": "Kiro Crew peut également ébaucher des compétences à partir de sessions terminées automatiquement — désactivé par défaut, contrôlé par <settingRef/>.",
-        "approval_required_hint": "Les candidats attendent ici jusqu'à votre approbation — requis par <settingRef/>."
+        "approval_required_hint": "Les candidats attendent ici votre approbation. Les skills en prose seule peuvent être publiés automatiquement lorsque <settingRef/> est désactivé — les skills contenant des scripts nécessitent toujours une revue.",
+        "scripts_always_require_review": "Les scripts inclus nécessitent toujours une revue manuelle, même lorsque l'approbation des skills est désactivée."
       },
       "steeringTab": {
         "always_on_markdown_conventions_injected_into_eve": "Conventions Markdown toujours actives, injectées dans chaque session. Les fichiers globaux se trouvent dans ~/.kiro/steering et s’appliquent partout ; les fichiers d’espace de travail se trouvent dans <project>/.kiro/steering et s’appliquent uniquement à ce projet.",
@@ -10327,6 +10397,9 @@
         "session_folder_name_desc": "Créé lors de l’enregistrement de ces paramètres, s’il n’existe pas encore."
       },
       "browserPanel": {
+        "use_builtin_label": "Utiliser le navigateur intégré",
+        "use_builtin_desc": "Ouvre les pages dans le panneau intégré de Kiro Crew. Désactivez pour naviguer avec playwright-cli à la place.",
+        "use_builtin_desktop_only": "Fonctionne uniquement dans l'application de bureau. Dans un navigateur ou sur une passerelle distante, l'agent utilise playwright-cli.",
         "browsing": "Navigation",
         "cannot_load": "Impossible de charger l'état du navigateur. La passerelle est-elle démarrée ?",
         "available": "L'agent peut consulter des pages web.",

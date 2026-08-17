@@ -31,6 +31,7 @@ from kiro_crew.constants import (
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
 from kiro_crew.dashboard.side_state import SideState
+from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.messaging.link import (
@@ -474,7 +475,7 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
         # is never scanned, because a later user/assistant row returns first.
         if is_stop_event_row(m):
             return False
-        if role == "assistant" and meta.get("kind") == "compaction":
+        if is_system_notice(role, meta):
             continue
         if role in ("user", "assistant") and m.get("content"):
             return True if role == "user" else saw_trailing_error
@@ -598,6 +599,12 @@ _WIRE_ONLY_ROLES = frozenset({"chunk", "done", "streaming"})
 #: card whose answer channel is already gone (server retired, client did not).
 #: Widening coverage is a data edit here.
 _QUESTION_RETIRING_ROLES = frozenset({"user", "nudge"})
+#: Roles that carry an inbound PROMPT -- the rows that ask this session to do
+#: something, as opposed to the rows produced while it works. ``user`` is a human
+#: send from any surface; ``inject`` is automation delivering a cron notification
+#: or a subagent completion event. Used to rank a session by when its work was
+#: requested while the answer is still streaming (``to_dict``'s ``last_turn_ts``).
+_PROMPT_ROLES = frozenset({"user", "inject"})
 _MAX_SOURCE_LINKS_PER_SLOT = 64
 # How many source links each slot payload actually serializes (the sidebar
 # renders at most this many chips). Shared with the periodic check-status
@@ -1008,6 +1015,7 @@ class _ChatSlot:
         "event",
         "_pending",
         "_queue",
+        "_last_enqueue_ts",
         "_approval_futures",
         "_trust",
         "_trust_scope",
@@ -1022,6 +1030,7 @@ class _ChatSlot:
         "_title_retry_pending",
         "_summary_in_flight",
         "_summary_turn_mark",
+        "_detail_render_lock",
         "_last_stop_reason",
         "_artifact",
         "_channel_folder_filed",
@@ -1145,6 +1154,9 @@ class _ChatSlot:
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         self._queue: list[dict[str, str]] = []  # [{"id": uuid, "content": str}, ...]
+        # Newest enqueue instant, read only while ``_queue`` is non-empty — see
+        # ``_note_enqueue``.
+        self._last_enqueue_ts: str = ""
         self._approval_futures: dict[str, asyncio.Future[str]] = {}  # type: ignore[type-arg]
         self._trust: bool = False  # auto-approve tools for this slot
         # SafetyOverride scope key holding an EXPIRING, SEL-audited auto-approve
@@ -1186,6 +1198,13 @@ class _ChatSlot:
         # summary pass outlives the turn that triggered it, so a fast follow-up
         # turn would otherwise start a second pass over the same transcript.
         self._summary_in_flight: bool = False
+        # Serializes the slot-detail render offload (see api_chat_slot_detail):
+        # rendering redacts the ENTIRE history with a regex battery, so on a
+        # multi-MB session two concurrent refetches (WS reconnect + switchSlot)
+        # would burn that CPU twice in parallel worker threads for the same
+        # payload. The lock queues them instead; each holder re-renders from
+        # fresh state, so a queued waiter never serves a stale response.
+        self._detail_render_lock = asyncio.Lock()
         # User-turn count at the last successful summary, so the configured
         # regeneration cadence can be honored without re-reading the sidecar.
         self._summary_turn_mark: int = 0
@@ -1917,7 +1936,23 @@ class _ChatSlot:
         if meta:
             item["meta"] = meta
         self._queue.append(item)
+        self._note_enqueue()
         return qid
+
+    def _note_enqueue(self) -> None:
+        """Record that work was just queued for this slot.
+
+        Held BESIDE the queue rather than on the entry: an entry dict is compared
+        wholesale in a great many places, and widening its shape would make every
+        one of those comparisons depend on a clock.
+
+        Read only while ``_queue`` is non-empty (see ``to_dict``), so the value
+        cannot outlive the queue it describes. Individual removals leave it
+        pointing at the most recent enqueue rather than at the oldest surviving
+        entry, which is the same statement for ranking purposes: work is waiting,
+        and it was asked for at this instant.
+        """
+        self._last_enqueue_ts = datetime.now(timezone.utc).isoformat()
 
     def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
@@ -1929,6 +1964,7 @@ class _ChatSlot:
         """
         qid = uuid.uuid4().hex[:12]
         self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
+        self._note_enqueue()
         return qid
 
     def queue_pop(self, index: int = 0) -> dict[str, str]:
@@ -2215,26 +2251,27 @@ class _ChatSlot:
         found_conv = False
         for m in reversed(self.messages):
             role = m.get("role")
-            # Compute meta/compaction flag once for both guards below
+            # Compute meta/system-notice flag once for both guards below
             msg_meta = m.get("meta") or {}
-            is_compaction = role == "assistant" and msg_meta.get("kind") == "compaction"
+            is_notice = is_system_notice(role, msg_meta)
             # Capture last_activity_ts from the most recent actionable message
             if (
                 not last_activity_ts
                 and role in ("tool_call", "tool_result", "assistant")
-                and not is_compaction
+                and not is_notice
             ):
                 last_activity_ts = m.get("ts") or ""
             # Capture the last conversational message (role/options once, and
-            # the newest non-empty preview). Skip compaction
-            # notices: assistant-role system messages tagged
-            # meta.kind == "compaction" — the auto-compact notice
-            # ("Auto-compacted at N%.", _AUTO_COMPACT_NOTICE) and the
-            # /compact result banner (chat_utils._append_compaction_notice).
+            # the newest non-empty preview). Skip system notices:
+            # assistant-role status rows tagged with a kind in
+            # SYSTEM_NOTICE_KINDS — the auto-compact notice
+            # ("Auto-compacted at N%.", _AUTO_COMPACT_NOTICE), the /compact
+            # result banner (chat_utils._append_compaction_notice), and the
+            # session-reload confirmation (api_chat_slot_reload).
             # This keeps the sidebar showing the last real message and mirrors
             # the frontend's deriveFollowUpOptions skip so preview/options
             # stay consistent.
-            if role in ("user", "assistant") and not is_compaction:
+            if role in ("user", "assistant") and not is_notice:
                 txt = m.get("content") or ""
                 if txt:
                     if not found_conv:
@@ -2267,6 +2304,42 @@ class _ChatSlot:
             if found_conv and last_msg and last_activity_ts:
                 break
         pending_approval = any(not f.done() for f in self._approval_futures.values())
+        # Ordering instant for the session list: the last time this session
+        # SETTLED -- work was asked of it, or a turn finished. Deliberately not
+        # ``last_ts``, which is the newest row of ANY role and therefore advances
+        # on every streamed tool call: a list ranked by that reshuffles
+        # continuously whenever several sessions are working, so rows swap under
+        # the pointer. A turn in flight instead holds the rank of the prompt that
+        # started it, and the single re-rank lands when the turn ends -- at which
+        # point the newest row IS the completion.
+        #
+        # A send that arrived behind a running turn is QUEUED, not appended, so
+        # the message scan alone would not see it and this snapshot would rank the
+        # session by the older prompt -- overwriting the client's own bump and
+        # dropping the row the user just typed into. Ranking queued entries here
+        # makes this the single owner of the key instead of racing the client.
+        #
+        # Both scans are running-only, so an idle slot (the common case in a long
+        # sidebar) costs nothing, and a running one is bounded by its own turn.
+        last_turn_ts = last_ts
+        if self.running:
+            prompt_ts = next(
+                (
+                    m.get("ts") or ""
+                    for m in reversed(self.messages)
+                    if m.get("role") in _PROMPT_ROLES
+                ),
+                "",
+            )
+            queued_ts = self._last_enqueue_ts if self._queue else ""
+            last_turn_ts = prompt_ts
+            if queued_ts:
+                # Parse-based, not string ``max``: rows carry both aware and naive
+                # isoformat, and comparing those as strings can pick the earlier
+                # one. Consulted only while something is queued, so a prompt row
+                # whose own ``ts`` is unparseable still ranks the session instead
+                # of being discarded by the combiner.
+                last_turn_ts = latest_transcript_ts(prompt_ts, queued_ts) or queued_ts
         # waiting_for_input: turn ended (not running), no options, no approval,
         # and the last conversational message is from the assistant (not user).
         waiting_for_input = (
@@ -2372,6 +2445,7 @@ class _ChatSlot:
             "wait_state": self._wait_state,
             "created": self.created_at,
             "last_ts": last_ts,
+            "last_turn_ts": last_turn_ts,
             "last_message": last_msg,
             "source_links": [
                 {
